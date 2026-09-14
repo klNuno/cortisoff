@@ -1,0 +1,13 @@
+[package]
+name = "cortisoff-ipc"
+description = "Wire protocol between the daemon and its clients. Knows no operating system."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortisoff-core = { path = "../cortisoff-core" }
+cortisoff-host = { path = "../cortisoff-host" }
+serde = { workspace = true }
+serde_json = { workspace = true }

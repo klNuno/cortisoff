@@ -1,0 +1,27 @@
+[package]
+name = "cortisoff-daemon"
+description = "The OS-agnostic half of the daemon: paths, the file-backed journal, the startup gate and the supervisor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cortisoffd"
+path = "src/main.rs"
+
+[dependencies]
+cortisoff-core = { path = "../cortisoff-core" }
+cortisoff-host = { path = "../cortisoff-host" }
+cortisoff-ipc = { path = "../cortisoff-ipc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The daemon binary is the one place that picks a platform. The library half
+# above it stays free of any of this, which is what keeps the test suite
+# runnable anywhere.
+[target.'cfg(windows)'.dependencies]
+cortisoff-win = { path = "../cortisoff-win" }
+
+[dev-dependencies]
+cortisoff-host = { path = "../cortisoff-host", features = ["test-util"] }

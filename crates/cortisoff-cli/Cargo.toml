@@ -1,0 +1,21 @@
+[package]
+name = "cortisoff-cli"
+description = "The command line client. An IPC client and nothing else."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cortisoff"
+path = "src/main.rs"
+
+[dependencies]
+cortisoff-host = { path = "../cortisoff-host" }
+cortisoff-ipc = { path = "../cortisoff-ipc" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The client half of the transport. Everything above the bytes is shared.
+[target.'cfg(windows)'.dependencies]
+cortisoff-win = { path = "../cortisoff-win" }

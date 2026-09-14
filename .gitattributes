@@ -1,0 +1,4 @@
+# The engine is meant to be built on three operating systems. Pinning LF keeps
+# a Windows checkout from producing a whole-file diff on a Linux contributor's
+# machine.
+* text=auto eol=lf

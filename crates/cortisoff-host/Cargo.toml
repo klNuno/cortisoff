@@ -1,0 +1,14 @@
+[package]
+name = "cortisoff-host"
+description = "The contract between cortisoff-core and an operating system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Compiles the `mock` module for dependents' tests. Never in a release build.
+test-util = []
+
+[dependencies]
+serde = { workspace = true }

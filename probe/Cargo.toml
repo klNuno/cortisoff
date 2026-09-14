@@ -1,0 +1,26 @@
+[package]
+name = "cortisoff-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Hardware experiments for the colour backends, outside the main workspace.
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Devices_Display",
+    "Win32_UI_Magnification",
+    "Win32_UI_ColorSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

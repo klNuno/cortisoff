@@ -1,0 +1,3 @@
+target/
+# Built by `pnpm sidecars`, never committed.
+app/src-tauri/binaries/

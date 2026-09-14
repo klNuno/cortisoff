@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cortisoff-host",
+    "crates/cortisoff-core",
+    "crates/cortisoff-ipc",
+    "crates/cortisoff-daemon",
+    "crates/cortisoff-win",
+    "crates/cortisoff-cli",
+]
+# probe/ is the T0 throwaway. It links Win32 directly and must never become a
+# workspace member, or `cargo test` stops running on non-Windows machines.
+exclude = ["probe"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/klNuno/cortisoff"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# Rule files only. Pure Rust, no OS call, so the core stays portable.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the release tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid tag '$tag'. Expected vX.Y.Z" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      # The tag is the only version anyone sees, so it has to be the version
+      # every manifest claims. A mismatch means the updater compares against a
+      # number nobody shipped.
+      - name: Check the versions against the tag
+        shell: pwsh
+        run: |
+          $want = "${{ steps.tag.outputs.version }}"
+          $tauri = (Get-Content app/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = (cargo metadata --no-deps --format-version 1 --manifest-path app/src-tauri/Cargo.toml |
+            ConvertFrom-Json).packages[0].version
+          if ($tauri -ne $want -or $cargo -ne $want) {
+            throw "Version mismatch. tag=$want tauri.conf.json=$tauri Cargo.toml=$cargo"
+          }
+
+      # Without it the bundle ships unsigned, the updater refuses the payload,
+      # and nobody finds out until an install fails on a stranger's machine.
+      - name: Check the signing key is present
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Missing secret TAURI_SIGNING_PRIVATE_KEY. Update artifacts cannot be signed."
+          }
+
+      - name: Test
+        run: |
+          cargo test --workspace
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install the dashboard's dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the dashboard
+        working-directory: app
+        run: |
+          pnpm check
+          pnpm test
+
+      - name: Build the daemon and the CLI
+        run: cargo build --release -p cortisoff-daemon -p cortisoff-cli
+
+      - name: Build the dashboard
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      # `latest.json` is what a running dashboard fetches. It has to name the
+      # asset by the URL it will have on the release, and carry the signature
+      # the build just produced.
+      - name: Write the updater manifest
+        shell: pwsh
+        run: |
+          $version = "${{ steps.tag.outputs.version }}"
+          $bundle = "app/src-tauri/target/release/bundle"
+          $installer = Get-ChildItem "$bundle/nsis/*.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "No installer found under $bundle/nsis" }
+          $sig = "$($installer.FullName).sig"
+          if (-not (Test-Path $sig)) { throw "Missing signature for $($installer.Name)" }
+
+          $manifest = @{
+            version = $version
+            notes = "See the release notes."
+            pub_date = (Get-Date).ToUniversalTime().ToString("o")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = (Get-Content $sig -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/$($installer.Name)"
+              }
+            }
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content dist/latest.json -Encoding utf8
+          Copy-Item $installer.FullName dist/
+          Copy-Item target/release/cortisoffd.exe "dist/cortisoffd_${version}_x64.exe"
+          Copy-Item target/release/cortisoff.exe "dist/cortisoff_${version}_x64.exe"
+          Get-ChildItem dist
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
+            ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          if-no-files-found: error
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v5
+        with:
+          name: release
+          path: dist
+
+      # Draft, so a release is read before a stranger's dashboard downloads it.
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
