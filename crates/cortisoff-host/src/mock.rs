@@ -154,6 +154,7 @@ impl JournalStore for MemJournal {
 pub struct MockHost {
     actuators: BTreeMap<CapabilityId, MockActuator>,
     pub installed: Vec<CapabilityId>,
+    pub active: bool,
     pub timers: Vec<(TimerId, Duration, Duration)>,
     pub cancelled: Vec<TimerId>,
     /// What the next `poll` hands back, so a test can drive a loop the same
@@ -201,6 +202,9 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
     fn probe(&self) -> CapabilitySet {
         self.actuators.keys().fold(CapabilitySet::new(), |set, id| {
             set.available(id.clone(), Some("mock"))

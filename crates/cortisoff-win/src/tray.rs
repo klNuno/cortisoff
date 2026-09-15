@@ -11,7 +11,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, DestroyIcon, DestroyMenu,
@@ -31,6 +31,7 @@ const ICON_ID: u32 = 1;
 
 /// The same picture the dashboard wears, so the two read as one application.
 static ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/icon.ico");
+static ACTIVE_ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/active.ico");
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -44,6 +45,7 @@ pub struct Tray {
     window: HWND,
     icon: HICON,
     owned: bool,
+    active: bool,
 }
 
 impl Tray {
@@ -52,14 +54,33 @@ impl Tray {
     pub fn add(window: HWND) -> Tray {
         let message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         TASKBAR_CREATED.store(message, Ordering::Relaxed);
-        let (icon, owned) = load_icon();
+        let (icon, owned) = load_icon(ICO);
         let tray = Tray {
             window,
             icon,
             owned,
+            active: false,
         };
         tray.show();
         tray
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        let (icon, owned) = load_icon(if active { ACTIVE_ICO } else { ICO });
+        let mut data = self.data();
+        data.uFlags = NIF_ICON;
+        data.hIcon = icon;
+        // Retain the desired state across a shell restart: show() reuses it.
+        let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+        if self.owned {
+            let _ = unsafe { DestroyIcon(self.icon) };
+        }
+        self.icon = icon;
+        self.owned = owned;
+        self.active = active;
     }
 
     pub fn show(&self) -> bool {
@@ -153,9 +174,9 @@ pub fn open_dashboard() -> Result<(), String> {
     Err(format!("no dashboard next to {}", dir.display()))
 }
 
-fn load_icon() -> (HICON, bool) {
+fn load_icon(ico: &[u8]) -> (HICON, bool) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-    if let Some(bits) = ico_image(ICO, size as u32) {
+    if let Some(bits) = ico_image(ico, size as u32) {
         if let Ok(icon) = unsafe {
             CreateIconFromResourceEx(bits, true, 0x0003_0000, size, size, LR_DEFAULTCOLOR)
         } {

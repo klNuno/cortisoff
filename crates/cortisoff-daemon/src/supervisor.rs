@@ -345,6 +345,17 @@ impl<J: JournalStore> Supervisor<J> {
                 Action::Apply { .. } | Action::RestoreBaseline { .. } => {}
             }
         }
+        host.set_active(self.active());
+    }
+
+    /// Whether at least one capability has an unblocked claim.
+    fn active(&self) -> bool {
+        let arbiter = self.engine.arbiter();
+        let table = arbiter.table();
+        (0..table.len()).any(|i| {
+            let cap = CapIndex(i as u16);
+            arbiter.holder(cap).is_some() && !self.gate.blocks(table.id(cap))
+        })
     }
 
     /// Drop what the startup gate refuses, keeping the rest of the batch. A
@@ -422,6 +433,7 @@ impl<J: JournalStore> Supervisor<J> {
     pub fn state(&self) -> StateReport {
         let w = self.engine.world();
         StateReport {
+            active: self.active(),
             world: WorldReport {
                 app: w.app.clone(),
                 fullscreen: w.fullscreen,
@@ -663,12 +675,15 @@ set.display.vibrance = 100
         let mut h = host();
         let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
         s.start(&mut h);
+        assert!(!h.active && !s.state().active);
 
         s.handle(&mut h, focus("game.exe"));
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
+        assert!(h.active && s.state().active);
 
         s.handle(&mut h, focus("notepad.exe"));
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
+        assert!(!h.active && !s.state().active);
     }
 
     /// Ctrl-C is not a crash. Quitting has to hand every screen back, or a
@@ -704,9 +719,11 @@ set.display.vibrance = 100
         s.manual_set(&mut h, &CapabilityId::new(VIBRANCE), Value::Int(70))
             .expect("the capability exists");
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(70)));
+        assert!(h.active && s.state().active);
 
         s.shutdown(&mut h);
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
+        assert!(!h.active && !s.state().active);
     }
 
     /// What clicking the switch on a card does, end to end: the file changes,
@@ -859,6 +876,7 @@ set.display.color_temp = 3400
         let mut s = supervisor(&h, source, Interference::assess(["flux.exe"], None));
         s.start(&mut h);
         s.handle(&mut h, focus("game.exe"));
+        assert!(!h.active && !s.state().active);
 
         let warned = s
             .drain()

@@ -87,14 +87,14 @@ function reports(): RuleReport[] {
     name: r.name,
     priority: r.priority,
     state: r.enabled ? { state: "active" } : { state: "disabled" },
-    holding: r.enabled && holding.has(r.name),
+    holding: r.enabled && !query.has("inactive") && holding.has(r.name),
     sets: r.set.map((a) => a.cap),
   }));
 }
 
 function claims(): ClaimReport[] {
   const blue = rules.find((r) => r.name === "blue light at night");
-  if (!blue?.enabled) return [];
+  if (!blue?.enabled || query.has("inactive")) return [];
   return [
     {
       cap: "display.color_temp",
@@ -108,6 +108,7 @@ function claims(): ClaimReport[] {
 
 function state(): StateReport {
   return {
+    active: claims().length > 0,
     world: {
       app: {
         exe: "C:\\Program Files\\Mozilla Firefox\\firefox.exe",

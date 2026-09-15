@@ -25,6 +25,7 @@ const size = process.env.SIZE ?? "940,680";
 // Each view is the query string `mock.html` reads.
 const views = {
   grid: "",
+  "grid-inactive": "inactive=1",
   "grid-light": "theme=light&usage=1",
   settings: "open=settings",
   "settings-machine": "open=settings:machine",

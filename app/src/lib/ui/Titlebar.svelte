@@ -3,6 +3,8 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   import { daemon } from "$lib/daemon.svelte";
+  import activeLogo from "$lib/assets/logo-active.svg";
+  import inactiveLogo from "$lib/assets/logo-inactive.svg";
   import { settings } from "$lib/settings.svelte";
   import { updater } from "$lib/updater.svelte";
 
@@ -23,6 +25,7 @@
   type Usage = { pid: number; cpu: number | null; rss_bytes: number };
 
   const win = getCurrentWindow();
+  const active = $derived(daemon.connected && (daemon.state?.active ?? false));
   let usage = $state<Usage[]>([]);
 
   $effect(() => {
@@ -69,6 +72,8 @@
   class="flex h-(--titlebar-height) shrink-0 select-none items-center gap-3 border-b border-line
     pl-3"
 >
+  <img data-tauri-drag-region src={active ? activeLogo : inactiveLogo}
+    alt={active ? "Cortisoff active" : "Cortisoff inactive"} class="size-6" />
   <span data-tauri-drag-region class="text-[13px] font-semibold tracking-tight">cortisoff</span>
 
   <span

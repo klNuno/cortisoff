@@ -159,6 +159,7 @@ export type WorldReport = {
 };
 
 export type StateReport = {
+  active?: boolean;
   world: WorldReport;
   rules: RuleReport[];
   claims: ClaimReport[];
