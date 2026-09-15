@@ -986,6 +986,70 @@ set.wallpaper.playback = false
         ));
     }
 
+    #[test]
+    fn display_profile_applies_on_focus_and_restores_both_settings_on_blur() {
+        let mode = ids::DISPLAY_MODE;
+        let baseline = Value::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        let mut h = host().with_actuator(mode, baseline.clone(), false);
+        let mut s = supervisor(
+            &h,
+            r#"
+[[rule]]
+name = "display profile"
+priority = 100
+when.app = "cs2.exe"
+set.display.vibrance = 100
+set.display.mode = "2560x1440@240"
+"#,
+            Interference::clear(),
+        );
+        s.start(&mut h);
+        s.handle(&mut h, focus("cs2.exe"));
+        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
+        assert_eq!(
+            h.value(mode),
+            Some(Value::Mode {
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 240000
+            })
+        );
+        s.handle(&mut h, focus("notepad.exe"));
+        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
+        assert_eq!(h.value(mode), Some(baseline));
+        assert!(s.state().claims.is_empty());
+        assert!(s.dispatcher.journal().dirty().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wallpaper_resumes_when_the_user_returns() {
+        let wallpaper = ids::WALLPAPER_PLAYBACK;
+        let mut h = host().with_actuator(wallpaper, Value::Bool(true), false);
+        let mut s = supervisor(
+            &h,
+            r#"
+[[rule]]
+name = "pause wallpaper while away"
+when.idle = true
+set.wallpaper.playback = false
+"#,
+            Interference::clear(),
+        );
+        s.start(&mut h);
+        for _ in 0..2 {
+            s.handle(&mut h, Event::Idle { idle: true });
+            assert_eq!(h.value(wallpaper), Some(Value::Bool(false)));
+            s.handle(&mut h, Event::Idle { idle: false });
+            assert_eq!(h.value(wallpaper), Some(Value::Bool(true)));
+            assert!(s.state().claims.is_empty());
+            assert!(s.dispatcher.journal().dirty().unwrap().is_empty());
+        }
+    }
+
     /// An unsupported rule reads idle, but nothing can ever act on it, so
     /// installing the idle source would cost for nothing.
     #[test]

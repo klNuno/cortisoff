@@ -33,7 +33,8 @@ const views = {
   "settings-light": "theme=light&open=settings",
   add: "open=add",
   "rule-blue-light": "open=rule:blue light at night",
-  "rule-vibrance": "open=rule:vibrance in game",
+  "rule-display-profile": "open=rule:display profile",
+  "rule-wallpaper": "open=rule:pause wallpaper while away",
 };
 
 const edge =
