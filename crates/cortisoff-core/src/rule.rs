@@ -100,7 +100,12 @@ impl Condition {
             Condition::AudioActive(v) => flag(w.audio_active == *v),
             Condition::Between { start, end } => match w.second_of_day {
                 None => 0.0,
-                Some(t) => transition::window_strength(start.0, end.0, t, fade),
+                Some(t) => transition::window_strength_ms(
+                    start.0,
+                    end.0,
+                    t * 1000 + u32::from(w.millisecond),
+                    fade,
+                ),
             },
             Condition::All(cs) => cs.iter().map(|c| c.strength(w, fade)).fold(1.0, f64::min),
             Condition::Any(cs) => cs.iter().map(|c| c.strength(w, fade)).fold(0.0, f64::max),

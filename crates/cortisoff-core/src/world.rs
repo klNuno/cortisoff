@@ -70,8 +70,10 @@ pub struct World {
     pub audio_active: bool,
     /// Second of the local day. `None` until the host has said, and a
     /// schedule condition never holds on an unknown clock. Seconds rather than
-    /// minutes because a fade steps every few of them.
+    /// minutes, plus a subsecond fraction for fades.
     pub second_of_day: Option<u32>,
+    /// Fraction of the current second, supplied by the host.
+    pub millisecond: u16,
 }
 
 impl World {
@@ -119,14 +121,26 @@ impl World {
                     w.audio_active = v
                 })
             }
-            Event::TimeOfDay { minute, second } => {
+            Event::TimeOfDay {
+                minute,
+                second,
+                millisecond,
+            } => {
                 let v = Some(u32::from(*minute) * 60 + u32::from(*second));
-                self.changed(v != self.second_of_day, Signals::TIME, |w| {
-                    w.second_of_day = v
-                })
+                self.changed(
+                    v != self.second_of_day || *millisecond != self.millisecond,
+                    Signals::TIME,
+                    |w| {
+                        w.millisecond = *millisecond;
+                        w.second_of_day = v
+                    },
+                )
             }
-            // Neither is a world field. The engine handles both directly.
-            Event::DisplayConfigChanged | Event::Reapply { .. } | Event::Shutdown => None,
+            // These are not world fields. The engine handles them directly.
+            Event::DisplayConfigChanged
+            | Event::Reapply { .. }
+            | Event::TimerFired { .. }
+            | Event::Shutdown => None,
         }
     }
 

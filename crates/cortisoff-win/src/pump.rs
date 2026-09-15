@@ -181,6 +181,7 @@ impl WinHost {
         Event::TimeOfDay {
             minute: now.wHour * 60 + now.wMinute,
             second: now.wSecond.min(59) as u8,
+            millisecond: now.wMilliseconds,
         }
     }
 
@@ -329,13 +330,18 @@ impl WinHost {
                 vec![Event::AudioActive { active }]
             }
             // The engine's own timer. It asked for a schedule edge or a fade
-            // step, so the answer is the time, not the timer id. It asked
+            // step. Send the time for schedules and the id for previews. It asked
             // once, and a Win32 timer repeats until killed: left alone, the
             // 40 ms fade timer went on firing after the fade, a clock event
             // twenty five times a second for the rest of the session.
-            Raw::Timer(id) if id < IDLE_TIMER => {
+            Raw::Timer(id) if (ENGINE_TIMER_BASE..IDLE_TIMER).contains(&id) => {
                 let _ = unsafe { KillTimer(self.window, id) };
-                vec![self.clock()]
+                vec![
+                    self.clock(),
+                    Event::TimerFired {
+                        id: TimerId((id - ENGINE_TIMER_BASE) as u32),
+                    },
+                ]
             }
             Raw::Timer(_) => Vec::new(),
             Raw::TrayOpen => {

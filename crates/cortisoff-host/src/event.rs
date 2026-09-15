@@ -62,12 +62,18 @@ pub enum Event {
     /// at startup, when the engine's schedule timer fires, and after anything
     /// that moves the clock underneath a sleeping timer: resume from sleep, a
     /// timezone or DST change. Never pushed every minute; the engine asks for
-    /// exactly the wakeups its schedule rules need, which is a step every few
-    /// seconds while a rule fades and nothing at all otherwise.
+    /// exactly the wakeups its schedule rules need, with subsecond frames
+    /// while a rule fades and only schedule edges otherwise.
     TimeOfDay {
         minute: u16,
         #[serde(default)]
         second: u8,
+        #[serde(default)]
+        millisecond: u16,
+    },
+    /// A one-shot engine timer fired.
+    TimerFired {
+        id: TimerId,
     },
     /// The daemon is going down cleanly. Every claim is released so the host
     /// restores baselines before the process exits.

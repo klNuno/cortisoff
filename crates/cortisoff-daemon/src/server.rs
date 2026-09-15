@@ -644,7 +644,12 @@ set.display.vibrance = 100
         // The rest was read before the drag, when the driver still showed 50.
         let mut values = Vec::new();
         for _ in 0..40 {
-            server.supervisor_mut().timer_fired(&mut host, 12 * 60, 0);
+            server.supervisor_mut().handle(
+                &mut host,
+                cortisoff_host::Event::TimerFired {
+                    id: cortisoff_core::PREVIEW_TIMER,
+                },
+            );
             values.push(host.value(ids::DISPLAY_VIBRANCE).unwrap());
         }
         assert_eq!(values.last(), Some(&Value::Int(50)));

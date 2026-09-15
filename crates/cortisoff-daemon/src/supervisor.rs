@@ -110,7 +110,11 @@ impl<J: JournalStore> Supervisor<J> {
 
     /// One event, all the way to the hardware.
     pub fn handle(&mut self, host: &mut dyn Host, event: Event) {
-        self.note(Notification::Event(event.clone()));
+        // Timer identities are internal. Keep existing trace clients compatible
+        // and publish the clock and resulting actions as before.
+        if !matches!(event, Event::TimerFired { .. }) {
+            self.note(Notification::Event(event.clone()));
+        }
         let before = self.holding_names();
         let actions = self.engine.on_event(&event);
         self.report_edges(before);
@@ -121,7 +125,14 @@ impl<J: JournalStore> Supervisor<J> {
     /// whatever event it stood for, except the schedule timer, which the host
     /// answers with the current [`Event::TimeOfDay`].
     pub fn timer_fired(&mut self, host: &mut dyn Host, minute: u16, second: u8) {
-        self.handle(host, Event::TimeOfDay { minute, second });
+        self.handle(
+            host,
+            Event::TimeOfDay {
+                minute,
+                second,
+                millisecond: 0,
+            },
+        );
     }
 
     /// Where `Request::Reload` reads from. Absent when the daemon was handed
@@ -949,6 +960,7 @@ set.display.color_temp = 3400
             Event::TimeOfDay {
                 minute: 21 * 60,
                 second: 0,
+                millisecond: 0,
             },
         );
         assert_eq!(h.value(TEMP), Some(Value::Int(3400)));
