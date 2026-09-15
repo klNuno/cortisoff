@@ -49,7 +49,7 @@ localStorage.setItem(
 );
 
 let rules: Rule[] = templates.map((t) => t.make());
-rules = rules.map((r) => (r.name === "high refresh in game" ? { ...r, enabled: false } : r));
+rules = rules.map((r) => (r.name === "pause wallpaper while away" ? { ...r, enabled: false } : r));
 let autostart = true;
 
 const kelvin: Control = { kind: "range", min: 1500, max: 6600, step: 50, default: 3400, unit: "K" };
