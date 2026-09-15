@@ -387,6 +387,11 @@ impl WinHost {
 }
 
 impl Host for WinHost {
+    fn set_active(&mut self, active: bool) {
+        if let Some(tray) = &mut self.tray {
+            tray.set_active(active);
+        }
+    }
     fn probe(&self) -> CapabilitySet {
         let set = CapabilitySet::new()
             .available(CapabilityId::new(ids::APP_FOCUS), Some("winevent"))

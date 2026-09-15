@@ -192,6 +192,9 @@ pub struct WorldReport {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateReport {
+    /// At least one unblocked claim is held; not a hardware readback.
+    #[serde(default)]
+    pub active: bool,
     pub world: WorldReport,
     pub rules: Vec<RuleReport>,
     pub claims: Vec<ClaimReport>,

@@ -49,6 +49,9 @@ pub trait Host {
     /// NVIDIA machine and on an Intel laptop.
     fn probe(&self) -> CapabilitySet;
 
+    /// Update the activity indicator when an unblocked claim is held.
+    fn set_active(&mut self, _active: bool) {}
+
     /// Install only the sources named here. Anything absent must not be
     /// hooked, because an installed hook costs on every system-wide event.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError>;
