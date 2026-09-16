@@ -533,6 +533,42 @@ mod tests {
     }
 
     #[test]
+    fn inactivity_delays_fire_independently_and_release_on_input() {
+        let mut engine = Engine::new(
+            table(),
+            vec![
+                rule("short", Condition::IdleFor(60), 0, &[(TEMP, 3200)]),
+                rule("long", Condition::IdleFor(120), 0, &[(VIBRANCE, 80)]),
+            ],
+        );
+        assert!(engine
+            .on_event(&Event::Idle {
+                idle: false,
+                seconds: 59
+            })
+            .is_empty());
+        assert_eq!(
+            engine.on_event(&Event::Idle {
+                idle: false,
+                seconds: 60
+            }),
+            vec![apply(TEMP, 3200)]
+        );
+        assert_eq!(
+            engine.on_event(&Event::Idle {
+                idle: false,
+                seconds: 120
+            }),
+            vec![apply(VIBRANCE, 80)]
+        );
+        let restored = engine.on_event(&Event::Idle {
+            idle: false,
+            seconds: 0,
+        });
+        assert!(restored.contains(&restore(TEMP)) && restored.contains(&restore(VIBRANCE)));
+    }
+
+    #[test]
     fn a_rule_claims_when_its_condition_starts_holding() {
         let mut e = Engine::new(
             table(),
@@ -739,7 +775,13 @@ mod tests {
         let mut e = Engine::new(table(), vec![rule("film", when, 0, &[(TEMP, 6500)])]);
         assert_eq!(e.on_event(&app("vlc.exe")), vec![apply(TEMP, 6500)]);
         // Idle is the other half of the condition, so it must reach this rule.
-        assert_eq!(e.on_event(&Event::Idle { idle: true }), vec![restore(TEMP)]);
+        assert_eq!(
+            e.on_event(&Event::Idle {
+                idle: true,
+                seconds: 300
+            }),
+            vec![restore(TEMP)]
+        );
     }
 
     fn at(hh: u16, mm: u16) -> Event {

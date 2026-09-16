@@ -59,6 +59,9 @@ pub struct WinHost {
     power_watch: Option<HPOWERNOTIFY>,
     audio_watched: bool,
     idle_after: Duration,
+    idle_thresholds: Vec<u32>,
+    idle_watched: bool,
+    idle_seconds: u32,
     /// Last state pushed, so a beat that changes nothing pushes nothing.
     idle: bool,
     fullscreen: bool,
@@ -121,6 +124,9 @@ impl WinHost {
             power_watch: None,
             audio_watched: false,
             idle_after: DEFAULT_IDLE_AFTER,
+            idle_thresholds: vec![DEFAULT_IDLE_AFTER.as_secs() as u32],
+            idle_watched: false,
+            idle_seconds: 0,
             idle: false,
             fullscreen: false,
             maximized: false,
@@ -195,35 +201,44 @@ impl WinHost {
         }
     }
 
-    fn idle_now(&self) -> bool {
+    fn away_seconds(&self) -> u32 {
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
         };
-        if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-            // Both are tick counts and both wrap at the same place, so the
-            // wrapping difference is the right answer even across 49 days.
-            let since = unsafe { GetTickCount() }.wrapping_sub(info.dwTime);
-            u64::from(since) >= self.idle_after.as_millis() as u64
+        if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+            return 0;
+        }
+        let seconds = unsafe { GetTickCount() }.wrapping_sub(info.dwTime) / 1000;
+        if seconds == 0 || self.fullscreen_now() || self.audio.playing() {
+            0
         } else {
-            false
+            seconds
         }
     }
 
-    /// Away means no input, nothing fullscreen and nothing audible. Checked in
-    /// that order, cheapest first, so a person at the keyboard never costs a
-    /// walk through the audio sessions.
-    fn away_now(&self) -> bool {
-        self.idle_now() && !self.fullscreen_now() && !self.audio.playing()
+    fn sample_idle(&mut self) -> Event {
+        let seconds = self.away_seconds();
+        self.idle = u64::from(seconds) >= self.idle_after.as_secs();
+        self.idle_seconds = idle_bucket(seconds, &self.idle_thresholds);
+        if self.idle_watched {
+            self.arm_idle_timer_at(seconds);
+        }
+        Event::Idle {
+            idle: self.idle,
+            seconds: self.idle_seconds,
+        }
     }
 
-    /// The idle beat: half the threshold, never tighter than fifteen seconds,
-    /// and with generous slack so Windows folds it into a wakeup it was going
-    /// to make anyway.
+    /// Check near the next threshold, and once per second while away so
+    /// keyboard or mouse input resumes playback without a long polling delay.
     fn arm_idle_timer(&self) {
-        let period = (self.idle_after / 2).max(Duration::from_secs(15));
-        let ms = period.as_millis().min(u128::from(u32::MAX)) as u32;
-        unsafe { SetCoalescableTimer(self.window, IDLE_TIMER, ms, None, ms / 2) };
+        self.arm_idle_timer_at(self.away_seconds());
+    }
+
+    fn arm_idle_timer_at(&self, seconds: u32) {
+        let ms = idle_poll_after(seconds, &self.idle_thresholds) * 1000;
+        unsafe { SetCoalescableTimer(self.window, IDLE_TIMER, ms, None, 100) };
     }
 
     fn foreground_event(&mut self, hwnd: HWND) -> Option<Event> {
@@ -244,7 +259,7 @@ impl WinHost {
     /// real event so no rule fires on a half-known world.
     fn snapshot(&mut self) -> Vec<Event> {
         self.fullscreen = self.fullscreen_now();
-        self.idle = self.away_now();
+        let idle_event = self.sample_idle();
         self.on_battery = crate::power::on_battery();
         self.audio_active = self.audio.playing();
         let mut out = vec![
@@ -252,7 +267,7 @@ impl WinHost {
             Event::Fullscreen {
                 exclusive: self.fullscreen,
             },
-            Event::Idle { idle: self.idle },
+            idle_event,
             Event::SessionLock { locked: false },
             Event::PowerSource {
                 on_battery: self.on_battery,
@@ -314,13 +329,15 @@ impl WinHost {
             }
             Raw::Timer(IDLE_TIMER) => {
                 self.names.prune();
-                let idle = self.away_now();
-                if idle == self.idle {
-                    return Vec::new();
+                let before = (self.idle, self.idle_seconds);
+                let event = self.sample_idle();
+                if before == (self.idle, self.idle_seconds) {
+                    Vec::new()
+                } else {
+                    vec![event]
                 }
-                self.idle = idle;
-                vec![Event::Idle { idle }]
             }
+
             Raw::Timer(AUDIO_TIMER) => {
                 let active = self.audio.playing();
                 if active == self.audio_active {
@@ -393,6 +410,14 @@ impl WinHost {
 }
 
 impl Host for WinHost {
+    fn set_idle_thresholds(&mut self, seconds: &[u32]) {
+        self.idle_thresholds = seconds.to_vec();
+        self.idle_thresholds
+            .push(self.idle_after.as_secs().max(1) as u32);
+        self.idle_thresholds.sort_unstable();
+        self.idle_thresholds.dedup();
+    }
+
     fn set_active(&mut self, active: bool) {
         if let Some(tray) = &mut self.tray {
             tray.set_active(active);
@@ -532,7 +557,8 @@ impl Host for WinHost {
             _ => {}
         }
 
-        if asked(ids::USER_IDLE) {
+        self.idle_watched = asked(ids::USER_IDLE);
+        if self.idle_watched {
             self.arm_idle_timer();
         } else {
             let _ = unsafe { KillTimer(self.window, IDLE_TIMER) };
@@ -635,3 +661,43 @@ impl Drop for WinHost {
 /// Silences the unused-import warnings for the types that only appear inside
 /// the window procedure's signature.
 const _: fn(WPARAM, LPARAM, PCWSTR) = |_, _, _| {};
+
+/// Emit only threshold crossings, rather than one core event per idle poll.
+fn idle_bucket(seconds: u32, thresholds: &[u32]) -> u32 {
+    thresholds
+        .iter()
+        .copied()
+        .filter(|t| *t <= seconds)
+        .max()
+        .unwrap_or(0)
+}
+
+fn idle_poll_after(seconds: u32, thresholds: &[u32]) -> u32 {
+    if idle_bucket(seconds, thresholds) > 0 {
+        return 1;
+    }
+    thresholds
+        .iter()
+        .filter_map(|t| t.checked_sub(seconds))
+        .min()
+        .unwrap_or(15)
+        .clamp(1, 15)
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn each_configured_delay_has_its_own_crossing() {
+        let thresholds = [60, 120, 300];
+        assert_eq!(idle_bucket(59, &thresholds), 0);
+        assert_eq!(idle_bucket(60, &thresholds), 60);
+        assert_eq!(idle_bucket(119, &thresholds), 60);
+        assert_eq!(idle_bucket(120, &thresholds), 120);
+        assert_eq!(idle_bucket(0, &thresholds), 0);
+        assert_eq!(idle_poll_after(59, &thresholds), 1);
+        assert_eq!(idle_poll_after(120, &thresholds), 1);
+        assert_eq!(idle_poll_after(0, &thresholds), 15);
+    }
+}

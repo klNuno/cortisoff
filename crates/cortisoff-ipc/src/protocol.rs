@@ -192,7 +192,7 @@ pub struct WorldReport {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StateReport {
-    /// At least one unblocked claim is held; not a hardware readback.
+    /// An enabled plugin or an unblocked manual claim; not a hardware readback.
     #[serde(default)]
     pub active: bool,
     pub world: WorldReport,

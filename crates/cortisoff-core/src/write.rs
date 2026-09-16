@@ -97,6 +97,7 @@ fn condition_pairs(condition: &Condition) -> Vec<(String, String)> {
         }
         Condition::Fullscreen(v) => vec![("fullscreen".to_owned(), v.to_string())],
         Condition::Maximized(v) => vec![("maximized".to_owned(), v.to_string())],
+        Condition::IdleFor(v) => vec![("idle_for".to_owned(), v.to_string())],
         Condition::Idle(v) => vec![("idle".to_owned(), v.to_string())],
         Condition::Locked(v) => vec![("locked".to_owned(), v.to_string())],
         Condition::OnBattery(v) => vec![("on_battery".to_owned(), v.to_string())],

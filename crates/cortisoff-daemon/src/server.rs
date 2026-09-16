@@ -354,9 +354,13 @@ set.display.vibrance = 100
         );
         server.supervisor_mut().drain();
 
-        server
-            .supervisor_mut()
-            .handle(&mut host, Event::Idle { idle: true });
+        server.supervisor_mut().handle(
+            &mut host,
+            Event::Idle {
+                idle: true,
+                seconds: 300,
+            },
+        );
         let out = server.fan_out();
         assert!(!out.is_empty());
         assert!(out.iter().all(|o| o.to == ClientId(1)));
@@ -367,9 +371,13 @@ set.display.vibrance = 100
             &mut host,
             &probed,
         );
-        server
-            .supervisor_mut()
-            .handle(&mut host, Event::Idle { idle: false });
+        server.supervisor_mut().handle(
+            &mut host,
+            Event::Idle {
+                idle: false,
+                seconds: 0,
+            },
+        );
         assert!(server.fan_out().is_empty());
     }
 
@@ -385,9 +393,13 @@ set.display.vibrance = 100
             &probed,
         );
         server.disconnect(ClientId(1), &mut host);
-        server
-            .supervisor_mut()
-            .handle(&mut host, Event::Idle { idle: true });
+        server.supervisor_mut().handle(
+            &mut host,
+            Event::Idle {
+                idle: true,
+                seconds: 300,
+            },
+        );
         assert!(server.fan_out().is_empty());
     }
 

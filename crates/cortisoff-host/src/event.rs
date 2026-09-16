@@ -39,6 +39,9 @@ pub enum Event {
     },
     Idle {
         idle: bool,
+        /// Last crossed inactivity threshold. Zero on resumed activity.
+        #[serde(default)]
+        seconds: u32,
     },
     SessionLock {
         locked: bool,

@@ -155,6 +155,7 @@ pub struct MockHost {
     actuators: BTreeMap<CapabilityId, MockActuator>,
     pub installed: Vec<CapabilityId>,
     pub active: bool,
+    pub idle_thresholds: Vec<u32>,
     pub timers: Vec<(TimerId, Duration, Duration)>,
     pub cancelled: Vec<TimerId>,
     /// What the next `poll` hands back, so a test can drive a loop the same
@@ -202,6 +203,9 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn set_idle_thresholds(&mut self, seconds: &[u32]) {
+        self.idle_thresholds = seconds.to_vec();
+    }
     fn set_active(&mut self, active: bool) {
         self.active = active;
     }

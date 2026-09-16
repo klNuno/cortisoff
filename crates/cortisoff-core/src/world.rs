@@ -65,6 +65,7 @@ pub struct World {
     /// fullscreen", while `fullscreen` above is the exclusive case only.
     pub maximized: bool,
     pub idle: bool,
+    pub idle_seconds: u32,
     pub locked: bool,
     pub on_battery: bool,
     pub audio_active: bool,
@@ -103,9 +104,16 @@ impl World {
                 let v = *maximized;
                 self.changed(v != self.maximized, Signals::MAXIMIZED, |w| w.maximized = v)
             }
-            Event::Idle { idle } => {
+            Event::Idle { idle, seconds } => {
                 let v = *idle;
-                self.changed(v != self.idle, Signals::IDLE, |w| w.idle = v)
+                self.changed(
+                    v != self.idle || *seconds != self.idle_seconds,
+                    Signals::IDLE,
+                    |w| {
+                        w.idle = v;
+                        w.idle_seconds = *seconds;
+                    },
+                )
             }
             Event::SessionLock { locked } => {
                 let v = *locked;

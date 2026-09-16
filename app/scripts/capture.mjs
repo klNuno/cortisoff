@@ -26,6 +26,7 @@ const size = process.env.SIZE ?? "940,680";
 const views = {
   grid: "",
   "grid-inactive": "inactive=1",
+  "grid-disabled": "disabled=1",
   "grid-light": "theme=light&usage=1",
   settings: "open=settings",
   "settings-machine": "open=settings:machine",
@@ -35,6 +36,7 @@ const views = {
   "rule-blue-light": "open=rule:blue light at night",
   "rule-display-profile": "open=rule:display profile",
   "rule-wallpaper": "open=rule:pause wallpaper while away",
+  "rule-wallpaper-light": "theme=light&open=rule:pause wallpaper while away",
 };
 
 const edge =
