@@ -47,6 +47,24 @@ pub trait Actuator {
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError>;
 
+    /// The hardware underneath moved: a monitor was plugged, unplugged, or
+    /// woke up with a different identity. Hand back a baseline covering what
+    /// is there now, or `None` when the one already captured still does.
+    ///
+    /// This exists because a baseline is captured once, on the first apply,
+    /// and a monitor that arrives after it is not in it. Tinting that monitor
+    /// with nothing to put back is how a screen stays orange: the release
+    /// restores the monitors that were there at capture time and leaves the
+    /// newcomer tinted, with no entry in the journal to fix it at the next
+    /// start either.
+    ///
+    /// Called only when the platform reports a configuration change, never on
+    /// the apply path: a fade steps twenty five times a second and must not
+    /// pay for a monitor enumeration each time.
+    fn recapture(&self) -> Option<Result<Value, ActuatorError>> {
+        None
+    }
+
     /// True when the operating system undoes this by itself once the process
     /// dies, which means it needs no baseline journal.
     ///
