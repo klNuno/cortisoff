@@ -21,7 +21,18 @@ const host = execFileSync("rustc", ["-vV"], { encoding: "utf8" }).match(/^host: 
 if (!host) throw new Error("rustc -vV did not name a host triple");
 
 const profile = release ? "release" : "debug";
-const target = process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : join(root, "target");
+
+// Where cargo writes, asked rather than guessed. `<root>/target` is wrong on
+// any machine that shares one build cache between checkouts, and the
+// environment does not have to say so: a wrapper can set the directory in the
+// cargo invocation alone, which is how this failed on a machine with a
+// `build-safe` launcher.
+const metadata = execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+  cwd: root,
+  encoding: "utf8",
+  maxBuffer: 64 * 1024 * 1024,
+});
+const target = resolve(JSON.parse(metadata).target_directory);
 
 execFileSync(
   "cargo",
