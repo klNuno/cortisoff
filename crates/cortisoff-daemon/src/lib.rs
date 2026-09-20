@@ -8,12 +8,14 @@
 #![forbid(unsafe_code)]
 
 mod journal;
+mod log;
 mod paths;
 mod server;
 mod startup;
 mod supervisor;
 
 pub use journal::FileJournal;
+pub use log::{append, DaemonLog, Mark, Previous, Stamp};
 pub use paths::{Layout, PathError, Paths};
 pub use server::{ClientId, Outbound, Server};
 pub use startup::Interference;

@@ -37,6 +37,9 @@ pub struct Paths {
     /// Rewritten by the daemon and meaningless to a human, so it lives with
     /// state and is never in a backup the user restores by hand.
     pub journal: PathBuf,
+    /// Why the daemon is or is not running, kept next to the journal because
+    /// it describes this machine's runs and nothing the user authored.
+    pub log: PathBuf,
 }
 
 /// Missing environment, named so the message can say which variable.
@@ -99,6 +102,7 @@ impl Paths {
         Ok(Paths {
             rules: config.join("cortisoff").join("rules.toml"),
             journal: state.join("cortisoff").join("journal.json"),
+            log: state.join("cortisoff").join("cortisoffd.log"),
         })
     }
 }
@@ -129,6 +133,10 @@ mod tests {
         assert!(p.rules.ends_with("cortisoff/rules.toml"));
         assert!(p.rules.starts_with(r"C:\Users\x\AppData\Roaming"));
         assert!(p.journal.starts_with(r"C:\Users\x\AppData\Local"));
+        // The log describes this machine's runs, so it sits with the journal
+        // rather than with the roaming rules.
+        assert!(p.log.ends_with("cortisoff/cortisoffd.log"));
+        assert!(p.log.starts_with(r"C:\Users\x\AppData\Local"));
     }
 
     #[test]

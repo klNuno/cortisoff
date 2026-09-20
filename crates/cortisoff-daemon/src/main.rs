@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cortisoff_core::{CapTable, Engine};
-use cortisoff_daemon::{resting, ClientId, FileJournal, Paths, Server, Supervisor};
+use cortisoff_daemon::{
+    resting, ClientId, DaemonLog, FileJournal, Mark, Paths, Previous, Server, Supervisor,
+};
 use cortisoff_host::{CapabilitySet, LogLevel};
 use cortisoff_ipc::Notification;
 
@@ -48,26 +50,79 @@ fn run(args: Args) -> Result<(), String> {
         return platform::autostart(mode);
     }
 
+    // Paths read the environment and touch no file, so the log is open before
+    // the session lock is even asked for. A process that never becomes the
+    // daemon is exactly the one whose reason for leaving gets lost otherwise.
+    let paths = Paths::from_env().map_err(|e| e.0)?;
+    let rules_path = args.rules.clone().unwrap_or(paths.rules);
+    let journal_path = args.journal.clone().unwrap_or(paths.journal);
+    let log_path = args.log.clone().unwrap_or(paths.log);
+
+    // The doctor only reads: no lock, no line in the log, nothing that makes
+    // a second run look like a daemon.
+    let mut log = if args.doctor || args.no_log {
+        DaemonLog::off()
+    } else {
+        DaemonLog::open(&log_path)
+    };
+
     // Before anything is read or applied: a second daemon would capture the
-    // first one's tint as its baseline. The doctor only reads, so it may run
-    // next to a live daemon.
+    // first one's tint as its baseline.
     let _session = if args.doctor {
         None
     } else {
-        Some(platform::claim_session().ok_or(
-            "another cortisoffd is already running in this session. `cortisoff stop` ends it",
-        )?)
+        match platform::claim_session() {
+            Some(lock) => Some(lock),
+            None => {
+                let said = "another cortisoffd is already running in this session. \
+                            `cortisoff stop` ends it";
+                // Once, however often the safety-net trigger tries.
+                log.line_once(platform::now(), Mark::Refused, said);
+                return Err(said.to_owned());
+            }
+        }
     };
     if !args.doctor && !args.no_eco {
         platform::efficiency_mode();
     }
 
-    let paths = Paths::from_env().map_err(|e| e.0)?;
-    let rules_path = args.rules.unwrap_or(paths.rules);
-    let journal_path = args.journal.unwrap_or(paths.journal);
+    let mut warnings = Vec::new();
+    if log.writing() {
+        let previous = log.start(
+            platform::now(),
+            &format!(
+                "cortisoffd {} as pid {}",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id()
+            ),
+        );
+        if previous == Previous::Cut {
+            warnings.push(format!(
+                "the previous run ended without handing the screen back. {} has the last thing \
+                 it said",
+                log.path().display()
+            ));
+        }
+        log_panics_to(&log_path);
+    }
+    warnings.extend(log.warnings().iter().cloned());
 
-    let rules = read_rules(&rules_path)?;
-    let (mut host, mut warnings) = platform::host(!args.doctor && !args.no_tray)?;
+    let rules = read_rules(&rules_path).inspect_err(|e| {
+        log.line(
+            platform::now(),
+            Mark::Exit,
+            &format!("could not start: {e}"),
+        );
+    })?;
+    let (mut host, host_warnings) =
+        platform::host(!args.doctor && !args.no_tray).inspect_err(|e| {
+            log.line(
+                platform::now(),
+                Mark::Exit,
+                &format!("could not start: {e}"),
+            )
+        })?;
+    warnings.extend(host_warnings);
     let probed = host.probe();
 
     let journal = FileJournal::open(&journal_path);
@@ -95,6 +150,9 @@ fn run(args: Args) -> Result<(), String> {
 
     println!("cortisoffd, rules from {}", rules_path.display());
     println!("baselines in {}", journal_path.display());
+    if log.writing() {
+        println!("log in {}", log.path().display());
+    }
     print_capabilities(&probed);
 
     let mut transport = match platform::listen() {
@@ -110,7 +168,7 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut server = Server::new(supervisor);
     server.supervisor_mut().start(host.as_mut());
-    flush(&mut server, &mut transport, args.verbose);
+    flush(&mut server, &mut transport, args.verbose, &mut log);
 
     if !platform::watch_for_stop() {
         eprintln!("warning: Ctrl-C will not restore the screen on the way out");
@@ -143,22 +201,44 @@ fn run(args: Args) -> Result<(), String> {
                 }
             }
         }
-        flush(&mut server, &mut transport, args.verbose);
+        flush(&mut server, &mut transport, args.verbose, &mut log);
     }
 
     // A client asking to stop has already been served: `Request::Shutdown`
     // restores the baselines itself, so that the exit path that always runs is
     // the one holding the restore. Only Ctrl-C still owes the screen anything.
-    if !server.stopping() {
+    let asked = server.stopping();
+    if !asked {
         println!("putting every screen back");
         server.supervisor_mut().shutdown(host.as_mut());
         server.supervisor_mut().note_closing();
     }
-    flush(&mut server, &mut transport, args.verbose);
+    flush(&mut server, &mut transport, args.verbose, &mut log);
     for e in server.supervisor().errors() {
         eprintln!("error: {e}");
     }
+    log.line(
+        platform::now(),
+        Mark::Exit,
+        if asked {
+            "a client asked it to stop, every screen handed back"
+        } else {
+            "Ctrl-C or the tray icon, every screen handed back"
+        },
+    );
     Ok(())
+}
+
+/// A panic writes its own line before the process goes, so the file never
+/// blames a crash on something that killed the daemon from outside. The
+/// release profile aborts on panic, and a hook still runs before the abort.
+fn log_panics_to(path: &Path) {
+    let path = path.to_path_buf();
+    let inner = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        cortisoff_daemon::append(&path, platform::now(), Mark::Panic, &info.to_string());
+        inner(info);
+    }));
 }
 
 /// The rule file, seeded on first run rather than treated as an error. A
@@ -182,19 +262,37 @@ fn read_rules(path: &Path) -> Result<Vec<cortisoff_core::Rule>, String> {
 ///
 /// Quiet by default: an event per focus change is noise, a rule changing its
 /// mind is not.
-fn flush(server: &mut Server<FileJournal>, transport: &mut platform::Transport, verbose: bool) {
+fn flush(
+    server: &mut Server<FileJournal>,
+    transport: &mut platform::Transport,
+    verbose: bool,
+    log: &mut DaemonLog,
+) {
     let outbound = server.fan_out();
     transport.write(outbound);
     for notification in server.drain_log() {
         match notification {
             Notification::RuleEdge { rule, holding } => {
                 println!("{} {rule}", if holding { "hold   " } else { "release" });
+                let mark = if holding { Mark::Hold } else { Mark::Release };
+                log.line(platform::now(), mark, &rule);
             }
-            Notification::Log { level, message } => match level {
-                LogLevel::Error => eprintln!("error: {message}"),
-                LogLevel::Warn => eprintln!("warning: {message}"),
-                _ => println!("{message}"),
-            },
+            Notification::Log { level, message } => {
+                match level {
+                    LogLevel::Error => eprintln!("error: {message}"),
+                    LogLevel::Warn => eprintln!("warning: {message}"),
+                    _ => println!("{message}"),
+                }
+                // Everything the user would want to read the morning after,
+                // and nothing per event: an action a second would bury the
+                // one line that says why the daemon is gone.
+                let mark = match level {
+                    LogLevel::Error => Mark::Error,
+                    LogLevel::Warn => Mark::Warn,
+                    _ => Mark::Info,
+                };
+                log.line(platform::now(), mark, &message);
+            }
             Notification::Closing => println!("closing"),
             Notification::Action(action) if verbose => println!("action {action:?}"),
             Notification::Event(event) if verbose => println!("event  {event:?}"),
@@ -250,6 +348,8 @@ const USAGE: &str = "cortisoffd, the cortisoff daemon
 
     --rules <path>    rule file to load, default is the per-user one
     --journal <path>  where captured baselines are written
+    --log <path>      where starts, exits and rule edges are written
+    --no-log          write no such file
     --doctor          print the capability and rule report, then exit
     --verbose         print every event and action, not only rule edges
     --autostart <on|off|status>
@@ -262,6 +362,8 @@ const USAGE: &str = "cortisoffd, the cortisoff daemon
 struct Args {
     rules: Option<PathBuf>,
     journal: Option<PathBuf>,
+    log: Option<PathBuf>,
+    no_log: bool,
     doctor: bool,
     verbose: bool,
     autostart: Option<String>,
@@ -278,6 +380,8 @@ impl Args {
             match arg.as_str() {
                 "--rules" => out.rules = args.next().map(PathBuf::from),
                 "--journal" => out.journal = args.next().map(PathBuf::from),
+                "--log" => out.log = args.next().map(PathBuf::from),
+                "--no-log" => out.no_log = true,
                 "--doctor" => out.doctor = true,
                 "--verbose" | "-v" => out.verbose = true,
                 "--autostart" => {
@@ -294,10 +398,24 @@ impl Args {
 
 #[cfg(windows)]
 mod platform {
-    use cortisoff_daemon::{Interference, Outbound};
+    use cortisoff_daemon::{Interference, Outbound, Stamp};
     use cortisoff_host::Host;
 
     pub use cortisoff_win::Incoming;
+
+    /// Local time, the same call the rule engine's clock events come from, so
+    /// a line in the log and a `between` rule never disagree about the hour.
+    pub fn now() -> Stamp {
+        let now = cortisoff_win::local_time();
+        Stamp {
+            year: now.0,
+            month: now.1,
+            day: now.2,
+            hour: now.3,
+            minute: now.4,
+            second: now.5,
+        }
+    }
 
     /// The host, and whatever it wants the user warned about before anything
     /// is applied.
@@ -402,8 +520,18 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use cortisoff_daemon::{Interference, Outbound};
+    use cortisoff_daemon::{Interference, Outbound, Stamp};
     use cortisoff_host::Host;
+
+    /// UTC until a platform here has a local-time call of its own. No daemon
+    /// runs on one yet, so nothing reads these lines.
+    pub fn now() -> Stamp {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        Stamp::from_unix_utc(secs)
+    }
 
     /// The same shape the Windows transport hands back, so the loop above
     /// needs no `cfg` of its own. Nothing constructs these until a platform
