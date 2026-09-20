@@ -243,16 +243,30 @@ impl ColorTemp {
     /// Put back exactly what was captured, monitor by monitor and panel by
     /// panel, and drop the magnifier effect whether or not it is live.
     fn restore(&self, encoded: &str) -> Result<(), ActuatorError> {
-        self.restore_using(encoded, set_magnifier, screen::write, ddc::write)
+        self.restore_using(
+            encoded,
+            &screen::device_names(),
+            set_magnifier,
+            screen::write,
+            ddc::write,
+        )
     }
 
+    /// `present` is every monitor on this machine right now. A baseline naming
+    /// one that is not there is not a failure: it is a monitor that was
+    /// unplugged or switched off since it was captured, and its entry is kept
+    /// for the run where it comes back. Counting it as a failure is what left
+    /// the journal permanently dirty and the doctor permanently complaining
+    /// about a screen nobody can put back.
     fn restore_using(
         &self,
         encoded: &str,
+        present: &[String],
         reset: impl FnOnce(&Rgb) -> Result<(), ActuatorError>,
         mut write_ramp: impl FnMut(&str, &Ramp) -> bool,
         mut write_panel: impl FnMut(&str, [u32; 3]) -> bool,
     ) -> Result<(), ActuatorError> {
+        let here = |device: &str| present.iter().any(|d| d == device);
         let mut failures = Vec::new();
         if self.magnifier {
             if let Err(error) = reset(&Rgb::NEUTRAL) {
@@ -260,7 +274,7 @@ impl ColorTemp {
             }
         }
         for (device, ramp) in color::decode(encoded) {
-            if !write_ramp(&device, &ramp) {
+            if !write_ramp(&device, &ramp) && here(&device) {
                 failures.push(format!("gamma ramp on {device}"));
             }
         }
@@ -273,7 +287,7 @@ impl ColorTemp {
             if known && !live.touched.contains(&key) {
                 continue;
             }
-            if !write_panel(&key, ddc::currents(&gains)) {
+            if !write_panel(&key, ddc::currents(&gains)) && here(ddc::device_of(&key)) {
                 failures.push(format!("panel gains on {key}"));
             }
         }
@@ -327,13 +341,64 @@ impl Actuator for ColorTemp {
             ddc::capture(&capable)
         };
 
-        let mut encoded = color::encode(&ramps);
-        if !gains.is_empty() {
-            encoded.push(';');
-            encoded.push_str(&ddc::encode(&gains));
-        }
-        *self.captured.borrow_mut() = Some(Captured { ramps, gains });
+        let captured = Captured { ramps, gains };
+        let encoded = encode(&captured);
+        *self.captured.borrow_mut() = Some(captured);
         Ok(Value::Text(encoded))
+    }
+
+    /// A monitor arrived, or came back, while a tint was held.
+    ///
+    /// Only what is missing from the baseline is read. A monitor that is gone
+    /// keeps its captured ramp, because that is what has to go back if it
+    /// returns under the same name, and a monitor this claim is already
+    /// tinting is skipped: its ramp is this process's own tint, and capturing
+    /// that as a baseline is how a screen stays orange for good.
+    fn recapture(&self) -> Option<Result<Value, ActuatorError>> {
+        let mut held = self.captured.borrow_mut();
+        // Nothing applied means nothing to grow: the next apply captures a
+        // whole baseline of its own.
+        let captured = held.as_mut()?;
+        let mut live = self.live.borrow_mut();
+
+        // A panel that refused a write while its monitor was renegotiating
+        // its link is not a panel that cannot do DDC/CI. Without this, one
+        // refusal during a display change left that monitor on the gamma path
+        // until the claim ended, which for the blue light rule is all night.
+        live.refused.clear();
+
+        let fresh: Vec<(String, Ramp)> = screen::device_names()
+            .into_iter()
+            .filter(|device| !captured.ramps.iter().any(|(d, _)| d == device))
+            .filter(|device| !live.gamma.contains(device))
+            .filter_map(|device| screen::capture(&device).map(|ramp| (device, ramp)))
+            .collect();
+
+        // Panels answer slowly, so they are only asked about on an output
+        // that can turn HDR on and has nothing captured yet.
+        let capable: Vec<String> = screen::hdr_outputs()
+            .into_iter()
+            .filter(|o| o.supported)
+            .map(|o| o.device)
+            .filter(|device| {
+                !captured
+                    .gains
+                    .iter()
+                    .any(|(key, _)| ddc::device_of(key) == device)
+            })
+            .collect();
+        let gains = if capable.is_empty() {
+            Vec::new()
+        } else {
+            ddc::capture(&capable)
+        };
+
+        if fresh.is_empty() && gains.is_empty() {
+            return None;
+        }
+        captured.ramps.extend(fresh);
+        captured.gains.extend(gains);
+        Some(Ok(Value::Text(encode(captured))))
     }
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError> {
@@ -392,6 +457,16 @@ fn push_ramp(device: &str, ramp: &Ramp, clamped: &mut Option<Option<Ramp>>) -> b
         .get_or_insert_with(|| color::within_windows_range(ramp))
         .as_ref()
         .is_some_and(|inside| screen::write(device, inside))
+}
+
+/// The baseline as the journal holds it: every ramp, then every panel gain.
+fn encode(captured: &Captured) -> String {
+    let mut encoded = color::encode(&captured.ramps);
+    if !captured.gains.is_empty() {
+        encoded.push(';');
+        encoded.push_str(&ddc::encode(&captured.gains));
+    }
+    encoded
 }
 
 fn baseline_ramp(captured: Option<&Captured>, device: &str) -> Ramp {
@@ -489,6 +564,7 @@ mod tests {
         let mut panels = Vec::new();
         let result = actuator.restore_using(
             &encoded,
+            &both(),
             |_| panic!("no magnifier was initialized"),
             |device, ramp| {
                 ramps.push((device.to_owned(), ramp[0]));
@@ -510,6 +586,7 @@ mod tests {
         actuator
             .restore_using(
                 &encoded,
+                &both(),
                 |_| unreachable!(),
                 |_, _| true,
                 |key, values| {
@@ -534,6 +611,7 @@ mod tests {
         let error = actuator
             .restore_using(
                 &encoded,
+                &both(),
                 |_| unreachable!(),
                 |_, _| false,
                 |key, _| {
@@ -554,6 +632,7 @@ mod tests {
         actuator
             .restore_using(
                 &encoded,
+                &both(),
                 |_| unreachable!(),
                 |_, _| true,
                 |key, _| {
@@ -564,6 +643,36 @@ mod tests {
             .unwrap();
         assert_eq!(panels, vec![ddc::key(ONE, 0)]);
         assert!(actuator.captured.borrow().is_none());
+    }
+
+    /// The monitor that carried the baseline is switched off. Nothing can be
+    /// written to it and nothing needs to be: the restore has to succeed, or
+    /// the journal stays dirty for a screen that is no longer there.
+    #[test]
+    fn a_monitor_that_is_gone_is_not_a_failed_restore() {
+        let (actuator, encoded) = restoration_fixture(true);
+        let mut written = Vec::new();
+        actuator
+            .restore_using(
+                &encoded,
+                &[TWO.to_owned()],
+                |_| unreachable!(),
+                |device, _| {
+                    written.push(device.to_owned());
+                    device == TWO
+                },
+                |_, _| false,
+            )
+            .expect("a monitor that left is not a failure");
+        // Both were attempted: a device can come back under the same name
+        // between the enumeration and the write.
+        assert_eq!(written, vec![ONE.to_owned(), TWO.to_owned()]);
+        assert!(actuator.captured.borrow().is_none());
+    }
+
+    /// Every monitor the fixture describes, as the machine would report them.
+    fn both() -> Vec<String> {
+        vec![ONE.to_owned(), TWO.to_owned()]
     }
 
     fn outputs(hdr: &[bool]) -> Vec<(String, bool)> {

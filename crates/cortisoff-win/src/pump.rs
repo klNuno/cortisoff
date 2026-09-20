@@ -36,9 +36,45 @@ use crate::tray::{self, Tray};
 use crate::vibrance::Vibrance;
 use crate::wallpaper::Wallpaper;
 
+/// The wall clock, local, as year, month, day, hour, minute, second and
+/// millisecond.
+///
+/// The one reading in the project: the rule engine's clock events and the
+/// daemon's log both come through here, so they never disagree about the hour
+/// across a daylight-saving change.
+pub fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
+    let now = unsafe { GetLocalTime() };
+    (
+        now.wYear,
+        now.wMonth as u8,
+        now.wDay as u8,
+        now.wHour as u8,
+        now.wMinute as u8,
+        now.wSecond as u8,
+        now.wMilliseconds,
+    )
+}
+
 /// The daemon's own beats, kept away from the engine's timer ids.
 const IDLE_TIMER: usize = 0x0100_0000;
 const AUDIO_TIMER: usize = 0x0100_0001;
+const DISPLAY_TIMER: usize = 0x0100_0002;
+
+/// When a display change is pushed again, counted from the message that
+/// announced it.
+///
+/// `WM_DISPLAYCHANGE` arrives while the driver is still working. A tint
+/// written inside that window is accepted and then dropped when the driver
+/// finishes reprogramming the output, which is what made switching a monitor
+/// off and on look like cortisoff had quit: the ramp went back to neutral and
+/// nothing asked for it again until the rule's next edge, hours later. So the
+/// answer is pushed again as the configuration settles. Three extra applies
+/// per display change cost a few ramp writes and nothing else.
+const SETTLE: [Duration; 3] = [
+    Duration::from_millis(400),
+    Duration::from_millis(1_500),
+    Duration::from_millis(4_000),
+];
 /// Engine timer ids are shifted by one, because a Windows timer id of zero is
 /// legal but easy to confuse with "no timer".
 const ENGINE_TIMER_BASE: usize = 1;
@@ -78,6 +114,9 @@ pub struct WinHost {
     /// The first poll answers with a snapshot: rules are predicates over a
     /// world, so they need the world before they can mean anything.
     snapshot_sent: bool,
+    /// How far through [`SETTLE`] the current display change is. `None`
+    /// between changes.
+    settling: Option<usize>,
 }
 
 impl WinHost {
@@ -140,6 +179,7 @@ impl WinHost {
             display_mode: DisplayMode::new(),
             wallpaper: Wallpaper::new(),
             snapshot_sent: false,
+            settling: None,
         })
     }
 
@@ -183,11 +223,11 @@ impl WinHost {
     }
 
     fn clock(&self) -> Event {
-        let now = unsafe { GetLocalTime() };
+        let (_, _, _, hour, minute, second, millisecond) = local_time();
         Event::TimeOfDay {
-            minute: now.wHour * 60 + now.wMinute,
-            second: now.wSecond.min(59) as u8,
-            millisecond: now.wMilliseconds,
+            minute: u16::from(hour) * 60 + u16::from(minute),
+            second: second.min(59),
+            millisecond,
         }
     }
 
@@ -239,6 +279,25 @@ impl WinHost {
     fn arm_idle_timer_at(&self, seconds: u32) {
         let ms = idle_poll_after(seconds, &self.idle_thresholds) * 1000;
         unsafe { SetCoalescableTimer(self.window, IDLE_TIMER, ms, None, 100) };
+    }
+
+    /// Arm the next push of a display change, or stop once the last one in
+    /// [`SETTLE`] has fired. A change arriving mid-series restarts it, which
+    /// is what a monitor announcing itself three times in a row needs.
+    fn arm_settle(&mut self, step: usize) {
+        match SETTLE.get(step) {
+            Some(after) => {
+                self.settling = Some(step);
+                let ms = after.as_millis() as u32;
+                // No slack: the point is to land while the driver is still
+                // settling, and a coalesced timer could drift past it.
+                unsafe { SetCoalescableTimer(self.window, DISPLAY_TIMER, ms, None, 0) };
+            }
+            None => {
+                self.settling = None;
+                let _ = unsafe { KillTimer(self.window, DISPLAY_TIMER) };
+            }
+        }
     }
 
     fn foreground_event(&mut self, hwnd: HWND) -> Option<Event> {
@@ -318,7 +377,11 @@ impl WinHost {
                 self.maximized_event(hwnd).into_iter().collect()
             }
             Raw::Lock(locked) => vec![Event::SessionLock { locked }],
-            Raw::DisplayChanged => vec![Event::DisplayConfigChanged],
+            // Answered now and again as the configuration settles: see SETTLE.
+            Raw::DisplayChanged => {
+                self.arm_settle(0);
+                vec![Event::DisplayConfigChanged]
+            }
             Raw::ClockMoved => vec![self.clock()],
             Raw::Power(on_battery) => {
                 if on_battery == self.on_battery {
@@ -338,6 +401,13 @@ impl WinHost {
                 }
             }
 
+            // The driver has had another moment to finish. Push the change
+            // again, and keep the series going until it runs out.
+            Raw::Timer(DISPLAY_TIMER) => {
+                let next = self.settling.map_or(SETTLE.len(), |step| step + 1);
+                self.arm_settle(next);
+                vec![Event::DisplayConfigChanged]
+            }
             Raw::Timer(AUDIO_TIMER) => {
                 let active = self.audio.playing();
                 if active == self.audio_active {

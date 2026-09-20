@@ -84,6 +84,19 @@ fn current_user() -> Option<String> {
 /// The task, as Task Scheduler's own schema. Ten seconds after logon, this
 /// user's token, no time limit, never a second copy, and nothing that stops it
 /// on battery.
+///
+/// The second trigger is what makes a logon trigger enough on a machine that
+/// is never rebooted. A daemon that died at midday stayed dead until the next
+/// logon, which on a desktop left running for a week is a week without it.
+/// Every five minutes, forever, Task Scheduler tries to start it again;
+/// `MultipleInstancesPolicy IgnoreNew` means that costs nothing at all while
+/// the daemon it started is still alive, and the session mutex catches the one
+/// case it cannot see, a daemon someone started by hand.
+///
+/// `RestartOnFailure` is not that safety net, whatever its name suggests: on
+/// Windows 11 26200 neither a non-zero exit nor an action that cannot be
+/// launched at all arms it. It stays because it costs nothing, and the
+/// repetition is what is relied on. `TRAPS.md`, platform and process model.
 pub fn task_xml(daemon: &Path, user: &str) -> String {
     let command = escape(&daemon.to_string_lossy());
     let user = escape(user);
@@ -99,6 +112,14 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
       <UserId>{user}</UserId>
       <Delay>PT10S</Delay>
     </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -108,6 +129,10 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
     </Principal>
   </Principals>
   <Settings>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -153,6 +178,21 @@ mod tests {
         assert!(xml.contains(r"<Command>C:\Tom &amp; Jerry\cortisoffd.exe</Command>"));
         assert_eq!(xml.matches(r"<UserId>PC\tom</UserId>").count(), 2);
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+    }
+
+    /// A logon trigger alone only covers a machine that is turned off at
+    /// night. The repetition is what covers the one that is not, and
+    /// `IgnoreNew` is what makes it free while the daemon is alive.
+    #[test]
+    fn a_dead_daemon_is_started_again_without_waiting_for_the_next_logon() {
+        let xml = task_xml(Path::new(r"C:\cortisoffd.exe"), "tom");
+        assert!(xml.contains("<Repetition>"));
+        assert!(xml.contains("<Interval>PT5M</Interval>"));
+        assert!(
+            !xml.contains("<Duration>"),
+            "no duration means the repetition never ends"
+        );
+        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
     }
 
     /// Creates a real task and deletes it straight away. Ignored by default

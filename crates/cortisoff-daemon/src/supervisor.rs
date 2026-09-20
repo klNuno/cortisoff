@@ -125,6 +125,14 @@ impl<J: JournalStore> Supervisor<J> {
         if !matches!(event, Event::TimerFired { .. }) {
             self.note(Notification::Event(event.clone()));
         }
+        // Monitors moved. Whatever is applied may now cover hardware that
+        // arrived after its baseline was captured, so the baseline grows
+        // before the engine pushes anything else at it.
+        if matches!(event, Event::DisplayConfigChanged) {
+            for e in self.dispatcher.rebaseline(&*host) {
+                self.fail(e);
+            }
+        }
         let before = self.holding_names();
         let actions = self.engine.on_event(&event);
         self.report_edges(before);
@@ -795,6 +803,30 @@ set.display.vibrance = 100
                 .expect("the mock journal always reads")
                 .is_empty(),
             "a cleanly restored baseline has nothing left to recover"
+        );
+    }
+
+    /// A monitor that arrives while a rule holds the screen: the baseline
+    /// grows before the rule is pushed at it, so releasing the rule puts that
+    /// monitor back too.
+    #[test]
+    fn a_display_change_grows_the_baseline_before_anything_is_pushed_again() {
+        let mut h = host();
+        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
+        s.start(&mut h);
+        s.handle(&mut h, focus("game.exe"));
+        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
+
+        h.grow_baseline(VIBRANCE, Value::Int(55));
+        s.handle(&mut h, Event::DisplayConfigChanged);
+
+        // The rule still holds, so the screen keeps the rule's value.
+        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
+        s.handle(&mut h, focus("notepad.exe"));
+        assert_eq!(
+            h.value(VIBRANCE),
+            Some(Value::Int(55)),
+            "the baseline captured after the monitors moved is the one that goes back"
         );
     }
 

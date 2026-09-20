@@ -38,6 +38,10 @@ pub struct MockActuator {
     state: RefCell<Value>,
     volatile: bool,
     trace: Trace,
+    /// What the next `recapture` hands back, standing in for a monitor that
+    /// arrived after the baseline was captured. Taken once, the way real
+    /// hardware only moves once per event.
+    grown: RefCell<Option<Value>>,
 }
 
 impl Actuator for MockActuator {
@@ -54,6 +58,12 @@ impl Actuator for MockActuator {
         self.trace.push(format!("apply {} {:?}", self.id, value));
         *self.state.borrow_mut() = value.clone();
         Ok(())
+    }
+
+    fn recapture(&self) -> Option<Result<Value, ActuatorError>> {
+        let grown = self.grown.borrow_mut().take()?;
+        self.trace.push(format!("recapture {}", self.id));
+        Some(Ok(grown))
     }
 
     fn volatile(&self) -> bool {
@@ -184,9 +194,19 @@ impl MockHost {
                 state: RefCell::new(initial),
                 volatile,
                 trace: self.trace.clone(),
+                grown: RefCell::new(None),
             },
         );
         self
+    }
+
+    /// The hardware under this actuator moved: its next `recapture` hands
+    /// back `baseline`, the way a monitor arriving mid-claim grows the one
+    /// the journal holds.
+    pub fn grow_baseline(&self, id: &str, baseline: Value) {
+        if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
+            *actuator.grown.borrow_mut() = Some(baseline);
+        }
     }
 
     /// Queue an event for the next `poll`, as a platform would.

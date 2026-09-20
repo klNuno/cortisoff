@@ -78,6 +78,42 @@ impl<J: JournalStore> Dispatcher<J> {
         errors
     }
 
+    /// Grow the baselines of everything applied right now, after the platform
+    /// reports that the hardware moved.
+    ///
+    /// The same ordering as the first apply: a baseline that changed is
+    /// durable before anything is pushed at the monitor it describes. The
+    /// caller runs this on a display-configuration event, ahead of the actions
+    /// the engine emits for it.
+    pub fn rebaseline(&mut self, host: &dyn Host) -> Vec<ActuatorError> {
+        let mut errors = Vec::new();
+        for (cap, baseline) in &mut self.captured {
+            let Some(actuator) = host.actuator(cap) else {
+                continue;
+            };
+            let fresh = match actuator.recapture() {
+                None => continue,
+                Some(Ok(fresh)) if fresh == *baseline => continue,
+                Some(Ok(fresh)) => fresh,
+                Some(Err(e)) => {
+                    errors.push(e);
+                    continue;
+                }
+            };
+            // The journal first, and the in-memory copy only if it took: a
+            // baseline this process believes in but cannot write down is the
+            // one case the crash path cannot recover from.
+            if !actuator.volatile() {
+                if let Err(e) = self.journal.record(cap, &fresh) {
+                    errors.push(e);
+                    continue;
+                }
+            }
+            *baseline = fresh;
+        }
+        errors
+    }
+
     pub fn execute(&mut self, host: &dyn Host, actions: Vec<Action>) -> Outcome {
         let mut out = Outcome::default();
         for action in actions {
@@ -261,6 +297,64 @@ mod tests {
         let host = MockHost::new().with_actuator(MODE, Value::Int(144), false);
         assert!(d.recover(&host).is_empty());
         assert_eq!(host.value(MODE), Some(Value::Int(60)));
+    }
+
+    /// A monitor arrived while the tint was held. The baseline that gets
+    /// restored, and the one on disk, both have to cover it.
+    #[test]
+    fn a_baseline_that_grew_is_journaled_and_restored() {
+        let host = MockHost::new().with_actuator(TEMP, Value::Int(6500), false);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        d.execute(&host, vec![apply_action(TEMP, 3400)]);
+
+        host.grow_baseline(TEMP, Value::Int(6000));
+        assert!(d.rebaseline(&host).is_empty());
+        d.execute(&host, vec![restore_action(TEMP)]);
+
+        assert_eq!(host.value(TEMP), Some(Value::Int(6000)));
+        assert_eq!(
+            host.trace().events(),
+            vec![
+                format!("capture {TEMP}"),
+                format!("journal {TEMP}"),
+                format!("apply {TEMP} Int(3400)"),
+                format!("recapture {TEMP}"),
+                // Durable before anything else touches the new monitor.
+                format!("journal {TEMP}"),
+                format!("apply {TEMP} Int(6000)"),
+                format!("unjournal {TEMP}"),
+            ]
+        );
+    }
+
+    /// Nothing moved under the actuator, so nothing is written.
+    #[test]
+    fn rebaseline_without_a_change_touches_neither_journal_nor_hardware() {
+        let host = MockHost::new().with_actuator(TEMP, Value::Int(6500), false);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        d.execute(&host, vec![apply_action(TEMP, 3400)]);
+        let before = host.trace().events().len();
+
+        assert!(d.rebaseline(&host).is_empty());
+
+        assert_eq!(host.trace().events().len(), before);
+    }
+
+    /// The journal is what makes the new monitor recoverable. If it refuses,
+    /// the process must keep believing in the baseline it can still restore.
+    #[test]
+    fn a_refused_journal_write_leaves_the_old_baseline_in_place() {
+        let host = MockHost::new().with_actuator(TEMP, Value::Int(6500), false);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        d.execute(&host, vec![apply_action(TEMP, 3400)]);
+        // The disk goes away after the first baseline landed on it.
+        d.journal.refuse_records();
+
+        host.grow_baseline(TEMP, Value::Int(6000));
+        assert_eq!(d.rebaseline(&host).len(), 1);
+        d.execute(&host, vec![restore_action(TEMP)]);
+
+        assert_eq!(host.value(TEMP), Some(Value::Int(6500)));
     }
 
     /// The invariant itself: no durable baseline, no apply.

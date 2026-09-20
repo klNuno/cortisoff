@@ -34,7 +34,7 @@ pub use process::{
     claim_dashboard, claim_session, efficiency_mode, raise_dashboard, usage, InstanceLock,
     ProcessUsage,
 };
-pub use pump::WinHost;
+pub use pump::{local_time, WinHost};
 pub use screen::{hdr_outputs, Hdr};
 pub use startup::{current_ramp, running_processes};
 pub use tray::open_dashboard;
