@@ -66,6 +66,7 @@ export type Condition =
   | { when: "fullscreen"; value: boolean }
   | { when: "maximized"; value: boolean }
   | { when: "idle"; value: boolean }
+  | { when: "idle_for"; value: number }
   | { when: "locked"; value: boolean }
   | { when: "on_battery"; value: boolean }
   | { when: "audio_active"; value: boolean }

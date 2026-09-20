@@ -261,6 +261,9 @@ fn parse_when(value: &toml::Value, at: &str) -> Result<Condition, ConfigError> {
             "fullscreen" => Condition::Fullscreen(as_bool(value, &at)?),
             "maximized" => Condition::Maximized(as_bool(value, &at)?),
             "idle" => Condition::Idle(as_bool(value, &at)?),
+            "idle_for" => Condition::IdleFor(value.as_integer()
+                .filter(|v| (1..=86400).contains(v))
+                .ok_or_else(|| ConfigError::new(&at, "expected 1 to 86400 seconds"))? as u32),
             "locked" => Condition::Locked(as_bool(value, &at)?),
             "on_battery" => Condition::OnBattery(as_bool(value, &at)?),
             "audio" => Condition::AudioActive(as_bool(value, &at)?),
@@ -277,7 +280,7 @@ fn parse_when(value: &toml::Value, at: &str) -> Result<Condition, ConfigError> {
                     &at,
                     format!(
                         "unknown condition `{other}`, expected one of `app`, `title`, \
-                         `fullscreen`, `maximized`, `idle`, `locked`, `on_battery`, `audio`, \
+                         `fullscreen`, `maximized`, `idle`, `idle_for`, `locked`, `on_battery`, `audio`, \
                          `between`, `any`, `all`, `not`"
                     ),
                 ))
@@ -501,6 +504,20 @@ mod tests {
 
     fn cap(s: &str) -> CapabilityId {
         CapabilityId::new(s)
+    }
+
+    #[test]
+    fn an_idle_delay_round_trips_and_checks_the_threshold() {
+        let rules = parse_rules(
+            r#"[[rule]]
+name = "wallpaper"
+when.idle_for = 120
+set.wallpaper.playback = false
+"#,
+        )
+        .unwrap();
+        let encoded = crate::write_rules(&rules);
+        assert_eq!(parse_rules(&encoded).unwrap(), rules);
     }
 
     #[test]

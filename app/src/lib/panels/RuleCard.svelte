@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { wallpaperApp, wallpaperDelay } from "$lib/wallpaper";
   import { daemon } from "$lib/daemon.svelte";
   import {
     capabilityLabel,
@@ -34,6 +35,7 @@
     onedit: () => void;
   } = $props();
 
+  const wallpaper = $derived(wallpaperDelay(rule) !== null);
   const fade = $derived(describeTransition(rule.transition));
   const state = $derived(report?.state);
   const holding = $derived(report?.holding ?? false);
@@ -116,7 +118,7 @@
   <header class="flex items-start gap-2.5">
     <span class="mt-[7px] size-2 shrink-0 rounded-full {dot}" title={status}></span>
     <h3 class="min-w-0 flex-1 text-sm font-semibold leading-snug break-words">
-      {rule.name}
+      {wallpaper ? wallpaperApp(capabilities) : rule.name}
     </h3>
     <button
       type="button"
@@ -161,7 +163,7 @@
       {@const colour = swatch(assign.cap, assign.value)}
       <li class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[13px]">
         <span class="min-w-0 text-foreground-subtle" title={assign.cap}>
-          {capabilityLabel(assign.cap, capabilities)}
+          {wallpaper ? "When away" : capabilityLabel(assign.cap, capabilities)}
         </span>
         <span class="num ml-auto flex items-baseline gap-1.5 font-medium text-foreground">
           {#if colour}
@@ -170,7 +172,7 @@
               style:background={colour}
             ></span>
           {/if}
-          {describeAssign(rule, assign.cap, assign.value, capabilityOf(assign.cap, capabilities)?.control)}
+          {wallpaper ? ("bool" in assign.value && !assign.value.bool ? "Pause" : "Play") : describeAssign(rule, assign.cap, assign.value, capabilityOf(assign.cap, capabilities)?.control)}
         </span>
       </li>
     {:else}

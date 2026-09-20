@@ -61,14 +61,14 @@ export const templates: Template[] = [
   },
   {
     id: "away",
-    title: "Pause animated wallpaper",
-    summary: "Pauses Wallpaper Engine or Lively while you are away. Resumes playback when you return.",
+    title: "Wallpaper Engine / Lively",
+    summary: "Pause your animated wallpaper after a delay you choose. Resume when you use the keyboard or mouse.",
     needs: ["wallpaper.playback"],
     make: () => ({
       name: "pause wallpaper while away",
       priority: 0,
       enabled: true,
-      when: { when: "idle", value: true },
+      when: { when: "idle_for", value: 300 },
       set: [{ cap: "wallpaper.playback", value: { bool: false } }],
     }),
   },

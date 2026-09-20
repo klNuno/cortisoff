@@ -444,6 +444,7 @@
       {/if}
     </section>
 
+    {#if sets.some((row) => rangeFor(controlOf(row.cap)) !== null)}
     <section class="well flex flex-col gap-3 p-3.5">
       <header class="flex items-center justify-between gap-3">
         <div class="flex flex-col gap-0.5">
@@ -540,6 +541,7 @@
         {/each}
       {/if}
     </section>
+    {/if}
   </div>
 
   {#snippet footer()}

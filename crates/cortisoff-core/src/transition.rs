@@ -92,9 +92,21 @@ fn shape(start: u16, end: u16, fade: Fade) -> Shape {
 /// along a quarter cosine at the end. When the window is shorter than the two
 /// fades together, the lower of the two curves wins, so it never reaches full
 /// strength rather than jumping.
+#[cfg(test)]
 pub fn window_strength(start: u16, end: u16, t: u32, fade: Fade) -> f64 {
+    window_strength_ms(start, end, t * 1000, fade)
+}
+
+/// Subsecond schedule strength, using the host's local time.
+pub fn window_strength_ms(start: u16, end: u16, t: u32, fade: Fade) -> f64 {
     let s = shape(start, end, fade);
-    let into = (t % DAY + DAY - s.begin) % DAY;
+    let s = Shape {
+        begin: s.begin * 1000,
+        span: s.span * 1000,
+        seconds: s.seconds * 1000,
+    };
+    let day = DAY * 1000;
+    let into = (t % day + day - s.begin) % day;
     if into >= s.span {
         return 0.0;
     }
@@ -136,12 +148,9 @@ pub fn ramps(start: u16, end: u16, fade: Fade, out: &mut Vec<(u32, u32)>) {
     out.push((falling, s.seconds));
 }
 
-/// How often a running fade is stepped. Two hundred and forty steps over the
-/// fade, so a forty minute one moves every ten seconds, which no eye follows,
-/// and never more often than every five seconds or less often than once a
-/// minute.
-pub fn step(seconds: u32) -> u32 {
-    (seconds / 240).clamp(5, 60)
+/// Milliseconds between schedule frames. No frame timer runs outside fades.
+pub fn step(_seconds: u32) -> u32 {
+    40
 }
 
 /// The value at strength `s`, between where the fade starts and what the rule
@@ -332,10 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn a_fade_steps_every_ten_seconds_over_forty_minutes() {
-        assert_eq!(step(40 * 60), 10);
-        assert_eq!(step(30), 5);
-        assert_eq!(step(12 * 3600), 60);
+    fn fades_use_subsecond_frames() {
+        assert_eq!(step(40 * 60), 40);
+        assert_eq!(step(30), 40);
+        assert_eq!(step(12 * 3600), 40);
     }
 
     #[test]

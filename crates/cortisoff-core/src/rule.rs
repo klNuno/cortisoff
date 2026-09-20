@@ -44,6 +44,8 @@ pub enum Condition {
     /// for, a browser or a game taking the whole screen.
     Maximized(bool),
     Idle(bool),
+    /// Seconds without input, suppressed during fullscreen or audio playback.
+    IdleFor(u32),
     Locked(bool),
     OnBattery(bool),
     AudioActive(bool),
@@ -60,6 +62,20 @@ pub enum Condition {
 }
 
 impl Condition {
+    /// Thresholds the platform must observe, including nested conditions.
+    pub fn idle_thresholds(&self, out: &mut Vec<u32>) {
+        match self {
+            Self::IdleFor(seconds) => out.push(*seconds),
+            Self::All(parts) | Self::Any(parts) => {
+                for part in parts {
+                    part.idle_thresholds(out);
+                }
+            }
+            Self::Not(part) => part.idle_thresholds(out),
+            _ => {}
+        }
+    }
+
     pub fn eval(&self, w: &World) -> bool {
         self.strength(w, Fade::NONE) > 0.0
     }
@@ -95,12 +111,18 @@ impl Condition {
             Condition::Fullscreen(v) => flag(w.fullscreen == *v),
             Condition::Maximized(v) => flag(w.maximized == *v),
             Condition::Idle(v) => flag(w.idle == *v),
+            Condition::IdleFor(seconds) => flag(w.idle_seconds >= *seconds),
             Condition::Locked(v) => flag(w.locked == *v),
             Condition::OnBattery(v) => flag(w.on_battery == *v),
             Condition::AudioActive(v) => flag(w.audio_active == *v),
             Condition::Between { start, end } => match w.second_of_day {
                 None => 0.0,
-                Some(t) => transition::window_strength(start.0, end.0, t, fade),
+                Some(t) => transition::window_strength_ms(
+                    start.0,
+                    end.0,
+                    t * 1000 + u32::from(w.millisecond),
+                    fade,
+                ),
             },
             Condition::All(cs) => cs.iter().map(|c| c.strength(w, fade)).fold(1.0, f64::min),
             Condition::Any(cs) => cs.iter().map(|c| c.strength(w, fade)).fold(0.0, f64::max),
@@ -116,7 +138,7 @@ impl Condition {
             Condition::App { .. } => Signals::APP,
             Condition::Fullscreen(_) => Signals::FULLSCREEN,
             Condition::Maximized(_) => Signals::MAXIMIZED,
-            Condition::Idle(_) => Signals::IDLE,
+            Condition::Idle(_) | Condition::IdleFor(_) => Signals::IDLE,
             Condition::Locked(_) => Signals::LOCKED,
             Condition::OnBattery(_) => Signals::POWER,
             Condition::AudioActive(_) => Signals::AUDIO,

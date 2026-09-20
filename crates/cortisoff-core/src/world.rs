@@ -65,13 +65,16 @@ pub struct World {
     /// fullscreen", while `fullscreen` above is the exclusive case only.
     pub maximized: bool,
     pub idle: bool,
+    pub idle_seconds: u32,
     pub locked: bool,
     pub on_battery: bool,
     pub audio_active: bool,
     /// Second of the local day. `None` until the host has said, and a
     /// schedule condition never holds on an unknown clock. Seconds rather than
-    /// minutes because a fade steps every few of them.
+    /// minutes, plus a subsecond fraction for fades.
     pub second_of_day: Option<u32>,
+    /// Fraction of the current second, supplied by the host.
+    pub millisecond: u16,
 }
 
 impl World {
@@ -101,9 +104,16 @@ impl World {
                 let v = *maximized;
                 self.changed(v != self.maximized, Signals::MAXIMIZED, |w| w.maximized = v)
             }
-            Event::Idle { idle } => {
+            Event::Idle { idle, seconds } => {
                 let v = *idle;
-                self.changed(v != self.idle, Signals::IDLE, |w| w.idle = v)
+                self.changed(
+                    v != self.idle || *seconds != self.idle_seconds,
+                    Signals::IDLE,
+                    |w| {
+                        w.idle = v;
+                        w.idle_seconds = *seconds;
+                    },
+                )
             }
             Event::SessionLock { locked } => {
                 let v = *locked;
@@ -119,14 +129,26 @@ impl World {
                     w.audio_active = v
                 })
             }
-            Event::TimeOfDay { minute, second } => {
+            Event::TimeOfDay {
+                minute,
+                second,
+                millisecond,
+            } => {
                 let v = Some(u32::from(*minute) * 60 + u32::from(*second));
-                self.changed(v != self.second_of_day, Signals::TIME, |w| {
-                    w.second_of_day = v
-                })
+                self.changed(
+                    v != self.second_of_day || *millisecond != self.millisecond,
+                    Signals::TIME,
+                    |w| {
+                        w.millisecond = *millisecond;
+                        w.second_of_day = v
+                    },
+                )
             }
-            // Neither is a world field. The engine handles both directly.
-            Event::DisplayConfigChanged | Event::Reapply { .. } | Event::Shutdown => None,
+            // These are not world fields. The engine handles them directly.
+            Event::DisplayConfigChanged
+            | Event::Reapply { .. }
+            | Event::TimerFired { .. }
+            | Event::Shutdown => None,
         }
     }
 

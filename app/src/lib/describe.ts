@@ -59,6 +59,8 @@ function clausesOf(condition: Condition): string[] {
           ? "while a game is in exclusive fullscreen"
           : "while no game is in exclusive fullscreen",
       ];
+    case "idle_for":
+      return [`after ${describeDuration(condition.value)} without activity`];
     case "idle":
       return [condition.value ? "while you are away" : "while you are here"];
     case "locked":

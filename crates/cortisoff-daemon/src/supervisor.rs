@@ -53,6 +53,7 @@ pub struct Supervisor<J> {
     /// Where each previewed capability rested before its drag began, read
     /// once at the first preview: an actuator whose rest is "what the driver
     /// shows now" would otherwise report the preview itself.
+    stopped: bool,
     previewing: BTreeMap<CapabilityId, Option<Value>>,
 }
 
@@ -74,6 +75,7 @@ impl<J: JournalStore> Supervisor<J> {
             errors: Vec::new(),
             rules_path: None,
             authored: Vec::new(),
+            stopped: false,
             previewing: BTreeMap::new(),
         }
     }
@@ -95,10 +97,18 @@ impl<J: JournalStore> Supervisor<J> {
     /// Recovery comes first on purpose: a rule that fires immediately would
     /// otherwise capture a poisoned baseline as this run's neutral.
     pub fn start(&mut self, host: &mut dyn Host) {
+        self.stopped = false;
         for e in self.dispatcher.recover(&*host) {
             self.fail(e);
         }
 
+        let mut thresholds = Vec::new();
+        for rule in self.engine.rules().iter().filter(|rule| rule.is_active()) {
+            rule.when.idle_thresholds(&mut thresholds);
+        }
+        thresholds.sort_unstable();
+        thresholds.dedup();
+        host.set_idle_thresholds(&thresholds);
         let wanted = self.wanted_sources();
         if let Err(e) = host.install_sources(&wanted) {
             self.fail(e);
@@ -110,7 +120,11 @@ impl<J: JournalStore> Supervisor<J> {
 
     /// One event, all the way to the hardware.
     pub fn handle(&mut self, host: &mut dyn Host, event: Event) {
-        self.note(Notification::Event(event.clone()));
+        // Timer identities are internal. Keep existing trace clients compatible
+        // and publish the clock and resulting actions as before.
+        if !matches!(event, Event::TimerFired { .. }) {
+            self.note(Notification::Event(event.clone()));
+        }
         let before = self.holding_names();
         let actions = self.engine.on_event(&event);
         self.report_edges(before);
@@ -121,7 +135,14 @@ impl<J: JournalStore> Supervisor<J> {
     /// whatever event it stood for, except the schedule timer, which the host
     /// answers with the current [`Event::TimeOfDay`].
     pub fn timer_fired(&mut self, host: &mut dyn Host, minute: u16, second: u8) {
-        self.handle(host, Event::TimeOfDay { minute, second });
+        self.handle(
+            host,
+            Event::TimeOfDay {
+                minute,
+                second,
+                millisecond: 0,
+            },
+        );
     }
 
     /// Where `Request::Reload` reads from. Absent when the daemon was handed
@@ -261,6 +282,13 @@ impl<J: JournalStore> Supervisor<J> {
         let actions = self.engine.reload(resting(host, rules));
         // A rule added from the dashboard may read something no rule read at
         // startup, and one switched off may leave a hook nobody needs.
+        let mut thresholds = Vec::new();
+        for rule in self.engine.rules().iter().filter(|rule| rule.is_active()) {
+            rule.when.idle_thresholds(&mut thresholds);
+        }
+        thresholds.sort_unstable();
+        thresholds.dedup();
+        host.set_idle_thresholds(&thresholds);
         let wanted = self.wanted_sources();
         if let Err(e) = host.install_sources(&wanted) {
             self.fail(e);
@@ -277,6 +305,7 @@ impl<J: JournalStore> Supervisor<J> {
     /// actually succeeded and a monitor that refuses keeps its entry for the
     /// next run.
     pub fn shutdown(&mut self, host: &mut dyn Host) {
+        self.stopped = true;
         let actions = self.engine.shutdown();
         self.run(host, actions);
     }
@@ -348,8 +377,19 @@ impl<J: JournalStore> Supervisor<J> {
         host.set_active(self.active());
     }
 
-    /// Whether at least one capability has an unblocked claim.
+    /// Enabled plugins remain active while waiting for their conditions.
     fn active(&self) -> bool {
+        if self.stopped {
+            return false;
+        }
+        if self
+            .engine
+            .rules()
+            .iter()
+            .any(|r| !matches!(r.state, RuleState::Disabled))
+        {
+            return true;
+        }
         let arbiter = self.engine.arbiter();
         let table = arbiter.table();
         (0..table.len()).any(|i| {
@@ -671,11 +711,60 @@ set.display.vibrance = 100
     }
 
     #[test]
+    fn saving_an_idle_delay_updates_the_host_and_persisted_rule() {
+        let dir = std::env::temp_dir().join(format!("cortisoff-idle-delay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("rules.toml");
+        let source = "[[rule]]\nname = 'idle'\nwhen.idle_for = 120\nset.display.vibrance = 80\n";
+        std::fs::write(&file, source).unwrap();
+        let mut h = host();
+        let mut s = supervisor(&h, source, Interference::clear())
+            .with_rules_path(&file)
+            .with_rules(parse_rules(source).unwrap());
+        s.start(&mut h);
+        assert_eq!(h.idle_thresholds, vec![120]);
+        let mut rules = s.authored().to_vec();
+        rules[0].when = Condition::IdleFor(90);
+        s.save_rules(&mut h, rules.clone()).unwrap();
+        assert_eq!(h.idle_thresholds, vec![90]);
+        assert_eq!(
+            parse_rules(&std::fs::read_to_string(&file).unwrap()).unwrap(),
+            rules
+        );
+        rules[0].enabled = false;
+        s.save_rules(&mut h, rules).unwrap();
+        assert!(h.idle_thresholds.is_empty());
+        assert!(!h.active);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disabled_plugins_leave_the_logo_red() {
+        let mut h = host();
+        let mut s = supervisor(
+            &h,
+            &FOCUS_RULE.replace("when.app", "enabled = false\nwhen.app"),
+            Interference::clear(),
+        );
+        s.start(&mut h);
+        assert!(!h.active && !s.state().active);
+    }
+
+    #[test]
+    fn an_enabled_waiting_plugin_keeps_the_logo_green() {
+        let mut h = host();
+        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
+        s.start(&mut h);
+        assert!(s.state().claims.is_empty());
+        assert!(h.active && s.state().active);
+    }
+
+    #[test]
     fn a_rule_firing_reaches_the_actuator_and_going_back_restores_it() {
         let mut h = host();
         let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
         s.start(&mut h);
-        assert!(!h.active && !s.state().active);
+        assert!(h.active && s.state().active);
 
         s.handle(&mut h, focus("game.exe"));
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
@@ -683,7 +772,7 @@ set.display.vibrance = 100
 
         s.handle(&mut h, focus("notepad.exe"));
         assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert!(!h.active && !s.state().active);
+        assert!(h.active && s.state().active);
     }
 
     /// Ctrl-C is not a crash. Quitting has to hand every screen back, or a
@@ -876,7 +965,7 @@ set.display.color_temp = 3400
         let mut s = supervisor(&h, source, Interference::assess(["flux.exe"], None));
         s.start(&mut h);
         s.handle(&mut h, focus("game.exe"));
-        assert!(!h.active && !s.state().active);
+        assert!(h.active && s.state().active);
 
         let warned = s
             .drain()
@@ -949,6 +1038,7 @@ set.display.color_temp = 3400
             Event::TimeOfDay {
                 minute: 21 * 60,
                 second: 0,
+                millisecond: 0,
             },
         );
         assert_eq!(h.value(TEMP), Some(Value::Int(3400)));
@@ -1041,9 +1131,21 @@ set.wallpaper.playback = false
         );
         s.start(&mut h);
         for _ in 0..2 {
-            s.handle(&mut h, Event::Idle { idle: true });
+            s.handle(
+                &mut h,
+                Event::Idle {
+                    idle: true,
+                    seconds: 300,
+                },
+            );
             assert_eq!(h.value(wallpaper), Some(Value::Bool(false)));
-            s.handle(&mut h, Event::Idle { idle: false });
+            s.handle(
+                &mut h,
+                Event::Idle {
+                    idle: false,
+                    seconds: 0,
+                },
+            );
             assert_eq!(h.value(wallpaper), Some(Value::Bool(true)));
             assert!(s.state().claims.is_empty());
             assert!(s.dispatcher.journal().dirty().unwrap().is_empty());

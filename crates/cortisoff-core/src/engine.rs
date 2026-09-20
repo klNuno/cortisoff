@@ -54,7 +54,7 @@ pub struct Engine {
     /// costing a wakeup per minute.
     clock_edges: Vec<u32>,
     /// Every fade of every active rule, as `(start, length)`. Inside one the
-    /// engine steps every few seconds, and outside all of them it sleeps until
+    /// engine steps every 40 milliseconds, and outside all of them it sleeps until
     /// the next edge.
     ramps: Vec<(u32, u32)>,
     /// Previews fading back after a drag ended, one per capability at most.
@@ -130,15 +130,23 @@ impl Engine {
             // resume or timezone change. Rescheduled even when the minute did
             // not change, because a timer that fired seconds early would
             // otherwise end the chain of wakeups.
-            Event::TimeOfDay { minute, second } => {
-                let mut out = self.step_returns();
+            Event::TimeOfDay {
+                minute,
+                second,
+                millisecond,
+            } => {
+                let mut out = Vec::new();
                 out.extend(match self.world.absorb(event) {
                     None => Vec::new(),
                     Some(changed) => self.evaluate(|r| r.reads.intersects(changed)),
                 });
-                out.extend(self.next_wakeup(u32::from(*minute) * 60 + u32::from(*second)));
+                out.extend(self.next_wakeup(
+                    (u32::from(*minute) * 60 + u32::from(*second)) * 1000 + u32::from(*millisecond),
+                ));
                 out
             }
+
+            Event::TimerFired { id } if *id == PREVIEW_TIMER => self.step_returns(),
 
             _ => match self.world.absorb(event) {
                 None => Vec::new(),
@@ -156,7 +164,7 @@ impl Engine {
     pub fn sync(&mut self) -> Vec<Action> {
         let mut out = self.evaluate(|_| true);
         if let Some(now) = self.world.second_of_day {
-            out.extend(self.next_wakeup(now));
+            out.extend(self.next_wakeup(now * 1000 + u32::from(self.world.millisecond)));
         }
         out
     }
@@ -346,18 +354,19 @@ impl Engine {
         self.arbiter.release_everything()
     }
 
-    /// The next wakeup after `now`, in seconds of the day: a step while a fade
+    /// The next wakeup after `now`, in milliseconds of the day: a step while a fade
     /// runs, the next schedule edge otherwise, or `None` when no active rule
     /// reads the clock.
     fn next_wakeup(&self, now: u32) -> Option<Action> {
-        let now = now % DAY;
+        let day = DAY * 1000;
+        let now = now % day;
         let edge = self
             .clock_edges
             .iter()
-            .map(|&edge| match (edge + DAY - now) % DAY {
+            .map(|&edge| match (edge * 1000 + day - now) % day {
                 // An edge equal to now is the one that just fired. The next
                 // occurrence is tomorrow.
-                0 => DAY,
+                0 => day,
                 d => d,
             })
             .min();
@@ -365,24 +374,24 @@ impl Engine {
             .ramps
             .iter()
             .filter_map(|&(start, length)| {
-                let into = (now + DAY - start) % DAY;
-                (into < length).then(|| transition::step(length).min(length - into))
+                let into = (now + day - start * 1000) % day;
+                let length_ms = length * 1000;
+                (into < length_ms).then(|| transition::step(length).min(length_ms - into))
             })
             .min();
 
         let (after, tolerance) = match (step, edge) {
-            // A fade is running. A second of slack keeps the steps even without
-            // pinning the CPU to a deadline.
-            (Some(step), edge) => (edge.map_or(step, |e| e.min(step)), 1),
+            // A fade is running. Keep timer slack below one frame.
+            (Some(step), edge) => (edge.map_or(step, |e| e.min(step)), 10),
             // A schedule edge is not a frame deadline. Half a minute of slack
             // lets the OS batch the wakeup with anything else pending.
-            (None, Some(edge)) => (edge, 30),
+            (None, Some(edge)) => (edge, 30_000),
             (None, None) => return None,
         };
         Some(Action::SetTimer {
             id: SCHEDULE_TIMER,
-            after: Duration::from_secs(u64::from(after)),
-            tolerance: Duration::from_secs(tolerance),
+            after: Duration::from_millis(u64::from(after)),
+            tolerance: Duration::from_millis(tolerance),
         })
     }
 
@@ -521,6 +530,42 @@ mod tests {
         Action::RestoreBaseline {
             cap: CapabilityId::new(cap),
         }
+    }
+
+    #[test]
+    fn inactivity_delays_fire_independently_and_release_on_input() {
+        let mut engine = Engine::new(
+            table(),
+            vec![
+                rule("short", Condition::IdleFor(60), 0, &[(TEMP, 3200)]),
+                rule("long", Condition::IdleFor(120), 0, &[(VIBRANCE, 80)]),
+            ],
+        );
+        assert!(engine
+            .on_event(&Event::Idle {
+                idle: false,
+                seconds: 59
+            })
+            .is_empty());
+        assert_eq!(
+            engine.on_event(&Event::Idle {
+                idle: false,
+                seconds: 60
+            }),
+            vec![apply(TEMP, 3200)]
+        );
+        assert_eq!(
+            engine.on_event(&Event::Idle {
+                idle: false,
+                seconds: 120
+            }),
+            vec![apply(VIBRANCE, 80)]
+        );
+        let restored = engine.on_event(&Event::Idle {
+            idle: false,
+            seconds: 0,
+        });
+        assert!(restored.contains(&restore(TEMP)) && restored.contains(&restore(VIBRANCE)));
     }
 
     #[test]
@@ -730,21 +775,114 @@ mod tests {
         let mut e = Engine::new(table(), vec![rule("film", when, 0, &[(TEMP, 6500)])]);
         assert_eq!(e.on_event(&app("vlc.exe")), vec![apply(TEMP, 6500)]);
         // Idle is the other half of the condition, so it must reach this rule.
-        assert_eq!(e.on_event(&Event::Idle { idle: true }), vec![restore(TEMP)]);
+        assert_eq!(
+            e.on_event(&Event::Idle {
+                idle: true,
+                seconds: 300
+            }),
+            vec![restore(TEMP)]
+        );
     }
 
     fn at(hh: u16, mm: u16) -> Event {
         Event::TimeOfDay {
             minute: hh * 60 + mm,
             second: 0,
+            millisecond: 0,
         }
     }
 
-    fn step_in(seconds: u64) -> Action {
+    #[test]
+    fn a_one_minute_fade_requests_small_steps() {
+        let mut rule = night_light(0);
+        rule.transition.as_mut().unwrap().seconds = 60;
+        let mut engine = Engine::new(table(), vec![rule]);
+        let actions = engine.on_event(&at(20, 0));
+        assert!(
+            actions.iter().any(|action| matches!(action,
+                Action::SetTimer { after, tolerance, .. }
+                    if *after <= Duration::from_millis(40)
+                        && *tolerance <= Duration::from_millis(10)
+            )),
+            "fade timer: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_one_minute_fade_changes_within_each_second() {
+        let mut rule = night_light(0);
+        rule.transition.as_mut().unwrap().seconds = 60;
+        let mut engine = Engine::new(table(), vec![rule]);
+        let mut previous = 6600;
+        for elapsed in (40..=60_000u32).step_by(40) {
+            let actions = engine.on_event(&Event::TimeOfDay {
+                minute: 20 * 60 + (elapsed / 60_000) as u16,
+                second: ((elapsed / 1000) % 60) as u8,
+                millisecond: (elapsed % 1000) as u16,
+            });
+            for action in actions {
+                if let Action::Apply {
+                    value: Value::Int(value),
+                    ..
+                } = action
+                {
+                    assert!(
+                        value <= previous && previous - value <= 4,
+                        "temperature jumped from {previous} to {value} at {elapsed} ms"
+                    );
+                    previous = value;
+                }
+            }
+        }
+        assert_eq!(previous, 3200);
+        assert_eq!(engine.on_event(&at(21, 0)), vec![wakeup_in(9 * 60 + 59)]);
+    }
+
+    #[test]
+    fn the_morning_fade_releases_at_its_end() {
+        let mut rule = night_light(0);
+        rule.transition.as_mut().unwrap().seconds = 60;
+        let mut engine = Engine::new(table(), vec![rule]);
+        let mut previous = 3200;
+        for elapsed in (0..60_000u32).step_by(40) {
+            let actions = engine.on_event(&Event::TimeOfDay {
+                minute: 6 * 60 + 59,
+                second: (elapsed / 1000) as u8,
+                millisecond: (elapsed % 1000) as u16,
+            });
+            for action in actions {
+                if let Action::Apply {
+                    value: Value::Int(value),
+                    ..
+                } = action
+                {
+                    assert!(value >= previous && value - previous <= 4);
+                    previous = value;
+                }
+            }
+        }
+        assert!(6600 - previous <= 4);
+        assert_eq!(
+            engine.on_event(&at(7, 0)),
+            vec![restore(TEMP), wakeup_in(13 * 60)]
+        );
+    }
+
+    #[test]
+    fn schedule_clock_updates_do_not_advance_preview_returns() {
+        let mut engine = Engine::new(table(), vec![]);
+        let cap = CapabilityId::new(TEMP);
+        engine.manual_set(&cap, Value::Int(4000)).unwrap();
+        engine.preview(&cap, Value::Int(2000)).unwrap();
+        engine.preview_end(&cap, None).unwrap();
+        assert!(engine.on_event(&at(20, 0)).is_empty());
+    }
+
+    fn step_in(milliseconds: u64) -> Action {
         Action::SetTimer {
             id: crate::engine::SCHEDULE_TIMER,
-            after: Duration::from_secs(seconds),
-            tolerance: Duration::from_secs(1),
+            after: Duration::from_millis(milliseconds),
+            tolerance: Duration::from_millis(10),
         }
     }
 
@@ -764,7 +902,7 @@ mod tests {
     }
 
     /// The whole evening and morning of a faded rule. Nothing before the
-    /// window, a sine up to full strength stepped every ten seconds, a long
+    /// window, a sine up to full strength stepped every 40 milliseconds, a long
     /// sleep, a cosine back down, and the baseline exactly at the end.
     #[test]
     fn a_transition_fades_in_and_out_and_steps_only_while_it_runs() {
@@ -773,7 +911,7 @@ mod tests {
         // Halfway through: 6600 - 3400 * sin(pi / 4).
         assert_eq!(
             e.on_event(&at(20, 20)),
-            vec![apply(TEMP, 4196), step_in(10)]
+            vec![apply(TEMP, 4196), step_in(40)]
         );
         assert_eq!(
             e.on_event(&at(20, 40)),
@@ -783,7 +921,7 @@ mod tests {
             .on_event(&at(23, 0))
             .iter()
             .all(|a| matches!(a, Action::SetTimer { .. })));
-        assert_eq!(e.on_event(&at(6, 40)), vec![apply(TEMP, 4196), step_in(10)]);
+        assert_eq!(e.on_event(&at(6, 40)), vec![apply(TEMP, 4196), step_in(40)]);
         assert_eq!(
             e.on_event(&at(7, 0)),
             vec![restore(TEMP), wakeup_in(13 * 60)]
@@ -797,7 +935,7 @@ mod tests {
         let mut e = Engine::new(table(), vec![night_light(100)]);
         assert_eq!(
             e.on_event(&at(19, 40)),
-            vec![apply(TEMP, 4196), step_in(10)]
+            vec![apply(TEMP, 4196), step_in(40)]
         );
         assert_eq!(e.on_event(&at(20, 0))[0], apply(TEMP, 3200));
     }
@@ -808,9 +946,10 @@ mod tests {
         let mut e = Engine::new(table(), vec![night_light(0)]);
         let late = Event::TimeOfDay {
             minute: 20 * 60 + 39,
-            second: 56,
+            second: 59,
+            millisecond: 980,
         };
-        assert_eq!(e.on_event(&late).last(), Some(&step_in(4)));
+        assert_eq!(e.on_event(&late).last(), Some(&step_in(20)));
     }
 
     fn between(start: &str, end: &str) -> Condition {
@@ -920,13 +1059,9 @@ mod tests {
         Action::CancelTimer { id: PREVIEW_TIMER }
     }
 
-    /// Every timer is answered with the clock, so a fade back is driven by
-    /// clock events whose second never changes.
+    /// Only the preview timer advances a preview return.
     fn tick(e: &mut Engine) -> Vec<Action> {
-        e.on_event(&Event::TimeOfDay {
-            minute: 12 * 60,
-            second: 0,
-        })
+        e.on_event(&Event::TimerFired { id: PREVIEW_TIMER })
     }
 
     /// The slider under the cursor outranks the override it will replace.

@@ -49,7 +49,10 @@ pub trait Host {
     /// NVIDIA machine and on an Intel laptop.
     fn probe(&self) -> CapabilitySet;
 
-    /// Update the activity indicator when an unblocked claim is held.
+    /// Configure the inactivity thresholds read by enabled rules.
+    fn set_idle_thresholds(&mut self, _seconds: &[u32]) {}
+
+    /// Update the activity indicator when a plugin is enabled or a manual claim is held.
     fn set_active(&mut self, _active: bool) {}
 
     /// Install only the sources named here. Anything absent must not be

@@ -2,6 +2,8 @@
   import { daemon } from "$lib/daemon.svelte";
   import AddCard from "$lib/panels/AddCard.svelte";
   import RuleCard from "$lib/panels/RuleCard.svelte";
+  import WallpaperDialog from "$lib/panels/WallpaperDialog.svelte";
+  import { wallpaperDelay } from "$lib/wallpaper";
   import RuleDialog from "$lib/panels/RuleDialog.svelte";
   import SettingsDialog from "$lib/panels/SettingsDialog.svelte";
   import TemplatePicker from "$lib/panels/TemplatePicker.svelte";
@@ -94,7 +96,11 @@
        than leaving one plugin's fields over another's. -->
   {#if editingRule}
     {#key editingRule.name}
-      <RuleDialog rule={editingRule} onclose={() => (editing = null)} />
+      {#if wallpaperDelay(editingRule) !== null}
+        <WallpaperDialog rule={editingRule} onclose={() => (editing = null)} />
+      {:else}
+        <RuleDialog rule={editingRule} onclose={() => (editing = null)} />
+      {/if}
     {/key}
   {/if}
 
