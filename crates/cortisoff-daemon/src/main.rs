@@ -26,8 +26,8 @@ use cortisoff_host::{CapabilitySet, LogLevel};
 use cortisoff_ipc::Notification;
 
 /// Long enough that an idle machine costs nothing, short enough that Ctrl-C
-/// feels immediate. Every real wakeup comes from the message pump, never from
-/// this expiring.
+/// feels immediate. Every real wakeup comes from the message pump or from a
+/// pipe client, never from this expiring.
 const TICK: Duration = Duration::from_millis(500);
 
 fn main() {

@@ -689,10 +689,13 @@ impl Host for WinHost {
         }
 
         let ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        // Blocks until a message arrives or the timeout runs out. This is the
-        // whole cost of an idle daemon: one thread parked in the kernel.
+        // Blocks until a message arrives, a pipe client sends something, or the
+        // timeout runs out. This is the whole cost of an idle daemon: one
+        // thread parked in the kernel.
+        let arrived = crate::pipe::arrived();
+        let handles = arrived.as_ref().map(std::slice::from_ref);
         unsafe {
-            MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            MsgWaitForMultipleObjectsEx(handles, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
 
         let mut message = MSG::default();
