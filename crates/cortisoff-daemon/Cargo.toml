@@ -23,5 +23,9 @@ serde_json = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 cortisoff-win = { path = "../cortisoff-win" }
 
+# Names the executable in the taskbar and Task Manager, see ../resources.rs.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 cortisoff-host = { path = "../cortisoff-host", features = ["test-util"] }
