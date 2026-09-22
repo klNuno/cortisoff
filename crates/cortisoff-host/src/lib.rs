@@ -68,6 +68,15 @@ pub trait Host {
     fn set_timer(&mut self, id: TimerId, after: Duration, tolerance: Duration);
     fn cancel_timer(&mut self, id: TimerId);
 
+    /// The wall clock right now, as an [`Event::TimeOfDay`]. The engine only
+    /// learns the time from these, so anything that makes it reschedule
+    /// outside a clock event reads this first: rescheduled from the last
+    /// time it heard, a 20:00 edge armed at 09:00 and re-armed by a monitor
+    /// waking at 15:00 fired at 02:00. `None` on a host with no clock.
+    fn time_of_day(&self) -> Option<Event> {
+        None
+    }
+
     /// Block in whatever native loop this platform requires until at least one
     /// event is ready or `timeout` elapses, then hand back everything that
     /// arrived, in order.

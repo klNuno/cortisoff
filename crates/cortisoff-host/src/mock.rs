@@ -171,6 +171,8 @@ pub struct MockHost {
     /// What the next `poll` hands back, so a test can drive a loop the same
     /// way a real platform would.
     pub queued: Vec<Event>,
+    /// What `time_of_day` answers: the wall clock a test decides.
+    pub clock: Option<Event>,
     trace: Trace,
 }
 
@@ -250,6 +252,10 @@ impl Host for MockHost {
 
     fn cancel_timer(&mut self, id: TimerId) {
         self.cancelled.push(id);
+    }
+
+    fn time_of_day(&self) -> Option<Event> {
+        self.clock.clone()
     }
 
     /// Events a test has queued, handed back on the next poll. A mock never

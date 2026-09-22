@@ -678,6 +678,10 @@ impl Host for WinHost {
         let _ = unsafe { KillTimer(self.window, ENGINE_TIMER_BASE + id.0 as usize) };
     }
 
+    fn time_of_day(&self) -> Option<Event> {
+        Some(self.clock())
+    }
+
     fn poll(&mut self, timeout: Duration) -> Vec<Event> {
         if !self.snapshot_sent {
             self.snapshot_sent = true;
