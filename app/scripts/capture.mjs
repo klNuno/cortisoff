@@ -28,6 +28,7 @@ const views = {
   "grid-inactive": "inactive=1",
   "grid-disabled": "disabled=1",
   "grid-light": "theme=light&usage=1",
+  "grid-down": "down=1",
   settings: "open=settings",
   "settings-machine": "open=settings:machine",
   "settings-logs": "open=settings:logs",
