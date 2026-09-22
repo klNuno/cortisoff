@@ -13,7 +13,7 @@
   } from "$lib/clauses";
   import { daemon } from "$lib/daemon.svelte";
   import { capabilityLabel, capabilityOf, describeDuration, valueText } from "$lib/describe";
-  import { isSwitch, numberOf, rangeFor } from "$lib/ranges";
+  import { isSwitch, numberOf, rangeFor, startingText, switchedOn } from "$lib/ranges";
   import type { Assign, Rule, Transition, Value } from "$lib/types";
   import Button from "$lib/ui/Button.svelte";
   import Dialog from "$lib/ui/Dialog.svelte";
@@ -102,9 +102,20 @@
 
   function addSet() {
     const unused = settable.find((c) => !sets.some((s) => s.cap === c.id));
-    const cap = unused?.id ?? "";
-    const range = rangeFor(unused?.control);
-    sets = [...sets, { cap, text: range ? String(range.fallback) : "", from: "" }];
+    sets = [...sets, { cap: unused?.id ?? "", text: startingText(unused?.control), from: "" }];
+  }
+
+  /** A row given another capability starts over: the old value means nothing to it. */
+  function changeCap(at: number, cap: string) {
+    const row = sets[at];
+    if (!row || row.cap === cap) return;
+    if (previewing === row.cap) previewEnd();
+    sets = sets.map((r, i) => (i === at ? { cap, text: startingText(controlOf(cap)), from: "" } : r));
+  }
+
+  /** What a row may switch to: anything settable that no other row sets yet. */
+  function choices(at: number) {
+    return settable.filter((c) => !sets.some((s, i) => i !== at && s.cap === c.id));
   }
 
   /** How the daemon says a capability is edited, or null for one it lacks. */
@@ -378,8 +389,12 @@
         {@const range = rangeFor(control)}
         <div class="flex flex-col gap-2.5 rounded-lg border border-line/70 bg-surface/40 p-2.5">
           <div class="flex items-center gap-1.5">
-            <select class="field flex-1" bind:value={row.cap}>
-              {#each settable as cap (cap.id)}
+            <select
+              class="field flex-1"
+              value={row.cap}
+              onchange={(e) => changeCap(i, e.currentTarget.value)}
+            >
+              {#each choices(i) as cap (cap.id)}
                 <option value={cap.id}>{cap.label}</option>
               {/each}
               {#if !settable.some((c) => c.id === row.cap)}
@@ -388,10 +403,10 @@
             </select>
             {#if isSwitch(control)}
               <span class="text-xs text-foreground-muted">
-                {row.text === "false" ? "off" : "on"}
+                {switchedOn(row.text) ? "on" : "off"}
               </span>
               <Switch
-                checked={row.text !== "false"}
+                checked={switchedOn(row.text)}
                 label={capabilityLabel(row.cap, capabilities)}
                 onchange={(on) => (row.text = on ? "true" : "false")}
               />

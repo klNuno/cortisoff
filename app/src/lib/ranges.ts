@@ -44,6 +44,22 @@ export function isSwitch(control: Control | null | undefined): boolean {
   return control?.kind === "switch";
 }
 
+/**
+ * The text a freshly picked capability starts with. Picking another
+ * capability on a row starts over from this: carrying the old text across is
+ * how a kelvin value ended up as a wallpaper switch.
+ */
+export function startingText(control: Control | null | undefined): string {
+  if (isSwitch(control)) return "true";
+  const range = rangeFor(control);
+  return range ? String(range.fallback) : "";
+}
+
+/** Whether a switch's text reads as on, spelled any way the rule file takes. */
+export function switchedOn(text: string): boolean {
+  return !["false", "off", "no", "0"].includes(text.trim().toLowerCase());
+}
+
 /** A value as the rule file spells it, or the range's fallback when it is not a number. */
 export function numberOf(text: string, range: Range): number {
   const n = Number(text.trim());
