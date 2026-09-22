@@ -95,6 +95,16 @@
   --bg-opacity: 0.6;
 }
 
+/* The three sizes above, in pixels. Tailwind's are in rem, and the root is
+   13 px rather than 16, so `text-xs` came out at 9.75 px and `text-sm` at
+   11.4 px: every hint on screen was under the floor the comment sets. */
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 1.45;
+  --text-sm: 14px;
+  --text-sm--line-height: 1.4;
+}
+
 @theme inline {
   --color-background: var(--bg);
   --color-surface: var(--bg-card);
