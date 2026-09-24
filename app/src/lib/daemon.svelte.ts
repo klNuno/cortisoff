@@ -20,55 +20,96 @@ export type TraceLine = {
   kind: "event" | "hold" | "release" | "action" | "log" | "closing";
   text: string;
   level?: string;
+  /** How many times in a row this same line arrived. A fade is dozens. */
+  count: number;
 };
+
+/**
+ * Where the connection stands. `connecting` is the window's first second and
+ * the daemon being started for it, and it is not an error: saying "not
+ * running" in red there was a lie the window told at every launch.
+ */
+export type Phase = "connecting" | "connected" | "down";
+
+type Status = { phase: Phase; reason: string | null };
 
 /** Enough to scroll back through a session without holding a day of it. */
 const MAX_TRACE = 600;
 
-/** A burst of events (a focus change is three) costs one state fetch. */
-const REFRESH_DEBOUNCE_MS = 120;
+/**
+ * At most one state fetch per this long while notifications stream. A
+ * throttle, not a debounce: a fade sends an action every few dozen
+ * milliseconds, and a debounce restarted by each of them never fired, so
+ * the cards showed the world from before the fade until it ended.
+ */
+const REFRESH_EVERY_MS = 100;
+
+/** What a notification needs fetched again, cheapest first. */
+type Need = 0 | 1 | 2;
+const NOTHING: Need = 0;
+const STATE: Need = 1;
+const EVERYTHING: Need = 2;
 
 class Daemon {
-  connected = $state(false);
-  /** A sentence for a person while disconnected. */
+  phase = $state<Phase>("connecting");
+  /** A sentence for a person while down. */
   reason = $state<string | null>(null);
-  state = $state<StateReport | null>(null);
-  doctor = $state<DoctorReport | null>(null);
+  // Raw: every one of these is replaced whole by the next answer and never
+  // edited in place, and a deep proxy over a doctor report cost a walk of the
+  // whole object on every refresh.
+  state = $state.raw<StateReport | null>(null);
+  doctor = $state.raw<DoctorReport | null>(null);
   /**
    * The rules as authored, which is what the cards edit. Separate from
-   * `doctor.rules`, which says what this machine did with them.
+   * `state.rules`, which says what this machine did with them.
    */
-  rules = $state<Rule[]>([]);
-  trace = $state<TraceLine[]>([]);
+  rules = $state.raw<Rule[]>([]);
+  trace = $state.raw<TraceLine[]>([]);
   /** The last thing that went wrong, shown until the next action succeeds. */
   error = $state<string | null>(null);
   busy = $state(false);
 
   #nextId = 1;
-  #pending: ReturnType<typeof setTimeout> | null = null;
+  #need: Need = NOTHING;
+  #timer: ReturnType<typeof setTimeout> | null = null;
+  #fetching = false;
+  #announced = false;
+
+  get connected(): boolean {
+    return this.phase === "connected";
+  }
 
   async start() {
-    await listen<{ connected: boolean; reason: string | null }>("daemon://status", (e) => {
-      const wasConnected = this.connected;
-      this.connected = e.payload.connected;
-      this.reason = e.payload.reason;
-      if (e.payload.connected && !wasConnected) {
-        this.push("log", "connected to the daemon");
-        void this.refresh();
-      }
-      if (!e.payload.connected) {
-        this.state = null;
-        this.doctor = null;
-        this.rules = [];
-      }
-    });
+    await Promise.all([
+      listen<Status>("daemon://status", (e) => this.#status(e.payload)),
+      listen<Notification>("daemon://notification", (e) => {
+        this.record(e.payload);
+        this.#want(needs(e.payload));
+      }),
+    ]);
 
-    await listen<Notification>("daemon://notification", (e) => {
-      this.record(e.payload);
-      this.scheduleRefresh();
-    });
+    // The watcher may have spoken before anything listened. It only speaks on
+    // a change, so the current phase is asked for rather than waited for.
+    const [status] = await Promise.all([
+      invoke<Status | null>("status").catch(() => null),
+      this.refresh(),
+    ]);
+    if (status && !this.connected) this.#status(status);
+  }
 
-    await this.refresh();
+  #status(status: Status) {
+    const was = this.phase;
+    this.phase = status.phase;
+    this.reason = status.reason;
+    // The refresh is what says "connected" in the trace, once, whichever of
+    // the two learns it first.
+    if (status.phase === "connected" && was !== "connected") void this.refresh();
+    if (status.phase === "down") {
+      this.#announced = false;
+      this.state = null;
+      this.doctor = null;
+      this.rules = [];
+    }
   }
 
   /** Every report at once: they are three questions about the same instant. */
@@ -82,23 +123,47 @@ class Daemon {
       this.state = state;
       this.doctor = doctor;
       this.rules = rules;
-      this.connected = true;
+      if (!this.#announced) this.push("log", "connected to the daemon");
+      this.#announced = true;
+      this.phase = "connected";
       this.reason = null;
     } catch {
-      // Not an error to show: the daemon being down is a state the window
-      // already says out loud, and the watcher thread reports it properly.
-      this.state = null;
-      this.doctor = null;
-      this.rules = [];
+      // Not an error to show: the watcher thread owns the connection's
+      // phase and says why it is down.
     }
   }
 
-  scheduleRefresh() {
-    if (this.#pending !== null) clearTimeout(this.#pending);
-    this.#pending = setTimeout(() => {
-      this.#pending = null;
-      void this.refresh();
-    }, REFRESH_DEBOUNCE_MS);
+  /** What changes on every event: who holds what, and what the machine sees. */
+  async refreshState() {
+    try {
+      this.state = await invoke<StateReport>("state");
+    } catch {
+      // Same as above.
+    }
+  }
+
+  /** Ask for a fetch, merged with whatever is already waiting. */
+  #want(need: Need) {
+    if (need > this.#need) this.#need = need;
+    if (this.#need === NOTHING || this.#timer !== null || this.#fetching) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      void this.#fetch();
+    }, REFRESH_EVERY_MS);
+  }
+
+  async #fetch() {
+    const need = this.#need;
+    this.#need = NOTHING;
+    if (!this.connected) return;
+    this.#fetching = true;
+    try {
+      await (need === EVERYTHING ? this.refresh() : this.refreshState());
+    } finally {
+      this.#fetching = false;
+      // Whatever arrived during the fetch gets the next slot.
+      this.#want(NOTHING);
+    }
   }
 
   /** A manual override written as text, the way the CLI takes it. */
@@ -152,6 +217,11 @@ class Daemon {
 
   async reload() {
     return this.run(() => invoke("reload"), "plugins re-read from the file");
+  }
+
+  /** The watcher connects to it on its own once its pipe is open. */
+  async startDaemon() {
+    return this.run(() => invoke("start_daemon"));
   }
 
   /** Stops the daemon, not this window. Every baseline goes back on the way out. */
@@ -208,14 +278,37 @@ class Daemon {
     const at = [now.getHours(), now.getMinutes(), now.getSeconds()]
       .map((n) => String(n).padStart(2, "0"))
       .join(":");
-    const line: TraceLine = { id: this.#nextId++, at, kind, text, level };
-    // A new array rather than a push: `$state` tracks the reference, and a
-    // sliced copy is also how the cap stays a cap.
-    this.trace = [...this.trace, line].slice(-MAX_TRACE);
+    const last = this.trace.at(-1);
+    if (last && last.kind === kind && last.text === text && last.level === level) {
+      // A fade is one line with a count, not a screen of the same line.
+      this.trace = [...this.trace.slice(0, -1), { ...last, at, count: last.count + 1 }];
+      return;
+    }
+    const line: TraceLine = { id: this.#nextId++, at, kind, text, level, count: 1 };
+    this.trace =
+      this.trace.length >= MAX_TRACE ? [...this.trace.slice(1 - MAX_TRACE), line] : [...this.trace, line];
   }
 
   clearTrace() {
     this.trace = [];
+  }
+}
+
+/**
+ * An event or an action changes who holds what, which is the state report.
+ * An edge or a log can mean the rule set itself changed under the window,
+ * reloaded from the file or refused, so those fetch everything.
+ */
+function needs(n: Notification): Need {
+  switch (n.notify) {
+    case "event":
+    case "action":
+      return STATE;
+    case "rule_edge":
+    case "log":
+      return EVERYTHING;
+    case "closing":
+      return NOTHING;
   }
 }
 

@@ -10,8 +10,10 @@
 //! A reader thread per client and a channel back to the daemon's loop. The
 //! loop is a Windows message pump and cannot also wait on a pipe without an
 //! I/O completion port or a restructured pump; a thread costs a few kilobytes
-//! of stack and no restructuring at all. The price is that a request waits for
-//! the next turn of the loop, bounded by the daemon's tick.
+//! of stack and no restructuring at all. Each thread sets one shared event
+//! after it hands something over, and the pump waits on that event beside its
+//! messages, so a request is served the moment it arrives rather than on the
+//! daemon's next tick.
 //!
 //! The handles are opened overlapped, and that is not optional. A synchronous
 //! handle has one I/O queue: the reader thread parked in `ReadFile` blocks the
@@ -21,7 +23,7 @@
 
 use std::ffi::c_void;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cortisoff_ipc::{encode, Frame, FrameReader};
 use windows::core::{HSTRING, PCWSTR};
@@ -41,13 +43,36 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 /// Room for a doctor report on a machine with many rules, and small enough
 /// that a client cannot make the daemon allocate anything interesting.
 const BUFFER: u32 = 64 * 1024;
+
+/// Auto reset, set by the pipe threads after every handover. Stored as an
+/// address because a raw `HANDLE` is neither `Send` nor `Sync`, and this one is
+/// created once and never closed.
+static ARRIVED: OnceLock<usize> = OnceLock::new();
+
+/// The event the daemon's pump waits on beside its messages. `None` only if
+/// the kernel refused an event, and then the pump falls back to its tick.
+pub(crate) fn arrived() -> Option<HANDLE> {
+    let address = *ARRIVED.get_or_init(|| {
+        unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_or(0, |h| h.0 as usize)
+    });
+    (address != 0).then_some(HANDLE(address as *mut c_void))
+}
+
+/// Hand one item to the daemon's loop and wake it.
+fn deliver(outbox: &Sender<Wire>, item: Wire) -> bool {
+    let sent = outbox.send(item).is_ok();
+    if let Some(event) = arrived() {
+        let _ = unsafe { SetEvent(event) };
+    }
+    sent
+}
 
 /// What the reader threads hand back to the daemon's loop.
 pub enum Incoming {
@@ -280,7 +305,7 @@ fn accept_loop(name: String, sddl: String, first: HANDLE, outbox: Sender<Wire>) 
         let reader = Arc::clone(&pipe);
         // The daemon takes the write end here, before any frame can arrive on
         // it, so an answer always has somewhere to go.
-        if outbox.send(Wire::Connected(id, pipe)).is_err() {
+        if !deliver(&outbox, Wire::Connected(id, pipe)) {
             return;
         }
         let sender = outbox.clone();
@@ -289,7 +314,7 @@ fn accept_loop(name: String, sddl: String, first: HANDLE, outbox: Sender<Wire>) 
             .spawn(move || read_loop(id, reader, sender))
             .is_err()
         {
-            let _ = outbox.send(Wire::Gone(id));
+            deliver(&outbox, Wire::Gone(id));
         }
 
         match create_instance(&name, &sddl) {
@@ -309,20 +334,20 @@ fn read_loop(id: u64, pipe: Arc<Pipe>, outbox: Sender<Wire>) {
             })
         };
         let Some(read) = read.filter(|n| *n > 0) else {
-            let _ = outbox.send(Wire::Gone(id));
+            deliver(&outbox, Wire::Gone(id));
             return;
         };
         for line in reader.push(&buffer[..read as usize]) {
             match line {
                 Ok(frame) => {
-                    if outbox.send(Wire::Frame(id, frame)).is_err() {
+                    if !deliver(&outbox, Wire::Frame(id, frame)) {
                         return;
                     }
                 }
                 // One unparseable line is enough to stop trusting the
                 // connection: a client that cannot frame cannot be answered.
                 Err(_) => {
-                    let _ = outbox.send(Wire::Gone(id));
+                    deliver(&outbox, Wire::Gone(id));
                     return;
                 }
             }
@@ -553,4 +578,42 @@ pub fn ask(
     connect(session)
         .ok_or_else(|| "no daemon is listening on this session. start cortisoffd first".to_owned())?
         .ask(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortisoff_ipc::{Request, Response};
+    use std::time::{Duration, Instant};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    /// A loop shaped like the daemon's, whose only wakeup is the event, with a
+    /// fallback far longer than any answer should take. An answer inside that
+    /// window can only come from a client waking it.
+    #[test]
+    fn a_request_wakes_the_loop_instead_of_waiting_for_the_tick() {
+        let session = u32::MAX - std::process::id();
+        let (ready, started) = channel();
+        std::thread::spawn(move || {
+            let mut server = PipeServer::start(session).expect("pipe");
+            ready.send(()).unwrap();
+            let event = arrived().expect("event");
+            loop {
+                unsafe { WaitForSingleObject(event, 5_000) };
+                for incoming in server.drain() {
+                    if let Incoming::Frame(client, Frame::Request { id, .. }) = incoming {
+                        server.send(client, &Frame::response(id, Response::Ok));
+                    }
+                }
+            }
+        });
+        started.recv().unwrap();
+
+        for _ in 0..3 {
+            let asked = Instant::now();
+            let answer = ask(session, Request::State).expect("answer");
+            assert!(matches!(answer, Response::Ok));
+            assert!(asked.elapsed() < Duration::from_millis(1_000));
+        }
+    }
 }

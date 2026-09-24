@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isSwitch, kelvinRgb, numberOf, rangeFor, withUnit } from "./ranges";
+import { isSwitch, kelvinRgb, numberOf, rangeFor, startingText, switchedOn, withUnit } from "./ranges";
 import type { Control } from "./types";
 
 const kelvin: Control = { kind: "range", min: 1500, max: 6600, step: 50, default: 3400, unit: "K" };
@@ -52,5 +52,21 @@ describe("a slider's value", () => {
     expect(withUnit(50, "%")).toBe("50%");
     expect(withUnit(3400, "K")).toBe("3400 K");
     expect(withUnit(7, null)).toBe("7");
+  });
+});
+
+describe("a capability picked on a row", () => {
+  it("starts from its own default, never the previous capability's value", () => {
+    expect(startingText(kelvin)).toBe("3400");
+    expect(startingText({ kind: "switch" })).toBe("true");
+    expect(startingText({ kind: "text", hint: "@240" })).toBe("");
+    expect(startingText(null)).toBe("");
+  });
+
+  it("reads a switch the way the rule file spells it", () => {
+    expect(switchedOn("true")).toBe(true);
+    expect(switchedOn("false")).toBe(false);
+    expect(switchedOn(" off ")).toBe(false);
+    expect(switchedOn("on")).toBe(true);
   });
 });

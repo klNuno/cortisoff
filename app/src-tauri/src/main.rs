@@ -17,21 +17,88 @@ mod transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cortisoff_host::{CapabilityId, Value};
 use cortisoff_ipc::{DoctorReport, Notification, Request, Response, Rule, StateReport};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Listener};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 
-/// Emitted whenever the connection to the daemon comes up or goes down, so the
-/// window can say "not running" instead of showing a stale world forever.
-#[derive(Debug, Clone, Serialize)]
+/// Where the connection to the daemon stands. Emitted when it changes, and
+/// answered by `status` for a page that started listening after the change.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    /// The first attempt, or a daemon this window just started and is
+    /// waiting for. Not an error, and the window does not paint it as one.
+    Connecting,
+    Connected,
+    Down,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct Status {
-    connected: bool,
-    /// A sentence for a person, `None` while connected.
+    phase: Phase,
+    /// A sentence for a person while down.
     reason: Option<String>,
 }
+
+/// The last status the watcher reported, and until when a daemon started by
+/// this window counts as coming up rather than absent.
+struct Link(Mutex<LinkState>);
+
+struct LinkState {
+    status: Status,
+    starting_until: Option<Instant>,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Self(Mutex::new(LinkState {
+            status: Status {
+                phase: Phase::Connecting,
+                reason: None,
+            },
+            starting_until: None,
+        }))
+    }
+}
+
+impl Link {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LinkState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Record a status and tell the page, only if it changed. Repeating "down" on
+/// every retry made the page redo its work for nothing.
+fn report(app: &AppHandle, phase: Phase, reason: Option<String>) {
+    let status = Status { phase, reason };
+    let link = app.state::<Link>();
+    let mut state = link.lock();
+    if state.status != status {
+        state.status = status.clone();
+        drop(state);
+        let _ = app.emit(STATUS_EVENT, status);
+    }
+}
+
+/// Start the daemon and give it `STARTING_GRACE` to open its pipe, reported
+/// as connecting meanwhile.
+fn start(app: &AppHandle) -> Result<(), String> {
+    transport::start_daemon()?;
+    app.state::<Link>().lock().starting_until = Some(Instant::now() + STARTING_GRACE);
+    report(app, Phase::Connecting, None);
+    Ok(())
+}
+
+/// How long a daemon this window started gets to open its pipe before the
+/// window says it is down. It usually takes a few dozen milliseconds.
+const STARTING_GRACE: Duration = Duration::from_secs(3);
+
+/// The window is shown by the page once it has painted, so nobody sees an
+/// empty frame. This is the fallback if the page never says so.
+const REVEAL_FALLBACK: Duration = Duration::from_secs(3);
 
 const STATUS_EVENT: &str = "daemon://status";
 const NOTIFICATION_EVENT: &str = "daemon://notification";
@@ -71,6 +138,9 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
+            status,
+            reveal,
+            start_daemon,
             doctor,
             state,
             rules,
@@ -88,6 +158,7 @@ fn main() {
             set_autostart
         ])
         .manage(Samples::default())
+        .manage(Link::default())
         .manage(PreviewLink::default())
         .setup(|app| {
             let window = tauri::WebviewWindowBuilder::new(
@@ -108,7 +179,13 @@ fn main() {
             .build()?;
 
             watch(app.handle().clone());
-            window.show()?;
+            let fallback = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(REVEAL_FALLBACK);
+                if !fallback.is_visible().unwrap_or(true) {
+                    let _ = fallback.show();
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -130,21 +207,14 @@ fn watch(app: AppHandle) {
     });
 
     std::thread::spawn(move || {
-        let mut announced_down = false;
         // Once per launch. Someone who stopped the daemon from this window
         // and is still looking at it does not want it back 800 ms later.
         let mut tried_starting = false;
         while alive.load(Ordering::Relaxed) {
             match transport::subscribe() {
                 Ok(mut client) => {
-                    announced_down = false;
-                    let _ = app.emit(
-                        STATUS_EVENT,
-                        Status {
-                            connected: true,
-                            reason: None,
-                        },
-                    );
+                    app.state::<Link>().lock().starting_until = None;
+                    report(&app, Phase::Connected, None);
                     // Returns when the daemon hangs up, which `stop` does on
                     // purpose and a crash does by accident. Both are the same
                     // thing here: reconnect.
@@ -158,6 +228,11 @@ fn watch(app: AppHandle) {
                             }
                         }
                     }
+                    report(
+                        &app,
+                        Phase::Down,
+                        Some("the daemon is not running".to_owned()),
+                    );
                 }
                 Err(reason) => {
                     // An installed cortisoff opened before its daemon, which
@@ -165,35 +240,46 @@ fn watch(app: AppHandle) {
                     // after quitting from the tray.
                     if !tried_starting {
                         tried_starting = true;
-                        if transport::start_daemon().is_ok() {
-                            std::thread::sleep(std::time::Duration::from_millis(400));
-                            continue;
-                        }
+                        let _ = start(&app);
                     }
-                    if !announced_down {
-                        announced_down = true;
-                        let _ = app.emit(
-                            STATUS_EVENT,
-                            Status {
-                                connected: false,
-                                reason: Some(reason),
-                            },
-                        );
+                    // A daemon just started is polled closely and reported as
+                    // connecting, so the window never says "not running" about
+                    // a daemon that is coming up.
+                    let until = app.state::<Link>().lock().starting_until;
+                    if until.is_some_and(|until| Instant::now() < until) {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
                     }
+                    report(&app, Phase::Down, Some(reason));
                 }
             }
             if alive.load(Ordering::Relaxed) {
-                let _ = app.emit(
-                    STATUS_EVENT,
-                    Status {
-                        connected: false,
-                        reason: Some("the daemon is not running".to_owned()),
-                    },
-                );
-                std::thread::sleep(std::time::Duration::from_millis(800));
+                std::thread::sleep(Duration::from_millis(800));
             }
         }
     });
+}
+
+#[tauri::command]
+fn status(link: tauri::State<'_, Link>) -> Status {
+    link.lock().status.clone()
+}
+
+/// Start the daemon by hand, after it was stopped or never came up. The
+/// watcher picks it up on its next try.
+#[tauri::command]
+async fn start_daemon(app: AppHandle) -> Result<(), String> {
+    blocking(move || start(&app)).await
+}
+
+/// The page has painted its first frame. Showing the window before that
+/// flashed an empty rectangle at every launch.
+#[tauri::command]
+fn reveal(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.is_visible().unwrap_or(false) {
+        return Ok(());
+    }
+    window.show().map_err(|e| e.to_string())
 }
 
 /// Every command below is `async` for one reason: a Tauri command that is

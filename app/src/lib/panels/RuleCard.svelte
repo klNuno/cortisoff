@@ -8,6 +8,7 @@
     describeCondition,
     describeTransition,
   } from "$lib/describe";
+  import { entrance } from "$lib/opening";
   import { kelvinHex } from "$lib/ranges";
   import type { CapabilityReport, ClaimReport, Rule, RuleReport, Value } from "$lib/types";
   import Switch from "$lib/ui/Switch.svelte";
@@ -35,6 +36,7 @@
     onedit: () => void;
   } = $props();
 
+  const enter = entrance("card-in");
   const wallpaper = $derived(wallpaperDelay(rule) !== null);
   const fade = $derived(describeTransition(rule.transition));
   const state = $derived(report?.state);
@@ -110,7 +112,7 @@
 </script>
 
 <article
-  class="card-in flex min-h-[196px] flex-col gap-3 rounded-card border bg-surface p-3.5
+  class="{enter} flex min-h-[196px] flex-col gap-3 rounded-card border bg-surface p-3.5
     transition-colors
     {holding && rule.enabled ? 'border-success/30' : 'border-line'}
     {rule.enabled ? '' : 'opacity-60'}"

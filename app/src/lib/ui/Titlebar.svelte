@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { untrack } from "svelte";
 
   import { daemon } from "$lib/daemon.svelte";
   import activeLogo from "$lib/assets/logo-active.svg";
@@ -35,7 +36,10 @@
     }
     let alive = true;
     const sample = async () => {
-      const pids = daemon.doctor?.pid ? [0, daemon.doctor.pid] : [0];
+      // Untracked: read inside the effect, the daemon's report made it start
+      // over, sample and all, on every refresh.
+      const pid = untrack(() => daemon.doctor?.pid);
+      const pids = pid ? [0, pid] : [0];
       try {
         const next = await invoke<Usage[]>("usage", { pids });
         if (alive) usage = next;
@@ -78,14 +82,19 @@
 
   <span
     data-tauri-drag-region
-    class="flex items-center gap-1.5 text-xs {daemon.connected
-      ? 'text-foreground-muted'
-      : 'text-danger'}"
+    class="flex items-center gap-1.5 text-xs {daemon.phase === 'down'
+      ? 'text-danger'
+      : 'text-foreground-muted'}"
   >
     <span
-      class="size-1.5 rounded-full {daemon.connected ? 'bg-success' : 'bg-danger'}"
+      data-tauri-drag-region
+      class="size-1.5 rounded-full {daemon.phase === 'connected'
+        ? 'bg-success'
+        : daemon.phase === 'down'
+          ? 'bg-danger'
+          : 'animate-pulse bg-foreground-subtle'}"
     ></span>
-    {daemon.connected ? "running" : (daemon.reason ?? "not running")}
+    {daemon.phase === "connected" ? "running" : daemon.phase === "down" ? "not running" : "connecting"}
   </span>
 
   {#if settings.usage}

@@ -13,6 +13,7 @@
  *     /mock.html?open=add
  *     /mock.html?open=rule:blue light at night
  *     /mock.html?theme=light&usage=1        the light scheme, usage readout on
+ *     /mock.html?down                       no daemon running
  */
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { mount } from "svelte";
@@ -156,11 +157,18 @@ mockIPC(
   (cmd, payload) => {
     const args = (payload ?? {}) as Record<string, unknown>;
     switch (cmd) {
+      case "status":
+        return query.has("down")
+          ? { phase: "down", reason: "the daemon is not running" }
+          : { phase: "connected", reason: null };
       case "state":
+        if (query.has("down")) throw "no daemon is listening on this session";
         return state();
       case "doctor":
+        if (query.has("down")) throw "no daemon is listening on this session";
         return doctor();
       case "rules":
+        if (query.has("down")) throw "no daemon is listening on this session";
         return rules;
       case "save_rules":
         rules = args.rules as Rule[];

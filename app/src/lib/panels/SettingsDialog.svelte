@@ -64,7 +64,7 @@
 
   /** Follow the tail unless the reader has scrolled up to look at something. */
   $effect(() => {
-    void daemon.trace.length;
+    void daemon.trace;
     if (current === "logs" && pinned && logBox) logBox.scrollTop = logBox.scrollHeight;
   });
 
@@ -378,6 +378,9 @@
                     : 'text-foreground-muted'}"
                 >
                   {line.text}
+                  {#if line.count > 1}
+                    <span class="num text-foreground-subtle">×{line.count}</span>
+                  {/if}
                 </span>
               </div>
             {/each}

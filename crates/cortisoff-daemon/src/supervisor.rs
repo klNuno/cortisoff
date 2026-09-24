@@ -127,8 +127,10 @@ impl<J: JournalStore> Supervisor<J> {
         }
         // Monitors moved. Whatever is applied may now cover hardware that
         // arrived after its baseline was captured, so the baseline grows
-        // before the engine pushes anything else at it.
+        // before the engine pushes anything else at it. The engine also
+        // reschedules here, so it hears the time first.
         if matches!(event, Event::DisplayConfigChanged) {
+            self.catch_up(host);
             for e in self.dispatcher.rebaseline(&*host) {
                 self.fail(e);
             }
@@ -137,6 +139,14 @@ impl<J: JournalStore> Supervisor<J> {
         let actions = self.engine.on_event(&event);
         self.report_edges(before);
         self.run(host, actions);
+    }
+
+    /// Tell the engine the time before something makes it reschedule outside
+    /// a clock event. See [`Host::time_of_day`].
+    fn catch_up(&mut self, host: &mut dyn Host) {
+        if let Some(now @ Event::TimeOfDay { .. }) = host.time_of_day() {
+            self.handle(host, now);
+        }
     }
 
     /// A timer the engine asked for has fired. The host converts it back into
@@ -287,6 +297,7 @@ impl<J: JournalStore> Supervisor<J> {
             .map_err(|e| format!("{}: {}: {}", path.display(), e.at, e.message))?;
 
         self.authored = rules.clone();
+        self.catch_up(host);
         let actions = self.engine.reload(resting(host, rules));
         // A rule added from the dashboard may read something no rule read at
         // startup, and one switched off may leave a hook nobody needs.
@@ -1077,6 +1088,43 @@ set.display.color_temp = 3400
         assert_eq!(h.timers.len(), 1);
         // 21:00 to 07:00 is ten hours, and not one wakeup in between.
         assert_eq!(h.timers[0].1.as_secs(), 10 * 60 * 60);
+    }
+
+    /// The engine hears the time only from clock events. Anything else that
+    /// reschedules has to tell it first, or the next edge is counted from
+    /// whenever it last heard: a daemon started at 09:01 and whose monitors
+    /// woke at 15:00 armed 20:00 for 02:00, and the night filter never came.
+    #[test]
+    fn rescheduling_outside_a_clock_event_counts_from_the_real_time() {
+        let source = r#"
+[[rule]]
+name = "blue light"
+when.between = "20:00-07:00"
+set.display.color_temp = 3400
+"#;
+        let at = |minute: u16| Event::TimeOfDay {
+            minute,
+            second: 0,
+            millisecond: 0,
+        };
+        let file =
+            std::env::temp_dir().join(format!("cortisoff-clock-{}.toml", std::process::id()));
+        std::fs::write(&file, source).unwrap();
+        let mut h = host();
+        let mut s = supervisor(&h, source, Interference::clear()).with_rules_path(&file);
+        s.start(&mut h);
+        s.handle(&mut h, at(9 * 60 + 1));
+        assert_eq!(h.timers.last().unwrap().1.as_secs(), (10 * 60 + 59) * 60);
+
+        h.clock = Some(at(15 * 60));
+        s.handle(&mut h, Event::DisplayConfigChanged);
+        assert_eq!(h.timers.last().unwrap().1.as_secs(), 5 * 60 * 60);
+
+        h.clock = Some(at(19 * 60));
+        let reloaded = s.reload(&mut h);
+        let _ = std::fs::remove_file(&file);
+        reloaded.unwrap();
+        assert_eq!(h.timers.last().unwrap().1.as_secs(), 60 * 60);
     }
 
     #[test]
