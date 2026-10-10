@@ -1,0 +1,26 @@
+[package]
+name = "cortisoff-ui"
+description = "The cortisoff window, in egui. A client of the daemon and nothing else."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cortisoff-ui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "accesskit", "wayland", "x11"] }
+mlua = { version = "0.12", features = ["luajit", "vendored"] }
+serde = { workspace = true }
+toml = { workspace = true }
+
+# egui ships no font at all without `default_fonts`. Windows has Segoe UI and
+# Segoe Fluent Icons on every install, so the Windows build ships none; other
+# systems get egui's bundled fonts until a font lookup exists there.
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

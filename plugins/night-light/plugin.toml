@@ -1,0 +1,7 @@
+id = "night-light"
+name = "Night light"
+version = "0.1.0"
+icon = "moon"
+# Gamma ramps exist on all three; DDC/CI and panel gain are per system.
+platforms = ["windows", "linux", "macos"]
+entry = "init.lua"
