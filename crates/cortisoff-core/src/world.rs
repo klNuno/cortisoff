@@ -148,6 +148,7 @@ impl World {
             Event::DisplayConfigChanged
             | Event::Reapply { .. }
             | Event::TimerFired { .. }
+            | Event::Hotkey { .. }
             | Event::Shutdown => None,
         }
     }

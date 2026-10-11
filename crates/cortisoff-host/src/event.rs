@@ -78,6 +78,11 @@ pub enum Event {
     TimerFired {
         id: TimerId,
     },
+    /// A global hotkey registered through [`crate::Host::set_hotkeys`] was
+    /// pressed.
+    Hotkey {
+        id: u32,
+    },
     /// The daemon is going down cleanly. Every claim is released so the host
     /// restores baselines before the process exits.
     Shutdown,

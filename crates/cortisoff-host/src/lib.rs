@@ -20,6 +20,7 @@ mod dispatcher;
 mod event;
 mod interference;
 mod journal;
+mod keys;
 mod value;
 
 /// Test doubles, for this crate's own tests and for dependents enabling the
@@ -35,6 +36,7 @@ pub use interference::{
     identify_running, identity_ramp, inspect, GammaRamp, RampVerdict, KNOWN_COLOUR_APPS,
 };
 pub use journal::{JournalEntry, JournalStore};
+pub use keys::{Chord, Hotkey, Key, Mods, Named, WindowAction, WindowInfo};
 pub use value::Value;
 
 use std::time::Duration;
@@ -90,7 +92,58 @@ pub trait Host {
     /// Returning an empty vector is normal and costs nothing: it means the
     /// timeout elapsed with nothing to report.
     fn poll(&mut self, timeout: Duration) -> Vec<Event>;
+
+    /// Milliseconds on a clock that never goes backwards and keeps counting
+    /// through a change of time zone. The runtime schedules plugin timers on
+    /// it; the wall clock is [`Host::time_of_day`].
+    fn monotonic_ms(&self) -> u64;
+
+    /// Register exactly these global hotkeys, replacing every earlier set.
+    /// Each one pressed comes back as [`Event::Hotkey`] with its id. Returns
+    /// the ones the system refused, with a sentence: another application
+    /// already owns the chord, or this system has no global hotkeys.
+    fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        wanted
+            .iter()
+            .map(|h| (h.id, UNSUPPORTED.to_owned()))
+            .collect()
+    }
+
+    /// Press and release a chord in whatever window has the focus.
+    fn send_keys(&mut self, _chord: &Chord) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// Type text into whatever window has the focus, as if typed.
+    fn type_text(&mut self, _text: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// A notification the user sees even with no cortisoff window open.
+    fn notify(&mut self, _title: &str, _body: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    fn clipboard(&self) -> Result<String, String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    fn set_clipboard(&mut self, _text: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// Every visible top-level window, front to back.
+    fn windows(&self) -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    fn window_action(&mut self, _id: u64, _action: WindowAction) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
 }
+
+/// What a host answers for a service its system does not offer.
+pub const UNSUPPORTED: &str = "this system does not offer that to cortisoff yet";
 
 /// Wall clock, injected so the core never reads one.
 ///

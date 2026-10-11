@@ -15,7 +15,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::HPOWERNOTIFY;
-use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount, GetTickCount64};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::Shell::{
@@ -480,6 +480,11 @@ impl WinHost {
 }
 
 impl Host for WinHost {
+    fn monotonic_ms(&self) -> u64 {
+        // SAFETY: no argument, no failure mode.
+        unsafe { GetTickCount64() }
+    }
+
     fn set_idle_thresholds(&mut self, seconds: &[u32]) {
         self.idle_thresholds = seconds.to_vec();
         self.idle_thresholds
