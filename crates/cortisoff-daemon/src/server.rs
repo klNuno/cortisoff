@@ -68,7 +68,7 @@ impl<J: JournalStore> Server<J> {
 
     /// Everything that has happened since the last call, for the daemon's own
     /// log. Independent of the subscriber list on purpose: a user watching
-    /// `cortisoffd` in a terminal and a user running `cortisoff trace` are
+    /// `cortisoff --daemon` in a terminal and a user running `cortisoff-cli trace` are
     /// both entitled to the whole stream.
     pub fn drain_log(&mut self) -> Vec<cortisoff_ipc::Notification> {
         std::mem::take(&mut self.log)
@@ -165,12 +165,7 @@ impl<J: JournalStore> Server<J> {
         out
     }
 
-    fn answer(
-        &mut self,
-        client: ClientId,
-        request: Request,
-        host: &mut dyn Host,
-    ) -> Response {
+    fn answer(&mut self, client: ClientId, request: Request, host: &mut dyn Host) -> Response {
         let s = &mut self.supervisor;
         let done = |r: Result<(), String>| match r {
             Ok(()) => Response::Ok,

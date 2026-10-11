@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// A capability's stable public name, such as `display.vibrance`.
 ///
-/// Strings live at the edges: rule files, IPC, the doctor report. Inside the
+/// Strings live at the edges: plugins, IPC, the doctor report. Inside the
 /// engine they are interned to a [`CapIndex`] so the hot path indexes a vector
 /// instead of hashing a string.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

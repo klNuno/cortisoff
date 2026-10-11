@@ -215,7 +215,10 @@ mod tests {
 
     #[test]
     fn a_wrong_chord_says_which_part() {
-        assert!("ctrl+hyper+n".parse::<Chord>().unwrap_err().contains("hyper"));
+        assert!("ctrl+hyper+n"
+            .parse::<Chord>()
+            .unwrap_err()
+            .contains("hyper"));
         assert!("ctrl+f99".parse::<Chord>().unwrap_err().contains("f99"));
         assert!("".parse::<Chord>().is_err());
     }

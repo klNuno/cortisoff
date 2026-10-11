@@ -18,7 +18,7 @@ mod supervisor;
 pub use journal::FileJournal;
 pub use log::{append, DaemonLog, Mark, Previous, Stamp};
 pub use paths::{Layout, PathError, Paths};
-pub use run::{autostart, run, spawn_detached, Options, USAGE};
+pub use run::{autostart, run, spawn_detached, start_at_logon, starts_at_logon, Options, USAGE};
 pub use server::{ClientId, Outbound, Server};
 pub use startup::Interference;
 pub use supervisor::{Supervisor, PLUGIN_TIMER, WATCH_TIMER};

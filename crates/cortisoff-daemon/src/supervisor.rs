@@ -348,9 +348,15 @@ impl<J: JournalStore> Supervisor<J> {
     ) -> Result<(), String> {
         let index = self.settable(host, cap)?;
         let now = host.monotonic_ms();
-        let actions =
-            self.claims
-                .claim(index, OwnerId::Manual, priority::MANUAL, value, 0, now, None);
+        let actions = self.claims.claim(
+            index,
+            OwnerId::Manual,
+            priority::MANUAL,
+            value,
+            0,
+            now,
+            None,
+        );
         self.run(host, actions);
         self.settle(host);
         Ok(())
@@ -372,9 +378,15 @@ impl<J: JournalStore> Supervisor<J> {
     ) -> Result<(), String> {
         let index = self.settable(host, cap)?;
         let now = host.monotonic_ms();
-        let actions =
-            self.claims
-                .claim(index, OwnerId::Preview, priority::PREVIEW, value, 0, now, None);
+        let actions = self.claims.claim(
+            index,
+            OwnerId::Preview,
+            priority::PREVIEW,
+            value,
+            0,
+            now,
+            None,
+        );
         self.run(host, actions);
         Ok(())
     }
@@ -551,7 +563,10 @@ impl<J: JournalStore> Supervisor<J> {
             });
         }
         for action in &allowed {
-            if matches!(action, Action::Apply { .. } | Action::RestoreBaseline { .. }) {
+            if matches!(
+                action,
+                Action::Apply { .. } | Action::RestoreBaseline { .. }
+            ) {
                 self.note(Notification::Action(action.clone()));
             }
         }
@@ -702,7 +717,10 @@ impl<J: JournalStore> Supervisor<J> {
                     owner: self.owner_name(top.owner),
                     priority: top.priority,
                     value: top.value.clone(),
-                    shadowed: stack[1..].iter().map(|c| self.owner_name(c.owner)).collect(),
+                    shadowed: stack[1..]
+                        .iter()
+                        .map(|c| self.owner_name(c.owner))
+                        .collect(),
                 })
             })
             .collect();
@@ -792,13 +810,14 @@ pub(crate) mod testing {
         }
     }
 
-    pub(crate) fn supervisor(
-        host: &MockHost,
-        packages: Vec<Package>,
-    ) -> Supervisor<MemJournal> {
+    pub(crate) fn supervisor(host: &MockHost, packages: Vec<Package>) -> Supervisor<MemJournal> {
         let mut store = Store::in_memory();
         for p in &packages {
-            store.plugins.entry(p.manifest.id.clone()).or_default().enabled = true;
+            store
+                .plugins
+                .entry(p.manifest.id.clone())
+                .or_default()
+                .enabled = true;
         }
         let runtime = Runtime::new(packages, &store, None);
         Supervisor::new(
@@ -851,7 +870,10 @@ mod tests {
         assert_eq!(host.installed, vec![CapabilityId::new(ids::APP_FOCUS)]);
         sup.handle(&mut host, focus("game.exe"));
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
-        assert_eq!(sup.plugins()[0].holds, vec![CapabilityId::new(ids::DISPLAY_VIBRANCE)]);
+        assert_eq!(
+            sup.plugins()[0].holds,
+            vec![CapabilityId::new(ids::DISPLAY_VIBRANCE)]
+        );
         sup.handle(&mut host, focus("notepad.exe"));
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
     }
@@ -917,7 +939,10 @@ mod tests {
         sup.handle(&mut host, Event::TimerFired { id: PLUGIN_TIMER });
         assert_eq!(sup.plugins()[0].state["n"].as_f64(), Some(1.0));
         assert_eq!(
-            host.timers.iter().filter(|(id, ..)| *id == PLUGIN_TIMER).count(),
+            host.timers
+                .iter()
+                .filter(|(id, ..)| *id == PLUGIN_TIMER)
+                .count(),
             2,
             "armed again for the next one"
         );
@@ -991,6 +1016,9 @@ mod tests {
             Store::in_memory(),
         );
         sup.start(&mut host);
-        assert!(sup.remove(&mut host, "night-light").unwrap_err().contains("built in"));
+        assert!(sup
+            .remove(&mut host, "night-light")
+            .unwrap_err()
+            .contains("built in"));
     }
 }

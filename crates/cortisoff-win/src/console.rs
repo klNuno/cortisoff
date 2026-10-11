@@ -35,7 +35,7 @@ pub fn request_stop() {
 ///
 /// A release daemon has no console of its own, so that a logon task does not
 /// open a black window. Started from a terminal it would then print nowhere,
-/// and `cortisoffd --doctor` would look like it did nothing.
+/// and `cortisoff --daemon --doctor` would look like it did nothing.
 pub fn attach_parent_console() -> bool {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok()

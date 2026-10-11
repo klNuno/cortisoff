@@ -583,7 +583,7 @@ pub fn ask(
     request: cortisoff_ipc::Request,
 ) -> Result<cortisoff_ipc::Response, String> {
     connect(session)
-        .ok_or_else(|| "no daemon is listening on this session. start cortisoffd first".to_owned())?
+        .ok_or_else(|| "cortisoff is not running in this session".to_owned())?
         .ask(request)
 }
 

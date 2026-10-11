@@ -92,15 +92,46 @@ pub fn spawn_detached(exe: &Path) -> Result<(), String> {
     platform::spawn_detached(exe)
 }
 
-/// Turn starting at logon on or off for this executable.
+/// `--autostart on|off|status`: starting the daemon at logon, from this
+/// executable.
 pub fn autostart(mode: &str) -> Result<(), String> {
-    platform::autostart(mode)
+    match mode {
+        "on" => {
+            platform::start_at_logon(true)?;
+            println!("cortisoff starts when you log on");
+        }
+        "off" => {
+            platform::start_at_logon(false)?;
+            println!("cortisoff no longer starts when you log on");
+        }
+        "status" => println!(
+            "{}",
+            if platform::starts_at_logon() {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        other => return Err(format!("--autostart takes on, off or status, not {other}")),
+    }
+    Ok(())
+}
+
+/// Start this executable's daemon at logon, or stop doing so. What the
+/// window's switch and the installer call.
+pub fn start_at_logon(on: bool) -> Result<(), String> {
+    platform::start_at_logon(on)
+}
+
+/// Whether the daemon starts at logon.
+pub fn starts_at_logon() -> bool {
+    platform::starts_at_logon()
 }
 
 pub fn run(args: Options) -> Result<(), String> {
     platform::attach_console();
     if let Some(mode) = &args.autostart {
-        return platform::autostart(mode);
+        return autostart(mode);
     }
 
     // Paths read the environment and touch no file, so the log is open before
@@ -391,22 +422,18 @@ mod platform {
         cortisoff_win::efficiency_mode();
     }
 
-    pub fn autostart(mode: &str) -> Result<(), String> {
+    pub fn start_at_logon(on: bool) -> Result<(), String> {
         use cortisoff_win::autostart;
-        match mode {
-            "on" => {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                autostart::enable(&exe)?;
-                println!("cortisoff starts when you log on: {}", exe.display());
-            }
-            "off" => {
-                autostart::disable()?;
-                println!("cortisoff no longer starts when you log on");
-            }
-            "status" => println!("{}", if autostart::enabled() { "on" } else { "off" }),
-            other => return Err(format!("--autostart takes on, off or status, not {other}")),
+        if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            autostart::enable(&exe)
+        } else {
+            autostart::disable()
         }
-        Ok(())
+    }
+
+    pub fn starts_at_logon() -> bool {
+        cortisoff_win::autostart::enabled()
     }
 
     pub fn spawn_detached(exe: &Path) -> Result<(), String> {
@@ -535,33 +562,34 @@ mod platform {
         cortisoff_unix::efficiency_mode();
     }
 
-    pub fn autostart(mode: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        use cortisoff_mac::autostart;
-        #[cfg(target_os = "linux")]
-        use cortisoff_linux::autostart;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            match mode {
-                "on" => {
-                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                    autostart::enable(&exe)?;
-                    println!("cortisoff starts when you log in: {}", exe.display());
-                }
-                "off" => {
-                    autostart::disable()?;
-                    println!("cortisoff no longer starts when you log in");
-                }
-                "status" => println!("{}", if autostart::enabled() { "on" } else { "off" }),
-                other => return Err(format!("--autostart takes on, off or status, not {other}")),
-            }
-            Ok(())
+    #[cfg(target_os = "linux")]
+    use cortisoff_linux::autostart;
+    #[cfg(target_os = "macos")]
+    use cortisoff_mac::autostart;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn start_at_logon(on: bool) -> Result<(), String> {
+        if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            autostart::enable(&exe)
+        } else {
+            autostart::disable()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = mode;
-            Err("starting at login is not supported on this system".to_owned())
-        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn starts_at_logon() -> bool {
+        autostart::enabled()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn start_at_logon(_on: bool) -> Result<(), String> {
+        Err("starting at login is not supported on this system".to_owned())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn starts_at_logon() -> bool {
+        false
     }
 
     pub fn spawn_detached(exe: &Path) -> Result<(), String> {

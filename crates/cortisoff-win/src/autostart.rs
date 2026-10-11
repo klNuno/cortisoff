@@ -153,6 +153,7 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{command}</Command>
+      <Arguments>--daemon</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -174,8 +175,9 @@ mod tests {
 
     #[test]
     fn the_task_names_the_user_and_the_daemon_escaped() {
-        let xml = task_xml(Path::new(r"C:\Tom & Jerry\cortisoffd.exe"), r"PC\tom");
-        assert!(xml.contains(r"<Command>C:\Tom &amp; Jerry\cortisoffd.exe</Command>"));
+        let xml = task_xml(Path::new(r"C:\Tom & Jerry\cortisoff.exe"), r"PC\tom");
+        assert!(xml.contains(r"<Command>C:\Tom &amp; Jerry\cortisoff.exe</Command>"));
+        assert!(xml.contains("<Arguments>--daemon</Arguments>"));
         assert_eq!(xml.matches(r"<UserId>PC\tom</UserId>").count(), 2);
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
     }
@@ -185,7 +187,7 @@ mod tests {
     /// `IgnoreNew` is what makes it free while the daemon is alive.
     #[test]
     fn a_dead_daemon_is_started_again_without_waiting_for_the_next_logon() {
-        let xml = task_xml(Path::new(r"C:\cortisoffd.exe"), "tom");
+        let xml = task_xml(Path::new(r"C:\cortisoff.exe"), "tom");
         assert!(xml.contains("<Repetition>"));
         assert!(xml.contains("<Interval>PT5M</Interval>"));
         assert!(

@@ -30,7 +30,7 @@ pub fn parse_value(raw: &str) -> Value {
 }
 
 /// `2560x1440@240`, `@240` and `1920x1080` are the three shapes, the same
-/// three a rule file takes. Refresh is carried in millihertz because 59.94 Hz
+/// three `cortisoff-cli set` takes. Refresh is carried in millihertz because 59.94 Hz
 /// is a real mode and rounding it to 60 picks a different one.
 fn parse_mode(raw: &str) -> Option<Value> {
     let (size, refresh) = match raw.split_once('@') {

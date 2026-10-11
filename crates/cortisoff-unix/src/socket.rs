@@ -469,7 +469,7 @@ impl Client {
 /// connection, a preview, ends here too: hold a `Client` for those.
 pub fn ask(request: cortisoff_ipc::Request) -> Result<cortisoff_ipc::Response, String> {
     connect()
-        .ok_or_else(|| "no daemon is listening on this session. start cortisoffd first".to_owned())?
+        .ok_or_else(|| "cortisoff is not running in this session".to_owned())?
         .ask(request)
 }
 

@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 cortisoff-win = { path = "../cortisoff-win" }
 
+[target.'cfg(unix)'.dependencies]
+cortisoff-unix = { path = "../cortisoff-unix" }
+
 # Names the executable in the taskbar and Task Manager, see ../resources.rs.
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
