@@ -30,7 +30,7 @@ pub const MENU_QUIT: usize = 3;
 const ICON_ID: u32 = 1;
 
 /// The same picture the dashboard wears, so the two read as one application.
-static ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/icon.ico");
+pub(crate) static ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/icon.ico");
 static ACTIVE_ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/active.ico");
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -135,6 +135,11 @@ impl Tray {
         }
     }
 
+    /// A notification balloon on this icon.
+    pub fn notify(&self, title: &str, body: &str) -> Result<(), String> {
+        crate::notice::show(self.window, ICON_ID, title, body)
+    }
+
     fn data(&self) -> NOTIFYICONDATAW {
         NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -174,7 +179,7 @@ pub fn open_dashboard() -> Result<(), String> {
     Err(format!("no dashboard next to {}", dir.display()))
 }
 
-fn load_icon(ico: &[u8]) -> (HICON, bool) {
+pub(crate) fn load_icon(ico: &[u8]) -> (HICON, bool) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
     if let Some(bits) = ico_image(ico, size as u32) {
         if let Ok(icon) = unsafe {

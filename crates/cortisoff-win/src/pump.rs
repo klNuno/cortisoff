@@ -9,7 +9,8 @@
 use std::time::Duration;
 
 use cortisoff_host::{
-    ids, Actuator, ActuatorError, CapabilityId, CapabilitySet, Event, Host, TimerId,
+    ids, Actuator, ActuatorError, CapabilityId, CapabilitySet, Chord, Event, Host, Hotkey, TimerId,
+    WindowAction, WindowInfo,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -29,8 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::Audio;
 use crate::colortemp::ColorTemp;
+use crate::hotkeys::Hotkeys;
 use crate::mode::DisplayMode;
 use crate::names::Names;
+use crate::notice::Notice;
 use crate::sources::{self, Raw};
 use crate::tray::{self, Tray};
 use crate::vibrance::Vibrance;
@@ -59,6 +62,11 @@ pub fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
 const IDLE_TIMER: usize = 0x0100_0000;
 const AUDIO_TIMER: usize = 0x0100_0001;
 const DISPLAY_TIMER: usize = 0x0100_0002;
+const NOTICE_TIMER: usize = 0x0100_0003;
+
+/// How long the notification-only icon stays when Windows never says its
+/// balloon is done, which it does not for one shown during quiet hours.
+const NOTICE_LINGER: Duration = Duration::from_secs(30);
 
 /// When a display change is pushed again, counted from the message that
 /// announced it.
@@ -107,6 +115,9 @@ pub struct WinHost {
     names: Names,
     audio: Audio,
     tray: Option<Tray>,
+    hotkeys: Hotkeys,
+    /// The icon a notification comes from when there is no tray icon.
+    notice: Option<Notice>,
     color_temp: Option<ColorTemp>,
     vibrance: Option<Vibrance>,
     display_mode: Option<DisplayMode>,
@@ -174,6 +185,8 @@ impl WinHost {
             names: Names::default(),
             audio: Audio::new(),
             tray: None,
+            hotkeys: Hotkeys::new(window),
+            notice: None,
             color_temp: ColorTemp::new(),
             vibrance: Vibrance::new(),
             display_mode: DisplayMode::new(),
@@ -416,6 +429,10 @@ impl WinHost {
                 self.audio_active = active;
                 vec![Event::AudioActive { active }]
             }
+            Raw::Timer(NOTICE_TIMER) => {
+                self.drop_notice();
+                Vec::new()
+            }
             // The engine's own timer. It asked for a schedule edge or a fade
             // step. Send the time for schedules and the id for previews. It asked
             // once, and a Win32 timer repeats until killed: left alone, the
@@ -447,7 +464,47 @@ impl WinHost {
                 }
                 Vec::new()
             }
+            Raw::Hotkey(id) => self
+                .hotkeys
+                .pressed(id)
+                .map(|id| Event::Hotkey { id })
+                .into_iter()
+                .collect(),
+            Raw::NoticeDone => {
+                if self.notice.as_mut().is_some_and(Notice::finished) {
+                    self.drop_notice();
+                }
+                Vec::new()
+            }
         }
+    }
+
+    /// A balloon from the tray icon when there is one, from an icon added
+    /// for the purpose otherwise.
+    fn show_notice(&mut self, title: &str, body: &str) -> Result<(), String> {
+        if let Some(tray) = &self.tray {
+            return tray.notify(title, body);
+        }
+        let mut notice = match self.notice.take() {
+            Some(notice) => notice,
+            None => Notice::add(self.window)?,
+        };
+        let shown = notice.show(title, body);
+        if shown.is_err() && notice.idle() {
+            drop(notice);
+            self.drop_notice();
+            return shown;
+        }
+        self.notice = Some(notice);
+        // Rearmed by every balloon, so the icon outlives the last one.
+        let ms = NOTICE_LINGER.as_millis() as u32;
+        unsafe { SetCoalescableTimer(self.window, NOTICE_TIMER, ms, None, ms / 10) };
+        shown
+    }
+
+    fn drop_notice(&mut self) {
+        self.notice = None;
+        let _ = unsafe { KillTimer(self.window, NOTICE_TIMER) };
     }
 
     fn tray_menu(&self, x: i32, y: i32) {
@@ -691,6 +748,38 @@ impl Host for WinHost {
         Some(self.clock())
     }
 
+    fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        self.hotkeys.set(wanted)
+    }
+
+    fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {
+        crate::input::send_chord(chord)
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), String> {
+        crate::input::type_text(text)
+    }
+
+    fn notify(&mut self, title: &str, body: &str) -> Result<(), String> {
+        self.show_notice(title, body)
+    }
+
+    fn clipboard(&self) -> Result<String, String> {
+        crate::clipboard::read(self.window)
+    }
+
+    fn set_clipboard(&mut self, text: &str) -> Result<(), String> {
+        crate::clipboard::write(self.window, text)
+    }
+
+    fn windows(&self) -> Vec<WindowInfo> {
+        crate::toplevel::list()
+    }
+
+    fn window_action(&mut self, id: u64, action: WindowAction) -> Result<(), String> {
+        crate::toplevel::act(id, action)
+    }
+
     fn poll(&mut self, timeout: Duration) -> Vec<Event> {
         if !self.snapshot_sent {
             self.snapshot_sent = true;
@@ -726,6 +815,9 @@ impl Drop for WinHost {
         // Before the window goes, or the icon lingers until a mouse passes
         // over it.
         self.tray = None;
+        self.drop_notice();
+        // Also tied to the window, and unregistered while it still exists.
+        self.hotkeys.clear();
         if let Some(hook) = self.foreground_hook.take() {
             sources::unhook_foreground(hook);
         }

@@ -9,13 +9,18 @@
 
 mod audio;
 pub mod autostart;
+mod clipboard;
 mod color;
 mod colortemp;
 mod console;
 mod ddc;
+mod hotkeys;
+mod input;
+mod keymap;
 mod maximized;
 mod mode;
 mod names;
+mod notice;
 mod nvapi;
 mod pipe;
 mod power;
@@ -24,6 +29,7 @@ mod pump;
 mod screen;
 mod sources;
 mod startup;
+mod toplevel;
 mod tray;
 mod vibrance;
 mod wallpaper;
