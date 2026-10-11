@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cortisoff"
+name = "cortisoff-cli"
 path = "src/main.rs"
 
 [dependencies]

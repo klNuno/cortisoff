@@ -1,13 +1,13 @@
 [package]
-name = "cortisoff-ui"
-description = "The cortisoff window, in egui. A client of the daemon and nothing else."
+name = "cortisoff-app"
+description = "The cortisoff app: the window, the daemon mode, the installer and the updater, in one binary."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cortisoff-ui"
+name = "cortisoff"
 path = "src/main.rs"
 
 [dependencies]

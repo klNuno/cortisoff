@@ -7,7 +7,7 @@ members = [
     "crates/cortisoff-daemon",
     "crates/cortisoff-win",
     "crates/cortisoff-cli",
-    "crates/cortisoff-ui",
+    "crates/cortisoff-app",
 ]
 # probe/ is the T0 throwaway. It links Win32 directly and must never become a
 # workspace member, or `cargo test` stops running on non-Windows machines.

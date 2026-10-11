@@ -1,9 +1,9 @@
 //! Renders every page to a PNG with no window and no daemon.
 //!
-//! `cargo test -p cortisoff-ui --test capture -- --nocapture` writes them to
+//! `cargo test -p cortisoff-app --test capture -- --nocapture` writes them to
 //! `target/captures/ui`. The egui counterpart of `pnpm capture`.
 
-use cortisoff_ui::{App, Page, Shell, SIZE};
+use cortisoff_app::{App, Page, Shell, SIZE};
 use egui_kittest::Harness;
 
 #[test]

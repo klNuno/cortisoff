@@ -689,6 +689,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortisoff-app"
+version = "0.0.0"
+dependencies = [
+ "eframe",
+ "egui_kittest",
+ "mlua",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "cortisoff-cli"
 version = "0.0.0"
 dependencies = [
@@ -737,17 +748,6 @@ dependencies = [
  "cortisoff-host",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cortisoff-ui"
-version = "0.0.0"
-dependencies = [
- "eframe",
- "egui_kittest",
- "mlua",
- "serde",
- "toml 0.8.23",
 ]
 
 [[package]]

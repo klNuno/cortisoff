@@ -1,5 +1,5 @@
 include!("../resources.rs");
 
 fn main() {
-    embed("cortisoff", "cortisoff command line");
+    embed("cortisoff-cli", "cortisoff command line");
 }
