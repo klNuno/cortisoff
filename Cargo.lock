@@ -767,8 +767,10 @@ dependencies = [
  "cortisoff-core",
  "cortisoff-host",
  "cortisoff-ipc",
+ "cortisoff-mac",
+ "cortisoff-runtime",
+ "cortisoff-unix",
  "cortisoff-win",
- "embed-resource",
  "serde",
  "serde_json",
 ]
