@@ -1,4 +1,5 @@
-//! Where the rule file, the journal and the socket live on each platform.
+//! Where plugins, their settings, the journal and the log live on each
+//! platform.
 //!
 //! Resolved from environment variables through an injected lookup, so the
 //! layout of all three platforms is tested on any one of them. Nothing here
@@ -31,9 +32,12 @@ impl Layout {
 /// Everything the daemon needs from the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
-    /// Hand-edited by the user, so it lives with configuration rather than
-    /// with state.
-    pub rules: PathBuf,
+    /// Which plugins are on and what the user set in them. Configuration,
+    /// so it roams with a Windows profile.
+    pub store: PathBuf,
+    /// One folder per installed plugin. Data rather than configuration: a
+    /// plugin can be large and it is downloaded again on demand.
+    pub plugins: PathBuf,
     /// Rewritten by the daemon and meaningless to a human, so it lives with
     /// state and is never in a backup the user restores by hand.
     pub journal: PathBuf,
@@ -76,14 +80,17 @@ impl Paths {
             })
         };
 
-        let (config, state) = match layout {
-            // Roaming for the rules so they follow a domain profile, local for
-            // the journal because it describes this machine's hardware.
-            Layout::Windows => (need("APPDATA")?, need("LOCALAPPDATA")?),
+        let (config, data, state) = match layout {
+            // Roaming for the settings so they follow a domain profile, local
+            // for the rest because it describes this machine.
+            Layout::Windows => {
+                let local = need("LOCALAPPDATA")?;
+                (need("APPDATA")?, local.clone(), local)
+            }
             Layout::MacOs => {
                 let home = need("HOME")?;
                 let support = home.join("Library").join("Application Support");
-                (support.clone(), support)
+                (support.clone(), support.clone(), support)
             }
             Layout::Xdg => {
                 let home = || need("HOME");
@@ -91,16 +98,21 @@ impl Paths {
                     Some(p) => p,
                     None => home()?.join(".config"),
                 };
+                let data = match get("XDG_DATA_HOME") {
+                    Some(p) => p,
+                    None => home()?.join(".local").join("share"),
+                };
                 let state = match get("XDG_STATE_HOME") {
                     Some(p) => p,
                     None => home()?.join(".local").join("state"),
                 };
-                (config, state)
+                (config, data, state)
             }
         };
 
         Ok(Paths {
-            rules: config.join("cortisoff").join("rules.toml"),
+            store: config.join("cortisoff").join("plugins.json"),
+            plugins: data.join("cortisoff").join("plugins"),
             journal: state.join("cortisoff").join("journal.json"),
             log: state.join("cortisoff").join("cortisoffd.log"),
         })
@@ -121,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_splits_roaming_rules_from_local_state() {
+    fn windows_splits_roaming_settings_from_local_state() {
         let p = Paths::resolve(
             Layout::Windows,
             env(&[
@@ -130,11 +142,12 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert!(p.rules.ends_with("cortisoff/rules.toml"));
-        assert!(p.rules.starts_with(r"C:\Users\x\AppData\Roaming"));
+        assert!(p.store.ends_with("cortisoff/plugins.json"));
+        assert!(p.store.starts_with(r"C:\Users\x\AppData\Roaming"));
+        assert!(p.plugins.starts_with(r"C:\Users\x\AppData\Local"));
         assert!(p.journal.starts_with(r"C:\Users\x\AppData\Local"));
         // The log describes this machine's runs, so it sits with the journal
-        // rather than with the roaming rules.
+        // rather than with the roaming settings.
         assert!(p.log.ends_with("cortisoff/cortisoffd.log"));
         assert!(p.log.starts_with(r"C:\Users\x\AppData\Local"));
     }
@@ -143,8 +156,12 @@ mod tests {
     fn xdg_falls_back_to_home_when_the_variables_are_absent() {
         let p = Paths::resolve(Layout::Xdg, env(&[("HOME", "/home/x")])).unwrap();
         assert_eq!(
-            p.rules,
-            PathBuf::from("/home/x/.config/cortisoff/rules.toml")
+            p.store,
+            PathBuf::from("/home/x/.config/cortisoff/plugins.json")
+        );
+        assert_eq!(
+            p.plugins,
+            PathBuf::from("/home/x/.local/share/cortisoff/plugins")
         );
         assert_eq!(
             p.journal,
@@ -159,7 +176,7 @@ mod tests {
             env(&[("HOME", "/home/x"), ("XDG_CONFIG_HOME", "/cfg")]),
         )
         .unwrap();
-        assert_eq!(p.rules, PathBuf::from("/cfg/cortisoff/rules.toml"));
+        assert_eq!(p.store, PathBuf::from("/cfg/cortisoff/plugins.json"));
         // The one that was not overridden still falls back to HOME.
         assert!(p.journal.starts_with("/home/x"));
     }
@@ -167,14 +184,14 @@ mod tests {
     #[test]
     fn macos_puts_both_under_application_support() {
         let p = Paths::resolve(Layout::MacOs, env(&[("HOME", "/Users/x")])).unwrap();
-        assert!(p.rules.starts_with("/Users/x/Library/Application Support"));
+        assert!(p.store.starts_with("/Users/x/Library/Application Support"));
         assert!(p
             .journal
             .starts_with("/Users/x/Library/Application Support"));
     }
 
-    /// `HOME=` is not a home directory, and treating it as one writes the rule
-    /// file to the filesystem root.
+    /// `HOME=` is not a home directory, and treating it as one writes the
+    /// settings to the filesystem root.
     #[test]
     fn an_empty_variable_counts_as_unset() {
         let err = Paths::resolve(Layout::Xdg, env(&[("HOME", "")])).unwrap_err();

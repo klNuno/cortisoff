@@ -1,51 +1,104 @@
-// A release daemon has no console, so a logon task does not open a black
-// window. A debug build keeps one, which is what `cargo run` wants.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-
-//! `cortisoffd`, the daemon itself.
+//! The daemon as a process: `cortisoff --daemon`.
 //!
-//! The only place in the project that picks a platform. What it does is four
-//! moves: ask the host what this machine can do, read the rules, put back
-//! whatever a previous run left applied, then loop.
+//! The only place in the project that picks a platform. Four moves: ask the
+//! host what this machine can do, put back whatever a previous run left
+//! applied, start the plugins, then loop.
 //!
-//!     cargo run -p cortisoff-daemon                    # foreground, live log
-//!     cargo run -p cortisoff-daemon -- --rules my.toml
-//!     cargo run -p cortisoff-daemon -- --doctor        # report and exit
+//! ```text
+//! cargo run -p cortisoff-app -- --daemon             # foreground, live log
+//! cargo run -p cortisoff-app -- --daemon --doctor    # report and exit
+//! ```
 //!
 //! Ctrl-C hands every screen back before exiting. Killing it does not, which
-//! is what the journal is for: the next start restores before any rule fires.
+//! is what the journal is for: the next start restores before any plugin
+//! claims anything.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cortisoff_core::{CapTable, Engine};
-use cortisoff_daemon::{
-    resting, ClientId, DaemonLog, FileJournal, Mark, Paths, Previous, Server, Supervisor,
-};
 use cortisoff_host::{CapabilitySet, LogLevel};
 use cortisoff_ipc::Notification;
+use cortisoff_runtime::{Runtime, Store};
+
+use crate::{ClientId, DaemonLog, FileJournal, Mark, Paths, Previous, Server, Supervisor};
 
 /// Long enough that an idle machine costs nothing, short enough that Ctrl-C
-/// feels immediate. Every real wakeup comes from the message pump or from a
-/// pipe client, never from this expiring.
+/// feels immediate. Every real wakeup comes from the platform or from a
+/// client, never from this expiring.
 const TICK: Duration = Duration::from_millis(500);
 
-fn main() {
-    // Started from a terminal, print there. Started by the logon task, there
-    // is nothing to attach to and nothing is lost.
-    platform::attach_console();
-    let args = Args::parse(std::env::args().skip(1));
-    if args.help {
-        println!("{USAGE}");
-        return;
-    }
-    if let Err(e) = run(args) {
-        eprintln!("cortisoffd: {e}");
-        std::process::exit(1);
+pub const USAGE: &str = "cortisoff --daemon, the part that runs the plugins
+
+    --journal <path>  where captured baselines are written
+    --log <path>      where starts, exits and errors are written
+    --no-log          write no such file
+    --plugins <dir>   where installed plugins live
+    --store <path>    which plugins are on and their settings
+    --doctor          print what this machine can do, then exit
+    --verbose         print every event and action
+    --autostart <on|off|status>
+                      start the daemon when you log on, or stop doing so
+    --no-tray         no icon in the notification area
+    --no-eco          do not ask the system to schedule it as background work";
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Options {
+    pub journal: Option<PathBuf>,
+    pub log: Option<PathBuf>,
+    pub plugins: Option<PathBuf>,
+    pub store: Option<PathBuf>,
+    pub no_log: bool,
+    pub doctor: bool,
+    pub verbose: bool,
+    pub autostart: Option<String>,
+    pub no_tray: bool,
+    pub no_eco: bool,
+}
+
+impl Options {
+    /// Everything after `--daemon`.
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut out = Self::default();
+        let mut args = args.into_iter();
+        let path = |name: &str, next: Option<String>| {
+            next.map(PathBuf::from)
+                .ok_or_else(|| format!("{name} needs a path after it"))
+        };
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--journal" => out.journal = Some(path("--journal", args.next())?),
+                "--log" => out.log = Some(path("--log", args.next())?),
+                "--plugins" => out.plugins = Some(path("--plugins", args.next())?),
+                "--store" => out.store = Some(path("--store", args.next())?),
+                "--no-log" => out.no_log = true,
+                "--doctor" => out.doctor = true,
+                "--verbose" | "-v" => out.verbose = true,
+                "--autostart" => {
+                    out.autostart = Some(args.next().unwrap_or_else(|| "status".to_owned()))
+                }
+                "--no-tray" => out.no_tray = true,
+                "--no-eco" => out.no_eco = true,
+                other => return Err(format!("{other} is not a daemon option\n\n{USAGE}")),
+            }
+        }
+        Ok(out)
     }
 }
 
-fn run(args: Args) -> Result<(), String> {
+/// Start the session's daemon from the window or the CLI, detached, unless
+/// one already answers. Returns once the process is started, not once it
+/// listens.
+pub fn spawn_detached(exe: &Path) -> Result<(), String> {
+    platform::spawn_detached(exe)
+}
+
+/// Turn starting at logon on or off for this executable.
+pub fn autostart(mode: &str) -> Result<(), String> {
+    platform::autostart(mode)
+}
+
+pub fn run(args: Options) -> Result<(), String> {
+    platform::attach_console();
     if let Some(mode) = &args.autostart {
         return platform::autostart(mode);
     }
@@ -54,9 +107,10 @@ fn run(args: Args) -> Result<(), String> {
     // the session lock is even asked for. A process that never becomes the
     // daemon is exactly the one whose reason for leaving gets lost otherwise.
     let paths = Paths::from_env().map_err(|e| e.0)?;
-    let rules_path = args.rules.clone().unwrap_or(paths.rules);
     let journal_path = args.journal.clone().unwrap_or(paths.journal);
     let log_path = args.log.clone().unwrap_or(paths.log);
+    let plugins_dir = args.plugins.clone().unwrap_or(paths.plugins);
+    let store_path = args.store.clone().unwrap_or(paths.store);
 
     // The doctor only reads: no lock, no line in the log, nothing that makes
     // a second run look like a daemon.
@@ -74,8 +128,8 @@ fn run(args: Args) -> Result<(), String> {
         match platform::claim_session() {
             Some(lock) => Some(lock),
             None => {
-                let said = "another cortisoffd is already running in this session. \
-                            `cortisoff stop` ends it";
+                let said = "another cortisoff daemon is already running in this session. \
+                            `cortisoff-cli stop` ends it";
                 // Once, however often the safety-net trigger tries.
                 log.line_once(platform::now(), Mark::Refused, said);
                 return Err(said.to_owned());
@@ -91,7 +145,7 @@ fn run(args: Args) -> Result<(), String> {
         let previous = log.start(
             platform::now(),
             &format!(
-                "cortisoffd {} as pid {}",
+                "cortisoff {} daemon as pid {}",
                 env!("CARGO_PKG_VERSION"),
                 std::process::id()
             ),
@@ -107,13 +161,6 @@ fn run(args: Args) -> Result<(), String> {
     }
     warnings.extend(log.warnings().iter().cloned());
 
-    let rules = read_rules(&rules_path).inspect_err(|e| {
-        log.line(
-            platform::now(),
-            Mark::Exit,
-            &format!("could not start: {e}"),
-        );
-    })?;
     let (mut host, host_warnings) =
         platform::host(!args.doctor && !args.no_tray).inspect_err(|e| {
             log.line(
@@ -128,19 +175,20 @@ fn run(args: Args) -> Result<(), String> {
     let journal = FileJournal::open(&journal_path);
     warnings.extend(journal.warnings().iter().cloned());
 
-    let engine = Engine::new(
-        CapTable::from_set(&probed),
-        resting(host.as_ref(), rules.clone()),
-    );
-    let mut supervisor = Supervisor::new(engine, journal, platform::gate())
-        .with_rules_path(&rules_path)
-        .with_rules(rules);
+    let (store, store_warning) = Store::open(&store_path);
+    warnings.extend(store_warning);
+    let (packages, problems) = cortisoff_runtime::discover(&plugins_dir, &store.links);
+    warnings.extend(problems);
+    let runtime = Runtime::new(packages, &store, host.waker());
+
+    let mut supervisor = Supervisor::new(probed.clone(), journal, platform::gate(), runtime, store)
+        .with_plugins_dir(&plugins_dir);
     for warning in warnings {
         supervisor.warn(warning);
     }
 
     if args.doctor {
-        let report = supervisor.doctor(host.as_ref(), &probed);
+        let report = supervisor.doctor(host.as_ref());
         println!(
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
@@ -148,14 +196,14 @@ fn run(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("cortisoffd, rules from {}", rules_path.display());
+    println!("cortisoff daemon, plugins from {}", plugins_dir.display());
     println!("baselines in {}", journal_path.display());
     if log.writing() {
         println!("log in {}", log.path().display());
     }
     print_capabilities(&probed);
 
-    let mut transport = match platform::listen() {
+    let mut transport = match platform::listen(host.waker()) {
         Ok(t) => {
             println!("listening on {}", t.address());
             t
@@ -183,7 +231,7 @@ fn run(args: Args) -> Result<(), String> {
                     if args.verbose {
                         println!("client {id} asked {frame:?}");
                     }
-                    let answers = server.on_frame(ClientId(id), frame, host.as_mut(), &probed);
+                    let answers = server.on_frame(ClientId(id), frame, host.as_mut());
                     transport.write(answers);
                 }
                 platform::Incoming::Gone(id) => {
@@ -236,32 +284,15 @@ fn log_panics_to(path: &Path) {
     let path = path.to_path_buf();
     let inner = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        cortisoff_daemon::append(&path, platform::now(), Mark::Panic, &info.to_string());
+        crate::append(&path, platform::now(), Mark::Panic, &info.to_string());
         inner(info);
     }));
 }
 
-/// The rule file, seeded on first run rather than treated as an error. A
-/// daemon that refuses to start because the user has never written a rule is a
-/// daemon nobody gets to try.
-fn read_rules(path: &Path) -> Result<Vec<cortisoff_core::Rule>, String> {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            seed(path)?;
-            println!("wrote a starter rule file to {}", path.display());
-            std::fs::read_to_string(path).map_err(|e| e.to_string())?
-        }
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
-    };
-    cortisoff_core::parse_rules(&source)
-        .map_err(|e| format!("{}: {}: {}", path.display(), e.at, e.message))
-}
-
 /// Hand every subscriber what has happened, then print it here too.
 ///
-/// Quiet by default: an event per focus change is noise, a rule changing its
-/// mind is not.
+/// Quiet by default: an event per focus change is noise, a plugin saying
+/// something is not.
 fn flush(
     server: &mut Server<FileJournal>,
     transport: &mut platform::Transport,
@@ -272,16 +303,13 @@ fn flush(
     transport.write(outbound);
     for notification in server.drain_log() {
         match notification {
-            Notification::RuleEdge { rule, holding } => {
-                println!("{} {rule}", if holding { "hold   " } else { "release" });
-                let mark = if holding { Mark::Hold } else { Mark::Release };
-                log.line(platform::now(), mark, &rule);
-            }
             Notification::Log { level, message } => {
                 match level {
                     LogLevel::Error => eprintln!("error: {message}"),
                     LogLevel::Warn => eprintln!("warning: {message}"),
-                    _ => println!("{message}"),
+                    LogLevel::Info => println!("{message}"),
+                    LogLevel::Trace if verbose => println!("{message}"),
+                    LogLevel::Trace => {}
                 }
                 // Everything the user would want to read the morning after,
                 // and nothing per event: an action a second would bury the
@@ -289,7 +317,8 @@ fn flush(
                 let mark = match level {
                     LogLevel::Error => Mark::Error,
                     LogLevel::Warn => Mark::Warn,
-                    _ => Mark::Info,
+                    LogLevel::Info => Mark::Info,
+                    LogLevel::Trace => continue,
                 };
                 log.line(platform::now(), mark, &message);
             }
@@ -313,98 +342,20 @@ fn print_capabilities(probed: &CapabilitySet) {
     }
 }
 
-/// A first rule file holding only what this machine can do today. Pointing a
-/// new user at a file full of unsupported rules is how a working program looks
-/// broken.
-fn seed(path: &Path) -> Result<(), String> {
-    const STARTER: &str = r#"# Your rules. Every key inside `when` has to hold at once, and a rule owns what
-# it sets only while its `when` holds. Nothing here needs an undo.
-#
-# The full list of conditions, and one rule per shipped feature, are in
-# `rules.example.toml` in the repository.
-
-[[rule]]
-name = "blue light at night"
-# End exclusive, and it crosses midnight because the start is after the end.
-when.between = "20:00-07:00"
-# A film or a game filling the screen keeps its colours. Maximised counts,
-# borderless fullscreen too.
-when.not.maximized = true
-set.display.color_temp = 3200
-# Fades rather than switching: one minute down to 3200 K at 20:00, and one
-# minute back, done by 07:00. It starts from whatever the screen shows,
-# 6600 K on an untouched monitor. Name a `transition.from` to start
-# elsewhere, or a longer duration to make the change slower.
-transition.duration = "1m"
-transition.offset = 0
-"#;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, STARTER).map_err(|e| format!("could not write {}: {e}", path.display()))
-}
-
-const USAGE: &str = "cortisoffd, the cortisoff daemon
-
-    --rules <path>    rule file to load, default is the per-user one
-    --journal <path>  where captured baselines are written
-    --log <path>      where starts, exits and rule edges are written
-    --no-log          write no such file
-    --doctor          print the capability and rule report, then exit
-    --verbose         print every event and action, not only rule edges
-    --autostart <on|off|status>
-                      start this daemon when you log on, or stop doing so
-    --no-tray         no icon in the notification area
-    --no-eco          do not ask Windows to schedule the daemon as background work
-    --help";
-
-#[derive(Default)]
-struct Args {
-    rules: Option<PathBuf>,
-    journal: Option<PathBuf>,
-    log: Option<PathBuf>,
-    no_log: bool,
-    doctor: bool,
-    verbose: bool,
-    autostart: Option<String>,
-    no_tray: bool,
-    no_eco: bool,
-    help: bool,
-}
-
-impl Args {
-    fn parse(args: impl Iterator<Item = String>) -> Self {
-        let mut out = Self::default();
-        let mut args = args;
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--rules" => out.rules = args.next().map(PathBuf::from),
-                "--journal" => out.journal = args.next().map(PathBuf::from),
-                "--log" => out.log = args.next().map(PathBuf::from),
-                "--no-log" => out.no_log = true,
-                "--doctor" => out.doctor = true,
-                "--verbose" | "-v" => out.verbose = true,
-                "--autostart" => {
-                    out.autostart = Some(args.next().unwrap_or_else(|| "status".to_owned()))
-                }
-                "--no-tray" => out.no_tray = true,
-                "--no-eco" => out.no_eco = true,
-                _ => out.help = true,
-            }
-        }
-        out
-    }
-}
+// Both platforms hand back the same `Incoming` and `Transport` shapes, so
+// the loop above needs no `cfg` of its own.
 
 #[cfg(windows)]
 mod platform {
-    use cortisoff_daemon::{Interference, Outbound, Stamp};
-    use cortisoff_host::Host;
+    use std::path::Path;
+
+    use crate::{Interference, Outbound, Stamp};
+    use cortisoff_host::{Host, Waker};
 
     pub use cortisoff_win::Incoming;
 
-    /// Local time, the same call the rule engine's clock events come from, so
-    /// a line in the log and a `between` rule never disagree about the hour.
+    /// Local time, the same call the plugins' clock comes from, so a line in
+    /// the log and a plugin's schedule never disagree about the hour.
     pub fn now() -> Stamp {
         let now = cortisoff_win::local_time();
         Stamp {
@@ -446,11 +397,11 @@ mod platform {
             "on" => {
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
                 autostart::enable(&exe)?;
-                println!("cortisoffd starts when you log on: {}", exe.display());
+                println!("cortisoff starts when you log on: {}", exe.display());
             }
             "off" => {
                 autostart::disable()?;
-                println!("cortisoffd no longer starts when you log on");
+                println!("cortisoff no longer starts when you log on");
             }
             "status" => println!("{}", if autostart::enabled() { "on" } else { "off" }),
             other => return Err(format!("--autostart takes on, off or status, not {other}")),
@@ -458,8 +409,23 @@ mod platform {
         Ok(())
     }
 
+    pub fn spawn_detached(exe: &Path) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        std::process::Command::new(exe)
+            .arg("--daemon")
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not start {}: {e}", exe.display()))
+    }
+
     /// Read once, before anything is applied. A colour utility that starts
-    /// later is the next reload's problem, not this call's.
+    /// later is the next start's problem, not this call's.
     pub fn gate() -> Interference {
         let processes = cortisoff_win::running_processes();
         Interference::assess(
@@ -468,12 +434,13 @@ mod platform {
         )
     }
 
-    pub fn listen() -> Result<Transport, String> {
+    /// The pipe wakes the pump itself; it needs no waker handed in.
+    pub fn listen(_waker: Option<Waker>) -> Result<Transport, String> {
         cortisoff_win::PipeServer::start(cortisoff_win::session_id())
             .map(|pipe| Transport { pipe: Some(pipe) })
     }
 
-    /// A daemon whose transport failed to open still filters blue light. It
+    /// A daemon whose transport failed to open still runs its plugins. It
     /// just cannot be asked anything, so it says so and keeps running rather
     /// than refusing to start.
     pub struct Transport {
@@ -518,81 +485,174 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 mod platform {
-    use cortisoff_daemon::{Interference, Outbound, Stamp};
-    use cortisoff_host::Host;
+    use std::path::Path;
 
-    /// UTC until a platform here has a local-time call of its own. No daemon
-    /// runs on one yet, so nothing reads these lines.
+    use crate::{Interference, Outbound, Stamp};
+    use cortisoff_host::{Host, Waker};
+
+    pub use cortisoff_unix::Incoming;
+
     pub fn now() -> Stamp {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0);
-        Stamp::from_unix_utc(secs)
+        let now = cortisoff_unix::local_time();
+        Stamp {
+            year: now.0,
+            month: now.1,
+            day: now.2,
+            hour: now.3,
+            minute: now.4,
+            second: now.5,
+        }
     }
 
-    /// The same shape the Windows transport hands back, so the loop above
-    /// needs no `cfg` of its own. Nothing constructs these until a platform
-    /// grows a transport.
-    #[allow(dead_code)]
-    pub enum Incoming {
-        Connected(u64),
-        Frame(u64, cortisoff_ipc::Frame),
-        Gone(u64),
-    }
-
+    #[cfg(target_os = "macos")]
     pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
-        Err("no Host is implemented for this platform yet".to_owned())
+        let host = cortisoff_mac::MacHost::new()?;
+        let warnings = host.warnings();
+        Ok((Box::new(host), warnings))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
+        let host = cortisoff_linux::LinuxHost::new()?;
+        let warnings = host.warnings();
+        Ok((Box::new(host), warnings))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
+        Err("cortisoff has no host for this system".to_owned())
     }
 
     pub fn attach_console() {}
 
-    /// Nothing to lock against until a platform can run a daemon at all.
-    pub fn claim_session() -> Option<()> {
-        Some(())
+    pub fn claim_session() -> Option<cortisoff_unix::InstanceLock> {
+        cortisoff_unix::claim_session()
     }
 
-    pub fn efficiency_mode() {}
-
-    pub fn autostart(_mode: &str) -> Result<(), String> {
-        Err("autostart is not implemented for this platform yet".to_owned())
+    pub fn efficiency_mode() {
+        cortisoff_unix::efficiency_mode();
     }
 
+    pub fn autostart(mode: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        use cortisoff_mac::autostart;
+        #[cfg(target_os = "linux")]
+        use cortisoff_linux::autostart;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            match mode {
+                "on" => {
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    autostart::enable(&exe)?;
+                    println!("cortisoff starts when you log in: {}", exe.display());
+                }
+                "off" => {
+                    autostart::disable()?;
+                    println!("cortisoff no longer starts when you log in");
+                }
+                "status" => println!("{}", if autostart::enabled() { "on" } else { "off" }),
+                other => return Err(format!("--autostart takes on, off or status, not {other}")),
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = mode;
+            Err("starting at login is not supported on this system".to_owned())
+        }
+    }
+
+    pub fn spawn_detached(exe: &Path) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(exe)
+            .arg("--daemon")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not start {}: {e}", exe.display()))
+    }
+
+    /// No portable way to read a gamma ramp here, so the name list decides.
     pub fn gate() -> Interference {
-        Interference::clear()
+        let processes = cortisoff_unix::running_processes();
+        Interference::assess(processes.iter().map(String::as_str), None)
     }
 
-    pub fn listen() -> Result<Transport, String> {
-        Err("no transport is implemented for this platform yet".to_owned())
+    pub fn listen(waker: Option<Waker>) -> Result<Transport, String> {
+        cortisoff_unix::SocketServer::start(waker).map(|socket| Transport {
+            socket: Some(socket),
+        })
     }
 
-    pub struct Transport;
+    pub struct Transport {
+        socket: Option<cortisoff_unix::SocketServer>,
+    }
 
     impl Transport {
         pub fn deaf() -> Self {
-            Self
+            Self { socket: None }
         }
 
         pub fn address(&self) -> &str {
-            "nothing"
+            self.socket.as_ref().map_or("nothing", |s| s.name())
         }
 
         pub fn read(&mut self) -> Vec<Incoming> {
-            Vec::new()
+            self.socket.as_mut().map(|s| s.drain()).unwrap_or_default()
         }
 
-        pub fn write(&mut self, _outbound: Vec<Outbound>) {}
+        pub fn write(&mut self, outbound: Vec<Outbound>) {
+            let Some(socket) = self.socket.as_mut() else {
+                return;
+            };
+            for out in outbound {
+                socket.send(out.to.0, &out.frame);
+            }
+        }
 
-        pub fn drop_client(&mut self, _id: u64) {}
+        pub fn drop_client(&mut self, id: u64) {
+            if let Some(socket) = self.socket.as_mut() {
+                socket.disconnect(id);
+            }
+        }
     }
 
     pub fn watch_for_stop() -> bool {
-        false
+        cortisoff_unix::watch_for_stop()
     }
 
     pub fn stop_requested() -> bool {
-        false
+        cortisoff_unix::stop_requested()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        Options::parse(args.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn options_read_their_paths() {
+        let o = parse(&["--plugins", "/p", "--doctor", "--no-tray"]).unwrap();
+        assert_eq!(o.plugins, Some(PathBuf::from("/p")));
+        assert!(o.doctor && o.no_tray);
+    }
+
+    #[test]
+    fn a_path_option_without_a_path_says_so() {
+        assert!(parse(&["--journal"]).unwrap_err().contains("--journal"));
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_with_the_usage() {
+        assert!(parse(&["--rules", "x"]).unwrap_err().contains("--plugins"));
     }
 }

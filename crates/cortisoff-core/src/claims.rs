@@ -123,6 +123,13 @@ impl Claims {
         now: u64,
         rest: Option<&Value>,
     ) -> Vec<Action> {
+        // Asked again for where it is already heading: a plugin that claims
+        // its target on every tick must not restart its own fade each time.
+        if self.fades.iter().any(|f| {
+            f.cap == cap && f.owner == owner && !f.release && f.to == value && f.priority == priority
+        }) {
+            return Vec::new();
+        }
         let from = self
             .arbiter
             .held(cap, owner)

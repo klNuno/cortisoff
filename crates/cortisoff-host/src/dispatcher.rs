@@ -50,6 +50,13 @@ impl<J: JournalStore> Dispatcher<J> {
         &self.journal
     }
 
+    /// What this run captured before its first apply on `cap`: the value the
+    /// capability goes back to once nobody holds it, and so where a release
+    /// fades to.
+    pub fn baseline(&self, cap: &CapabilityId) -> Option<&Value> {
+        self.captured.get(cap)
+    }
+
     /// Put back what a previous run left applied. Runs once at startup, before
     /// any rule fires.
     ///
