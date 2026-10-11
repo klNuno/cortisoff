@@ -62,15 +62,16 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # Clippy and the tests still run after a formatting failure, so one run
-      # reports every check rather than the first one that failed.
+      # Clippy and the tests still run after a formatting failure, and keep
+      # going past a failing crate, so one run reports every crate and every
+      # check rather than the first one that failed.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
       # capture_every_page renders the window through wgpu, and hosted
       # runners have no GPU to give it. It runs on a developer machine with
       # `cargo test -p cortisoff-app --test capture`.
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace -- --skip capture_every_page
+        run: cargo test --workspace --no-fail-fast -- --skip capture_every_page
