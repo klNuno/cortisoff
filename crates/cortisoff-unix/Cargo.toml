@@ -1,0 +1,16 @@
+[package]
+name = "cortisoff-unix"
+description = "The plumbing the Linux and macOS hosts share: the unix socket transport, the session lock, stopping on a signal, the local clock and the process list."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortisoff-host = { path = "../cortisoff-host" }
+cortisoff-ipc = { path = "../cortisoff-ipc" }
+
+# Only on unix, so `cargo check --workspace` still builds on Windows, where
+# this crate compiles to nothing at all.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

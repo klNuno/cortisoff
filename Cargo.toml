@@ -6,6 +6,7 @@ members = [
     "crates/cortisoff-ipc",
     "crates/cortisoff-daemon",
     "crates/cortisoff-win",
+    "crates/cortisoff-unix",
     "crates/cortisoff-cli",
     "crates/cortisoff-app",
 ]

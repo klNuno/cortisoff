@@ -751,6 +751,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortisoff-unix"
+version = "0.0.0"
+dependencies = [
+ "cortisoff-host",
+ "cortisoff-ipc",
+ "libc",
+]
+
+[[package]]
 name = "cortisoff-win"
 version = "0.0.0"
 dependencies = [
