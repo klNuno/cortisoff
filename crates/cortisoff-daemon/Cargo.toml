@@ -25,5 +25,8 @@ cortisoff-unix = { path = "../cortisoff-unix" }
 [target.'cfg(target_os = "macos")'.dependencies]
 cortisoff-mac = { path = "../cortisoff-mac" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+cortisoff-linux = { path = "../cortisoff-linux" }
+
 [dev-dependencies]
 cortisoff-host = { path = "../cortisoff-host", features = ["test-util"] }

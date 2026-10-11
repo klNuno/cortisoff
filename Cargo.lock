@@ -767,6 +767,7 @@ dependencies = [
  "cortisoff-core",
  "cortisoff-host",
  "cortisoff-ipc",
+ "cortisoff-linux",
  "cortisoff-mac",
  "cortisoff-runtime",
  "cortisoff-unix",
