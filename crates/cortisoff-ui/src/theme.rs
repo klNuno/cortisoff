@@ -5,7 +5,7 @@
 //! temperature. Everything here is a constant so a capture and the real window
 //! cannot disagree.
 
-use eframe::egui::{
+use egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
 };
 use std::sync::Arc;
@@ -63,6 +63,52 @@ pub mod glyph {
     pub const LOCK: char = '\u{E72E}';
     pub const FULLSCREEN: char = '\u{E740}';
     pub const ARROW: char = '\u{E72A}';
+    pub const PLUGIN: char = '\u{EA86}';
+    pub const CHECK: char = '\u{E73E}';
+    pub const KEYBOARD: char = '\u{E765}';
+    pub const PLAY: char = '\u{E768}';
+    pub const DELETE: char = '\u{E74D}';
+    pub const EDIT: char = '\u{E70F}';
+    pub const SEARCH: char = '\u{E721}';
+    pub const WARNING: char = '\u{E7BA}';
+    pub const REFRESH: char = '\u{E72C}';
+    pub const SUN: char = '\u{E706}';
+    pub const POWER: char = '\u{E7E8}';
+    pub const BATTERY: char = '\u{E83F}';
+
+    /// The glyph for an icon name a plugin uses, or a generic plugin glyph.
+    pub fn named(name: &str) -> char {
+        match name {
+            "home" => HOME,
+            "settings" => SETTINGS,
+            "add" => ADD,
+            "moon" => MOON,
+            "monitor" => MONITOR,
+            "picture" => PICTURE,
+            "bolt" => BOLT,
+            "pause" => PAUSE,
+            "close" => CLOSE,
+            "clock" => CLOCK,
+            "game" => GAME,
+            "volume" => VOLUME,
+            "lock" => LOCK,
+            "fullscreen" => FULLSCREEN,
+            "arrow" => ARROW,
+            "plugin" => PLUGIN,
+            "check" => CHECK,
+            "keyboard" => KEYBOARD,
+            "play" => PLAY,
+            "delete" => DELETE,
+            "edit" => EDIT,
+            "search" => SEARCH,
+            "warning" => WARNING,
+            "refresh" => REFRESH,
+            "sun" => SUN,
+            "power" => POWER,
+            "battery" => BATTERY,
+            _ => PLUGIN,
+        }
+    }
 }
 
 /// Fonts and style. Called once, before the first frame.
@@ -151,6 +197,11 @@ fn fonts() -> FontDefinitions {
         system_font(&["consola.ttf"]),
         FontFamily::Monospace,
     );
+    // Consolas sits about three points higher than Segoe UI on the same
+    // line, which shows in a field holding one of each.
+    if let Some(consolas) = fonts.font_data.get_mut("consolas") {
+        Arc::make_mut(consolas).tweak.y_offset_factor = 0.2;
+    }
 
     // A family that names no font panics at the first glyph, so every named
     // family falls back to the proportional list.

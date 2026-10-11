@@ -4,9 +4,9 @@
 //! areas). A switch, a card, a setting row, a chip and a slider whose track
 //! can carry data are drawn here, because they carry most of the window.
 
-use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Mesh, Pos2,
-    Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+use egui::{
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Mesh,
+    Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, UiBuilder, Vec2,
 };
 
 use crate::theme::{self, glyph};
@@ -65,13 +65,22 @@ pub fn card<R>(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui) -> R)
 }
 
 /// One line of a card: what it is on the left, with a hint under it, and the
-/// control on the right.
+/// controls on the right, laid out left to right in the order they are added.
 pub fn row(ui: &mut Ui, label: &str, hint: Option<&str>, control: impl FnOnce(&mut Ui)) {
     ui.add_space(4.0);
-    egui::Sides::new().height(32.0).show(
-        ui,
-        |ui| {
-            ui.vertical(|ui| {
+    let id = ui.next_auto_id().with("row");
+    let reserved = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    // The text block's height from the frame before, to centre it on the
+    // controls the way they are centred on it.
+    let text_id = id.with("text");
+    let text_height = ui.data(|d| d.get_temp::<f32>(text_id)).unwrap_or(20.0);
+    ui.horizontal(|ui| {
+        ui.set_min_height(text_height.max(32.0));
+        let text_width = (ui.available_width() - reserved - 24.0).max(96.0);
+        let text = ui.allocate_ui_with_layout(
+            vec2(text_width, text_height),
+            Layout::top_down(Align::Min),
+            |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
                     egui::RichText::new(label)
@@ -85,11 +94,49 @@ pub fn row(ui: &mut Ui, label: &str, hint: Option<&str>, control: impl FnOnce(&m
                             .color(theme::MUTED),
                     );
                 }
-            });
-        },
-        control,
-    );
+                ui.min_rect().height()
+            },
+        );
+        if (text.inner - text_height).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(text_id, text.inner));
+            ui.ctx().request_repaint();
+        }
+        trailing_with(ui, id, control);
+    });
     ui.add_space(4.0);
+}
+
+/// Whatever `add` draws, left to right, pushed against the right edge of
+/// the space left. Its width is measured on one frame and used on the next,
+/// so the block lands in place one frame after it first appears or changes
+/// size, and asks for that frame itself.
+pub fn trailing<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let id = ui.next_auto_id().with("trailing");
+    trailing_with(ui, id, add)
+}
+
+fn trailing_with<R>(ui: &mut Ui, id: egui::Id, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let width = ui.data(|d| d.get_temp::<f32>(id));
+    let avail = ui.available_rect_before_wrap();
+    let left = match width {
+        Some(w) => (avail.right() - w).max(avail.left()),
+        None => avail.left(),
+    };
+    let rect = Rect::from_min_max(pos2(left, avail.top()), avail.max);
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let out = add(&mut child);
+    let used = child.min_rect();
+    if width.is_none_or(|w| (used.width() - w).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(id, used.width()));
+        ui.ctx().request_repaint();
+    }
+    ui.advance_cursor_after_rect(used);
+    out
 }
 
 pub fn divider(ui: &mut Ui) {
@@ -102,15 +149,31 @@ pub fn divider(ui: &mut Ui) {
 
 /// A small rounded tag. `icon` is a glyph from the system icon font.
 pub fn chip(ui: &mut Ui, icon: Option<char>, text: &str) -> Response {
+    chip_with(ui, icon, text, Sense::hover())
+}
+
+/// A tag that answers a click, such as a list entry with a remove glyph.
+/// It brightens under the pointer, the only difference from [`chip`].
+pub fn chip_button(ui: &mut Ui, icon: Option<char>, text: &str) -> Response {
+    chip_with(ui, icon, text, Sense::click())
+}
+
+fn chip_with(ui: &mut Ui, icon: Option<char>, text: &str, sense: Sense) -> Response {
     let font = theme::body(12.5);
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), font, theme::TEXT);
     let icon_w = if icon.is_some() { 18.0 } else { 0.0 };
     let size = vec2(galley.size().x + icon_w + 18.0, 24.0);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let hot = sense.senses_click() && response.hovered();
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(12), theme::FIELD);
+    let fill = if hot {
+        theme::FIELD_HOVER
+    } else {
+        theme::FIELD
+    };
+    painter.rect_filled(rect, CornerRadius::same(12), fill);
     let mut x = rect.left() + 9.0;
     if let Some(icon) = icon {
         painter.text(
@@ -118,7 +181,7 @@ pub fn chip(ui: &mut Ui, icon: Option<char>, text: &str) -> Response {
             Align2::LEFT_CENTER,
             icon,
             theme::icon(12.0),
-            theme::MUTED,
+            if hot { theme::TEXT } else { theme::MUTED },
         );
         x += icon_w;
     }
@@ -193,6 +256,252 @@ pub fn field(ui: &mut Ui, text: &str, width: f32) -> Response {
     response
 }
 
+/// A line of text the user types, on the same quiet fill as [`field`]. A
+/// faint outline shows where the caret is.
+pub fn text_field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: Option<&str>,
+    width: f32,
+    mono: bool,
+) -> Response {
+    let (rect, base) = ui.allocate_exact_size(vec2(width, 30.0), Sense::hover());
+    let bg = ui.painter().add(Shape::Noop);
+    let font = if mono {
+        FontId::monospace(13.5)
+    } else {
+        theme::body(14.0)
+    };
+    let inner = rect.shrink2(vec2(10.0, 0.0));
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .id_salt(base.id)
+            .max_rect(inner)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let mut edit = TextEdit::singleline(value)
+        .id(base.id.with("text"))
+        .frame(Frame::NONE)
+        .margin(Margin::ZERO)
+        .min_size(vec2(inner.width(), 30.0))
+        .vertical_align(Align::Center)
+        .desired_width(inner.width())
+        .font(font.clone())
+        .text_color(theme::TEXT);
+    if let Some(hint) = hint {
+        edit = edit.hint_text(egui::RichText::new(hint).font(font).color(theme::SUBTLE));
+    }
+    let response = child.add(edit);
+    let focused = response.has_focus();
+    let fill = if focused || response.hovered() {
+        theme::FIELD_HOVER
+    } else {
+        theme::FIELD
+    };
+    ui.painter()
+        .set(bg, Shape::rect_filled(rect, theme::RADIUS_CONTROL, fill));
+    if focused {
+        ui.painter().rect_stroke(
+            rect,
+            theme::RADIUS_CONTROL,
+            Stroke::new(1.0, theme::SUBTLE),
+            StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+/// One of a few choices, shown like [`field`], opening a list under it.
+/// `selected` is the entry of `labels` showing now, `None` showing `fallback`
+/// instead. Returns the entry picked this frame.
+pub fn select(
+    ui: &mut Ui,
+    labels: &[String],
+    selected: Option<usize>,
+    fallback: &str,
+) -> Option<usize> {
+    let font = theme::body(14.0);
+    let widest = labels
+        .iter()
+        .map(String::as_str)
+        .chain([fallback])
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap(l.to_owned(), font.clone(), theme::TEXT)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let width = (widest + 46.0).max(120.0);
+    let shown = selected
+        .and_then(|i| labels.get(i))
+        .map_or(fallback, String::as_str);
+    let response = field(ui, shown, width);
+    let mut picked = None;
+    egui::Popup::menu(&response)
+        .width(width)
+        .gap(4.0)
+        .frame(
+            Frame::new()
+                .fill(theme::CARD)
+                .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+                .corner_radius(theme::RADIUS_CONTROL)
+                .inner_margin(Margin::same(4)),
+        )
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (i, label) in labels.iter().enumerate() {
+                let (rect, item) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+                let painter = ui.painter();
+                if item.hovered() {
+                    painter.rect_filled(rect, CornerRadius::same(4), theme::FIELD_HOVER);
+                }
+                let current = selected == Some(i);
+                painter.text(
+                    rect.left_center() + vec2(10.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    label,
+                    if current {
+                        theme::strong(14.0)
+                    } else {
+                        theme::body(14.0)
+                    },
+                    if current { theme::TEXT } else { theme::MUTED },
+                );
+                if current {
+                    painter.text(
+                        rect.right_center() - vec2(10.0, 0.0),
+                        Align2::RIGHT_CENTER,
+                        glyph::CHECK,
+                        theme::icon(11.0),
+                        theme::TEXT,
+                    );
+                }
+                if item.clicked() {
+                    picked = Some(i);
+                }
+            }
+        });
+    picked
+}
+
+/// A time of day as `HH:MM`. Click to type one (`21:30`, `2130`, `9`), or
+/// drag sideways to move it by five minutes every few pixels. `minute` is
+/// the minute of the day.
+pub fn time_field(ui: &mut Ui, minute: &mut f64) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(vec2(92.0, 30.0), Sense::click_and_drag());
+    let edit_id = response.id.with("edit");
+    let drag_id = response.id.with("drag");
+    let mut editing: Option<String> = ui.data(|d| d.get_temp(edit_id));
+    if editing.is_none() && response.clicked() {
+        editing = Some(clock(*minute));
+        ui.memory_mut(|m| m.request_focus(edit_id.with("text")));
+    }
+    let bg = ui.painter().add(Shape::Noop);
+    let mut active = false;
+    if let Some(mut text) = editing {
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id_salt(edit_id)
+                .max_rect(rect.shrink2(vec2(10.0, 0.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        let edit = child.add(
+            TextEdit::singleline(&mut text)
+                .id(edit_id.with("text"))
+                .frame(Frame::NONE)
+                .margin(Margin::ZERO)
+                .min_size(vec2(rect.width() - 20.0, 30.0))
+                .vertical_align(Align::Center)
+                .desired_width(rect.width() - 20.0)
+                .font(theme::body(14.0))
+                .text_color(theme::TEXT),
+        );
+        active = true;
+        if edit.lost_focus() {
+            if let Some(m) = parse_clock(&text) {
+                if m != *minute {
+                    *minute = m;
+                    response.mark_changed();
+                }
+            }
+            ui.data_mut(|d| d.remove::<String>(edit_id));
+        } else {
+            ui.data_mut(|d| d.insert_temp(edit_id, text));
+        }
+    } else {
+        if response.drag_started() {
+            ui.data_mut(|d| d.insert_temp(drag_id, (*minute, 0.0_f32)));
+        }
+        if response.dragged() {
+            if let Some((start, moved)) = ui.data(|d| d.get_temp::<(f64, f32)>(drag_id)) {
+                let moved = moved + response.drag_delta().x;
+                ui.data_mut(|d| d.insert_temp(drag_id, (start, moved)));
+                let steps = (moved / 6.0).round() as f64;
+                let m = ((start / 5.0).round() * 5.0 + steps * 5.0).rem_euclid(1440.0);
+                if m != *minute {
+                    *minute = m;
+                    response.mark_changed();
+                }
+            }
+        }
+        let painter = ui.painter();
+        painter.text(
+            rect.left_center() + vec2(10.0, 0.0),
+            Align2::LEFT_CENTER,
+            clock(*minute),
+            theme::body(14.0),
+            theme::TEXT,
+        );
+        painter.text(
+            rect.right_center() - vec2(10.0, 0.0),
+            Align2::RIGHT_CENTER,
+            glyph::CLOCK,
+            theme::icon(12.0),
+            theme::MUTED,
+        );
+    }
+    let fill = if active || response.hovered() || response.dragged() {
+        theme::FIELD_HOVER
+    } else {
+        theme::FIELD
+    };
+    ui.painter()
+        .set(bg, Shape::rect_filled(rect, theme::RADIUS_CONTROL, fill));
+    if active {
+        ui.painter().rect_stroke(
+            rect,
+            theme::RADIUS_CONTROL,
+            Stroke::new(1.0, theme::SUBTLE),
+            StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+/// `HH:MM` for a minute of the day.
+pub fn clock(minute: f64) -> String {
+    let m = (minute.round() as i64).rem_euclid(1440);
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+/// A typed time: `21:30`, `21.30`, `21h30`, `2130`, `930`, `21`.
+pub fn parse_clock(text: &str) -> Option<f64> {
+    let t = text.trim().to_ascii_lowercase();
+    let (h, m) = match t.find([':', '.', 'h', ' ']) {
+        Some(i) => {
+            let (h, m) = (&t[..i], t[i + 1..].trim());
+            (h.trim(), if m.is_empty() { "0" } else { m })
+        }
+        None if t.len() > 2 => t.split_at(t.len() - 2),
+        None => (t.as_str(), "0"),
+    };
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    (h < 24 && m < 60).then(|| f64::from(h * 60 + m))
+}
+
 /// A coloured dot saying what a plugin is doing.
 pub fn dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
@@ -240,7 +549,11 @@ pub fn slider(
             painter.rect_filled(rail, CornerRadius::same(3), theme::FIELD);
             let filled =
                 Rect::from_min_max(rail.min, pos2(egui::lerp(rail.x_range(), t), rail.max.y));
-            painter.rect_filled(filled, CornerRadius::same(3), theme::MUTED);
+            // Under the handle anyway, and a sliver narrower than its own
+            // rounding draws as a stray mark beside it.
+            if filled.width() >= 6.0 {
+                painter.rect_filled(filled, CornerRadius::same(3), theme::MUTED);
+            }
         }
         Track::Kelvin => {
             gradient(painter, rail, 48, |x| {

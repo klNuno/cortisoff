@@ -733,11 +733,20 @@ dependencies = [
 name = "cortisoff-app"
 version = "0.0.0"
 dependencies = [
+ "cortisoff-daemon",
+ "cortisoff-host",
+ "cortisoff-ipc",
+ "cortisoff-runtime",
+ "cortisoff-ui",
+ "cortisoff-unix",
+ "cortisoff-update",
+ "cortisoff-win",
  "eframe",
  "egui_kittest",
+ "embed-resource",
  "mlua",
  "serde",
- "toml 0.8.23",
+ "serde_json",
 ]
 
 [[package]]
@@ -746,6 +755,7 @@ version = "0.0.0"
 dependencies = [
  "cortisoff-host",
  "cortisoff-ipc",
+ "cortisoff-unix",
  "cortisoff-win",
  "embed-resource",
  "serde",
@@ -830,6 +840,19 @@ dependencies = [
  "toml 0.8.23",
  "ureq",
  "zip",
+]
+
+[[package]]
+name = "cortisoff-ui"
+version = "0.0.0"
+dependencies = [
+ "cortisoff-host",
+ "cortisoff-ipc",
+ "cortisoff-runtime",
+ "egui",
+ "egui_kittest",
+ "mlua",
+ "serde_json",
 ]
 
 [[package]]

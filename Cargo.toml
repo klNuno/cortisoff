@@ -10,6 +10,7 @@ members = [
     "crates/cortisoff-unix",
     "crates/cortisoff-mac",
     "crates/cortisoff-cli",
+    "crates/cortisoff-ui",
     "crates/cortisoff-app",
     "crates/cortisoff-update",
     "crates/cortisoff-linux",
