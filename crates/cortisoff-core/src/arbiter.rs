@@ -11,11 +11,11 @@ use cortisoff_host::{Action, CapIndex, Value};
 
 use crate::table::CapTable;
 
-/// Who holds a claim. A rule, a manual override from the CLI or dashboard, or
-/// a slider being dragged.
+/// Who holds a claim. A plugin, a manual override from the CLI or the
+/// window, or a slider being dragged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OwnerId {
-    Rule(u32),
+    Plugin(u32),
     Manual,
     Preview,
 }
@@ -63,6 +63,33 @@ impl Arbiter {
     /// Who currently drives this capability, for `cortisoff trace`.
     pub fn holder(&self, cap: CapIndex) -> Option<OwnerId> {
         self.top(cap).map(|c| c.owner)
+    }
+
+    /// What is pushed to the hardware right now, as far as this arbiter
+    /// knows. Where a fade starts from.
+    pub fn applied(&self, cap: CapIndex) -> Option<&Value> {
+        self.slots[cap.0 as usize].applied.as_ref()
+    }
+
+    /// The value `owner` holds on `cap`, if any.
+    pub fn held(&self, cap: CapIndex, owner: OwnerId) -> Option<&Value> {
+        self.slots[cap.0 as usize]
+            .claims
+            .iter()
+            .find(|c| c.owner == owner)
+            .map(|c| &c.value)
+    }
+
+    /// Push the winner of every capability again, for after [`Self::invalidate`].
+    pub fn resettle(&mut self) -> Vec<Action> {
+        (0..self.slots.len())
+            .filter_map(|i| self.settle(CapIndex(i as u16)))
+            .collect()
+    }
+
+    /// The same, for one capability.
+    pub fn resettle_one(&mut self, cap: CapIndex) -> Option<Action> {
+        self.settle(cap)
     }
 
     pub fn stack(&self, cap: CapIndex) -> &[Claim] {
@@ -116,7 +143,7 @@ impl Arbiter {
     }
 
     /// Drop everything one owner holds, across every capability. Used when a
-    /// rule stops matching and on shutdown.
+    /// plugin is switched off or reloaded.
     pub fn release_all(&mut self, owner: OwnerId) -> Vec<Action> {
         (0..self.slots.len())
             .filter_map(|i| self.release(CapIndex(i as u16), owner))
@@ -225,7 +252,7 @@ mod tests {
     fn first_claim_applies() {
         let (mut a, vib, _) = arbiter();
         assert_eq!(
-            a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80)),
+            a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80)),
             Some(apply(VIBRANCE, 80))
         );
     }
@@ -233,16 +260,16 @@ mod tests {
     #[test]
     fn reclaiming_the_same_value_emits_nothing() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
-        assert_eq!(a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80)), None);
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
+        assert_eq!(a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80)), None);
     }
 
     #[test]
     fn an_owner_holds_one_claim_and_updates_it_in_place() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         assert_eq!(
-            a.claim(vib, OwnerId::Rule(1), 0, Value::Int(50)),
+            a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(50)),
             Some(apply(VIBRANCE, 50))
         );
         assert_eq!(a.stack(vib).len(), 1);
@@ -251,7 +278,7 @@ mod tests {
     #[test]
     fn higher_priority_preempts() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         assert_eq!(
             a.claim(vib, OwnerId::Manual, 100, Value::Int(20)),
             Some(apply(VIBRANCE, 20))
@@ -262,7 +289,7 @@ mod tests {
     fn a_lower_priority_claim_under_a_held_capability_changes_nothing() {
         let (mut a, vib, _) = arbiter();
         a.claim(vib, OwnerId::Manual, 100, Value::Int(20));
-        assert_eq!(a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80)), None);
+        assert_eq!(a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80)), None);
     }
 
     /// The reason the stack exists. Releasing the winner must fall back to the
@@ -270,7 +297,7 @@ mod tests {
     #[test]
     fn releasing_the_top_falls_back_to_the_claim_below() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         a.claim(vib, OwnerId::Manual, 100, Value::Int(20));
         assert_eq!(a.release(vib, OwnerId::Manual), Some(apply(VIBRANCE, 80)));
     }
@@ -278,41 +305,41 @@ mod tests {
     #[test]
     fn releasing_the_last_claim_restores_the_baseline() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
-        assert_eq!(a.release(vib, OwnerId::Rule(1)), Some(restore(VIBRANCE)));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
+        assert_eq!(a.release(vib, OwnerId::Plugin(1)), Some(restore(VIBRANCE)));
     }
 
     #[test]
     fn releasing_a_claim_that_is_not_on_top_emits_nothing() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         a.claim(vib, OwnerId::Manual, 100, Value::Int(20));
-        assert_eq!(a.release(vib, OwnerId::Rule(1)), None);
+        assert_eq!(a.release(vib, OwnerId::Plugin(1)), None);
     }
 
     #[test]
     fn releasing_an_owner_that_holds_nothing_is_a_no_op() {
         let (mut a, vib, _) = arbiter();
-        assert_eq!(a.release(vib, OwnerId::Rule(7)), None);
+        assert_eq!(a.release(vib, OwnerId::Plugin(7)), None);
     }
 
     #[test]
     fn equal_priority_resolves_to_the_most_recent_claim() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 5, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 5, Value::Int(80));
         assert_eq!(
-            a.claim(vib, OwnerId::Rule(2), 5, Value::Int(30)),
+            a.claim(vib, OwnerId::Plugin(2), 5, Value::Int(30)),
             Some(apply(VIBRANCE, 30))
         );
-        assert_eq!(a.holder(vib), Some(OwnerId::Rule(2)));
+        assert_eq!(a.holder(vib), Some(OwnerId::Plugin(2)));
     }
 
     #[test]
     fn releasing_the_recent_of_two_equal_priorities_falls_back_to_the_older() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 5, Value::Int(80));
-        a.claim(vib, OwnerId::Rule(2), 5, Value::Int(30));
-        assert_eq!(a.release(vib, OwnerId::Rule(2)), Some(apply(VIBRANCE, 80)));
+        a.claim(vib, OwnerId::Plugin(1), 5, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(2), 5, Value::Int(30));
+        assert_eq!(a.release(vib, OwnerId::Plugin(2)), Some(apply(VIBRANCE, 80)));
     }
 
     /// Batch order is the capability table's order, which is alphabetical
@@ -321,18 +348,18 @@ mod tests {
     #[test]
     fn release_all_drops_one_owner_across_every_capability() {
         let (mut a, vib, temp) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
-        a.claim(temp, OwnerId::Rule(1), 0, Value::Int(3400));
-        let actions = a.release_all(OwnerId::Rule(1));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
+        a.claim(temp, OwnerId::Plugin(1), 0, Value::Int(3400));
+        let actions = a.release_all(OwnerId::Plugin(1));
         assert_eq!(actions, vec![restore(TEMP), restore(VIBRANCE)]);
     }
 
     #[test]
     fn release_all_leaves_other_owners_alone() {
         let (mut a, vib, temp) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         a.claim(temp, OwnerId::Manual, 0, Value::Int(3400));
-        assert_eq!(a.release_all(OwnerId::Rule(1)), vec![restore(VIBRANCE)]);
+        assert_eq!(a.release_all(OwnerId::Plugin(1)), vec![restore(VIBRANCE)]);
         assert_eq!(a.holder(temp), Some(OwnerId::Manual));
     }
 
@@ -341,9 +368,9 @@ mod tests {
     #[test]
     fn shutdown_restores_everything_once_per_capability() {
         let (mut a, vib, temp) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         a.claim(vib, OwnerId::Manual, 100, Value::Int(20));
-        a.claim(temp, OwnerId::Rule(2), 0, Value::Int(3400));
+        a.claim(temp, OwnerId::Plugin(2), 0, Value::Int(3400));
         assert_eq!(
             a.release_everything(),
             vec![restore(TEMP), restore(VIBRANCE)]
@@ -362,7 +389,7 @@ mod tests {
     #[test]
     fn a_preemption_that_lands_on_the_same_value_emits_nothing() {
         let (mut a, vib, _) = arbiter();
-        a.claim(vib, OwnerId::Rule(1), 0, Value::Int(80));
+        a.claim(vib, OwnerId::Plugin(1), 0, Value::Int(80));
         assert_eq!(a.claim(vib, OwnerId::Manual, 100, Value::Int(80)), None);
         assert_eq!(a.holder(vib), Some(OwnerId::Manual));
     }

@@ -1,0 +1,23 @@
+[package]
+name = "cortisoff-runtime"
+description = "Runs plugins: finds them, sandboxes their Lua, hands them the cx API, keeps their settings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortisoff-core = { path = "../cortisoff-core" }
+cortisoff-host = { path = "../cortisoff-host" }
+cortisoff-ipc = { path = "../cortisoff-ipc" }
+mlua = { version = "0.12", features = ["luajit", "vendored", "serialize"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+# HTTP for `cx:http` and for installing a plugin from a URL. The system's own
+# TLS: SChannel, Security.framework or OpenSSL, nothing bundled.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+cortisoff-host = { path = "../cortisoff-host", features = ["test-util"] }

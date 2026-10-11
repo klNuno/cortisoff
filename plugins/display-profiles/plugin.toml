@@ -1,0 +1,7 @@
+id = "display-profiles"
+name = "Display profiles"
+version = "0.1.0"
+description = "A refresh rate and a vibrance for each app, while it is in front."
+icon = "monitor"
+# Display modes exist everywhere; vibrance needs an NVIDIA driver on Windows.
+platforms = ["windows", "linux", "macos"]

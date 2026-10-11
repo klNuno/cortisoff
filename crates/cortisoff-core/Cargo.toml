@@ -1,6 +1,6 @@
 [package]
 name = "cortisoff-core"
-description = "Event engine, claim arbitration and rule dispatch. Knows no operating system."
+description = "Claim arbitration, fades and the world model. Knows no operating system and no plugin language."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,3 @@ repository.workspace = true
 [dependencies]
 cortisoff-host = { path = "../cortisoff-host" }
 serde = { workspace = true }
-toml = { workspace = true }

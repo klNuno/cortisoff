@@ -1,64 +1,85 @@
 //! What the daemon and its clients say to each other.
 //!
-//! Every type here is plain data with a serde derive. The CLI, the Tauri
-//! dashboard and any third-party client speak this and nothing else, which is
-//! what keeps the daemon free of a webview and free of a windowing crate.
+//! Every type here is plain data with a serde derive. The CLI, the window and
+//! any third-party client speak this and nothing else. A plugin's settings
+//! and the state it publishes cross as JSON the plugin shapes itself, so the
+//! protocol never changes for a new plugin.
 
-use cortisoff_core::Rule;
-use cortisoff_host::{Action, AppRef, CapabilityId, Control, Event, LogLevel, Value};
+use cortisoff_host::{Action, AppRef, CapabilityId, Control, Event, LogLevel, Value, WindowInfo};
 use serde::{Deserialize, Serialize};
+
+/// Free-form data a plugin owns: its settings, the state it publishes, a
+/// message from its page.
+pub type Json = serde_json::Value;
 
 /// What a client asks for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
-    /// Everything `cortisoff doctor` prints.
+    /// Everything `cortisoff-cli doctor` prints.
     Doctor,
-    /// The live world plus who holds what.
+    /// The live world, every plugin, and who holds what.
     State,
-    /// Start receiving [`Notification`]s on this connection. What `cortisoff
-    /// trace` does, and what the dashboard leaves open while it is on screen.
+    /// Start receiving [`Notification`]s on this connection. What `trace`
+    /// does, and what the window leaves open while it is on screen.
     Subscribe,
     Unsubscribe,
-    /// A manual override, outranking every rule until it is cleared. The
-    /// dashboard's sliders and `cortisoff set`.
+    /// A manual override, outranking every plugin until it is cleared.
     Set {
         cap: CapabilityId,
         value: Value,
     },
-    /// Drop the manual override and let the rules have the capability back.
+    /// Drop the manual override and let the plugins have the capability back.
     Clear {
         cap: CapabilityId,
     },
     /// Show a value while a slider is being dragged. Outranks even a manual
     /// override and lasts until [`Request::PreviewEnd`] or the connection
-    /// closes, whichever comes first, so a dashboard that crashes mid-drag
+    /// closes, whichever comes first, so a window that crashes mid-drag
     /// leaves nothing behind.
     Preview {
         cap: CapabilityId,
         value: Value,
     },
-    /// The drag ended. The capability fades back to whatever held it before
-    /// the preview, a rule, a manual override or the screen's own rest.
+    /// The drag ended. The capability eases back to whatever held it before.
     PreviewEnd {
         cap: CapabilityId,
     },
-    /// The rules as authored, which is what an editor needs and what
-    /// [`DoctorReport::rules`] deliberately is not: that one says what this
-    /// machine did with them.
-    Rules,
-    /// Replace the rule file with these, then reload.
-    ///
-    /// The whole set, not one rule, because that is what makes switching a
-    /// rule off, editing it, adding one and deleting one the same operation,
-    /// with no identity to keep in sync between the file and the client. A set
-    /// that does not load leaves the previous file in place.
-    SaveRules {
-        rules: Vec<Rule>,
+    /// Every plugin found, enabled or not.
+    Plugins,
+    /// Switch a plugin on or off. Off releases everything it holds.
+    Enable {
+        id: String,
+        enabled: bool,
     },
-    /// Re-read the rule files. A syntax error leaves the running rules alone
-    /// and comes back as [`Response::Error`].
-    Reload,
+    /// Replace a plugin's settings. The daemon stores them and tells the
+    /// plugin.
+    Settings {
+        id: String,
+        settings: Json,
+    },
+    /// Something a plugin's page sent its own daemon half: a button pressed,
+    /// an app picked.
+    Message {
+        id: String,
+        name: String,
+        #[serde(default)]
+        data: Json,
+    },
+    /// Read the plugin folders again: a client installed, updated or removed
+    /// one on disk.
+    Rescan,
+    /// Load a plugin from a folder in place and reload it whenever a file in
+    /// it changes. What a plugin author works with.
+    Link {
+        path: String,
+    },
+    /// Forget a linked folder or delete an installed plugin.
+    Remove {
+        id: String,
+    },
+    /// The open windows, for a page that lets the user pick an app.
+    Windows,
     /// Exit cleanly, restoring every baseline on the way out.
     Shutdown,
 }
@@ -69,12 +90,14 @@ pub enum Response {
     Ok,
     Doctor(Box<DoctorReport>),
     State(Box<StateReport>),
-    /// A named field rather than a newtype, because this enum is internally
-    /// tagged and serde cannot put a tag next to a bare sequence. A newtype
-    /// here compiles and then panics the daemon the first time a client asks
-    /// for the rules.
-    Rules {
-        rules: Vec<Rule>,
+    /// Named fields rather than newtypes: this enum is internally tagged and
+    /// serde cannot put a tag next to a bare sequence. A newtype here
+    /// compiles and then panics the daemon the first time a client asks.
+    Plugins {
+        plugins: Vec<PluginReport>,
+    },
+    Windows {
+        windows: Vec<WindowInfo>,
     },
     /// Never a panic and never a dropped connection. A client that asks for
     /// something impossible gets a sentence it can print.
@@ -97,20 +120,73 @@ impl Response {
 pub enum Notification {
     /// Something the platform observed.
     Event(Event),
-    /// A rule's condition changed truth value. The line `cortisoff trace`
-    /// exists for.
-    RuleEdge {
-        rule: String,
-        holding: bool,
-    },
-    /// What the engine decided to do about it.
+    /// What the daemon pushed to the hardware about it.
     Action(Action),
     Log {
         level: LogLevel,
         message: String,
     },
+    /// One plugin changed: it published a state, its settings moved, it
+    /// failed or came back.
+    Plugin(Box<PluginReport>),
+    /// Plugins appeared or went away. Ask for [`Request::Plugins`] again.
+    Plugins,
     /// The daemon is going down. No further notification follows.
     Closing,
+}
+
+/// Where a plugin's files come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Shipped inside cortisoff.
+    Builtin,
+    /// Downloaded into the data folder.
+    Installed,
+    /// A folder the user pointed at, reloaded as it changes.
+    Linked,
+}
+
+/// One plugin, as the daemon runs it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginReport {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    pub platforms: Vec<String>,
+    /// Whether this system is one of `platforms`.
+    pub supported: bool,
+    pub origin: Origin,
+    /// The folder the files are read from. `None` for a built-in plugin,
+    /// whose files are inside the binary.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Where it was installed from, for updates.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The plugin asked for native calls through LuaJIT's FFI.
+    #[serde(default)]
+    pub ffi: bool,
+    pub enabled: bool,
+    /// Loaded and started. False while disabled, unsupported or broken.
+    pub running: bool,
+    /// Why it is not running, or the last error a call into it raised.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub settings: Json,
+    /// What the plugin last published with `cx:publish`.
+    #[serde(default)]
+    pub state: Json,
+    /// Capabilities it holds right now.
+    #[serde(default)]
+    pub holds: Vec<CapabilityId>,
 }
 
 /// One capability as this machine reports it.
@@ -118,16 +194,12 @@ pub enum Notification {
 pub struct CapabilityReport {
     pub id: CapabilityId,
     /// The implementation actually chosen, such as `nvapi` or `magnification`.
-    /// "vibrance works" and "vibrance works through NVAPI" are different bug
-    /// reports.
     pub backend: Option<String>,
     /// `None` when the capability is present. A sentence naming the missing
     /// piece otherwise, never the failing call.
     pub missing_because: Option<String>,
-    /// Whether this capability can be written to. `app.focus` and
-    /// `session.lock` are things the machine tells cortisoff, not things
-    /// cortisoff sets, and a client offering an override on one of them is
-    /// offering something the daemon will refuse.
+    /// Whether this capability can be written to. `app.focus` is something
+    /// the machine tells cortisoff, not something cortisoff sets.
     pub settable: bool,
     /// A short name for a person, such as `Colour temperature`.
     pub label: String,
@@ -141,35 +213,11 @@ impl CapabilityReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum RuleStateReport {
-    Active,
-    /// Switched off by the user. Separate from the others because it is the one
-    /// a client can undo, and the only one that is not a problem.
-    Disabled,
-    Unsupported {
-        missing: Vec<CapabilityId>,
-    },
-    Empty,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuleReport {
-    pub name: String,
-    pub priority: i32,
-    pub state: RuleStateReport,
-    /// Whether its condition holds right now.
-    pub holding: bool,
-    pub sets: Vec<CapabilityId>,
-}
-
-/// Who owns a capability at this instant, and what the user's screen had
-/// before anyone touched it.
+/// Who owns a capability at this instant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimReport {
     pub cap: CapabilityId,
-    /// The rule's name, or `manual`.
+    /// The plugin's name, `manual` or `preview`.
     pub owner: String,
     pub priority: i32,
     pub value: Value,
@@ -196,7 +244,7 @@ pub struct StateReport {
     #[serde(default)]
     pub active: bool,
     pub world: WorldReport,
-    pub rules: Vec<RuleReport>,
+    pub plugins: Vec<PluginReport>,
     pub claims: Vec<ClaimReport>,
 }
 
@@ -207,7 +255,7 @@ pub struct DoctorReport {
     /// costs.
     pub pid: u32,
     pub capabilities: Vec<CapabilityReport>,
-    pub rules: Vec<RuleReport>,
+    pub plugins: Vec<PluginReport>,
     /// Capabilities whose baseline is still journaled, meaning a previous run
     /// died with a value applied and the restore has not completed.
     pub journal_dirty: Vec<CapabilityId>,

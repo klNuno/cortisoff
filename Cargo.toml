@@ -4,6 +4,7 @@ members = [
     "crates/cortisoff-host",
     "crates/cortisoff-core",
     "crates/cortisoff-ipc",
+    "crates/cortisoff-runtime",
     "crates/cortisoff-daemon",
     "crates/cortisoff-win",
     "crates/cortisoff-cli",
