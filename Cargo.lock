@@ -751,6 +751,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortisoff-linux"
+version = "0.0.0"
+dependencies = [
+ "cortisoff-host",
+ "libc",
+ "rustix 1.1.5",
+ "x11rb",
+]
+
+[[package]]
 name = "cortisoff-win"
 version = "0.0.0"
 dependencies = [
