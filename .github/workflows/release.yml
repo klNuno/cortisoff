@@ -1,0 +1,247 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag is the only version anyone sees, and the running app compares the
+  # feed against the version compiled into it. A tag that disagrees with the
+  # workspace version would make every install update to itself forever.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check the tag against the workspace version
+        id: check
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid tag '$tag'. Expected vX.Y.Z"
+            exit 1
+          fi
+          version="${tag#v}"
+          for package in cortisoff-app cortisoff-cli cortisoff-update; do
+            found=$(cargo metadata --no-deps --format-version 1 |
+              jq -r --arg p "$package" '.packages[] | select(.name == $p) | .version')
+            if [ "$found" != "$version" ]; then
+              echo "::error::Version mismatch: tag $version, $package $found"
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.key }})
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - key: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - key: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - key: darwin-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          # Built natively: LuaJIT's build runs a host tool that has to match
+          # the target, which makes a cross build from arm64 fragile.
+          - key: darwin-x86_64
+            os: macos-26-intel
+            target: x86_64-apple-darwin
+            ext: ""
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libssl-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cortisoff-app -p cortisoff-cli
+
+      # The bare executables are the artifacts, so the signature covers
+      # exactly what runs.
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir -p dist
+          out="target/${{ matrix.target }}/release"
+          cp "$out/cortisoff${{ matrix.ext }}" "dist/cortisoff-${{ matrix.key }}${{ matrix.ext }}"
+          cp "$out/cortisoff-cli${{ matrix.ext }}" "dist/cortisoff-cli-${{ matrix.key }}${{ matrix.ext }}"
+          ls -la dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.key }}
+          if-no-files-found: error
+          path: dist/*
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check the signing secrets are present
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ] || [ -z "$MINISIGN_PASSWORD" ]; then
+            echo "::error::MINISIGN_SECRET_KEY or MINISIGN_PASSWORD is missing. Updates cannot be signed."
+            exit 1
+          fi
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The signer is an example of the library itself, so a release is
+      # signed by the code that checks it, and every signature is verified
+      # against the committed update.pub before anything is published.
+      - name: Build the signer
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: cargo build --release --locked -p cortisoff-update --example sign
+
+      - name: Download the builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          target/release/examples/sign "$VERSION" \
+            dist/cortisoff-windows-x86_64.exe \
+            dist/cortisoff-linux-x86_64 \
+            dist/cortisoff-darwin-aarch64 \
+            dist/cortisoff-darwin-x86_64
+
+      - name: Write the release notes
+        run: |
+          tag="$GITHUB_REF_NAME"
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "$tag^" 2>/dev/null || true)
+          range="$tag"
+          if [ -n "$previous" ]; then
+            range="$previous..$tag"
+          fi
+          git log --no-merges --pretty='- %s' "$range" > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "- No changes listed." > RELEASE_NOTES.md
+          fi
+          cat RELEASE_NOTES.md
+
+      # The shape the Tauri updater reads. Each signature is base64 of its
+      # .sig file, as Tauri spells it.
+      - name: Write latest.json
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          platforms='{}'
+          for key in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64; do
+            name="cortisoff-$key"
+            if [ "$key" = windows-x86_64 ]; then
+              name="$name.exe"
+            fi
+            if [ ! -s "dist/$name.sig" ]; then
+              echo "::error::Missing signature for $name"
+              exit 1
+            fi
+            signature=$(base64 -w0 "dist/$name.sig")
+            platforms=$(jq -n \
+              --argjson platforms "$platforms" \
+              --arg key "$key" \
+              --arg signature "$signature" \
+              --arg url "https://github.com/$REPO/releases/download/$TAG/$name" \
+              '$platforms + { ($key): { signature: $signature, url: $url } }')
+          done
+          jq -n \
+            --arg version "$VERSION" \
+            --rawfile notes RELEASE_NOTES.md \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson platforms "$platforms" \
+            '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms }' \
+            > dist/latest.json
+          cat dist/latest.json
+
+      - name: Checksums
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Draft, so a release is read before any installed copy updates to it:
+      # releases/latest/download/latest.json only resolves once it is
+      # published.
+      - name: Create the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          body_path: RELEASE_NOTES.md
+          files: dist/*

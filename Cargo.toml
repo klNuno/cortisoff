@@ -11,6 +11,7 @@ members = [
     "crates/cortisoff-mac",
     "crates/cortisoff-cli",
     "crates/cortisoff-app",
+    "crates/cortisoff-update",
 ]
 # probe/ is the T0 throwaway. It links Win32 directly and must never become a
 # workspace member, or `cargo test` stops running on non-Windows machines.
