@@ -47,7 +47,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
-/// Room for a doctor report on a machine with many rules, and small enough
+/// Room for a doctor report on a machine with many plugins, and small enough
 /// that a client cannot make the daemon allocate anything interesting.
 const BUFFER: u32 = 64 * 1024;
 

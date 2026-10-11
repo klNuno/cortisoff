@@ -159,7 +159,7 @@ pub fn on_battery() -> Option<bool> {
     // SAFETY: a snapshot from `IOPSCopyPowerSourcesInfo`, as documented.
     let kind = unsafe { IOPSGetProvidingPowerSourceType(Some(&snapshot)) }?;
     // `kIOPMBatteryPowerKey`. A UPS reports its own kind; a Mac running on
-    // one is not on battery in the sense a rule means.
+    // one is not on battery in the sense a plugin means.
     Some(kind.to_string() == "Battery Power")
 }
 

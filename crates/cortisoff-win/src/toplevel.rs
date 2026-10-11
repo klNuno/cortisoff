@@ -134,7 +134,7 @@ fn listed(shape: Shape) -> bool {
     shape.visible && !shape.owned && !shape.tool && !shape.cloaked && shape.titled
 }
 
-/// `C:\Program Files\App\App.EXE` to `app.exe`, the form rules match on.
+/// `C:\Program Files\App\App.EXE` to `app.exe`, the form plugins match on.
 fn exe_name(path: &str) -> String {
     path.rsplit(['\\', '/'])
         .next()

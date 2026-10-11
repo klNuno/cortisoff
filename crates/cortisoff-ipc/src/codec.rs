@@ -41,7 +41,7 @@ impl Frame {
 
 /// A frame this size is either a bug or a client trying to exhaust the
 /// daemon's memory. Comfortably above a doctor report on a machine with
-/// hundreds of rules.
+/// hundreds of plugins.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,8 +164,8 @@ mod tests {
     /// frame is always serializable. That argument is only true if nothing in
     /// the protocol is a shape serde refuses: a newtype variant holding a
     /// sequence inside an internally tagged enum compiles fine and then kills
-    /// the daemon the first time a client asks for it. That is exactly what a
-    /// list of rules was before this test existed.
+    /// the daemon the first time a client asks for it. That is exactly what
+    /// the old rule engine's list of rules was before this test existed.
     #[test]
     fn every_request_and_response_shape_encodes_and_comes_back() {
         let requests = [

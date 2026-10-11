@@ -52,7 +52,7 @@ const SETTLE: [Duration; 3] = [
 /// How long without input counts as away, unless the daemon says otherwise.
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// How often the front window's fit is read while a rule reads it. macOS has
+/// How often the front window's fit is read while a plugin watches it. macOS has
 /// no event for another application's window being resized, and a window
 /// going fullscreen is not a frame deadline.
 const WINDOW_EVERY: Duration = Duration::from_secs(2);
@@ -72,7 +72,7 @@ pub struct MacHost {
     placements: Placements,
     /// The wall clock moving underneath the engine's timers. Always on, like
     /// `WM_TIMECHANGE` on Windows: a schedule is wrong after a time zone
-    /// change whether or not a rule reads anything else.
+    /// change whether or not a plugin watches anything else.
     _clock_observers: Observers,
     focus_observers: Observers,
     lock_observers: Observers,
@@ -92,7 +92,7 @@ pub struct MacHost {
     locked: bool,
     color_temp: Option<ColorTemp>,
     display_mode: Option<DisplayMode>,
-    /// The first poll answers with a snapshot: rules are predicates over a
+    /// The first poll answers with a snapshot: plugins decide from the
     /// world, so they need the world before they can mean anything.
     snapshot_sent: bool,
     /// How far through [`SETTLE`] the current display change is.
@@ -172,22 +172,22 @@ impl MacHost {
         }
         if !CGPreflightScreenCaptureAccess() {
             out.push(
-                "macOS hides other applications' window titles from cortisoff without the Screen Recording permission, so app.focus reports no title and a rule on a title never matches. turn it on in System Settings, Privacy & Security, Screen Recording"
+                "macOS hides other applications' window titles from cortisoff without the Screen Recording permission, so app.focus reports no title and a plugin waiting for a title never sees one. turn it on in System Settings, Privacy & Security, Screen Recording"
                     .to_owned(),
             );
         }
         if self.display_watch.is_none() {
             out.push(
-                "CoreGraphics refused the display reconfiguration callback, so a display plugged in later is not tinted until the next rule edge"
+                "CoreGraphics refused the display reconfiguration callback, so a display plugged in later is not tinted until a plugin claims again"
                     .to_owned(),
             );
         }
         out
     }
 
-    /// How long without input counts as away. The rule format says `idle =
-    /// true`, not a duration, so the threshold is the host's and it is the
-    /// same for every rule.
+    /// How long without input sets the world's `idle` flag. A plugin wanting
+    /// its own delay passes `after` to `cx:watch("user.idle")`, which reaches
+    /// `set_idle_thresholds`; this is the default for every other plugin.
     pub fn idle_after(mut self, after: Duration) -> Self {
         self.idle_after = after;
         self
@@ -296,8 +296,8 @@ impl MacHost {
         out
     }
 
-    /// Everything a rule could already be true about, pushed before the
-    /// first real event so no rule fires on a half-known world.
+    /// Everything a plugin could already be told about, pushed before the
+    /// first real event so no plugin acts on a half-known world.
     fn snapshot(&mut self) -> Vec<Event> {
         let windows = windows::on_screen();
         let fit = self.front_fit(&windows);
@@ -478,8 +478,8 @@ impl Host for MacHost {
         self.idle_thresholds.dedup();
     }
 
-    /// Only what some rule reads. An observer costs a wakeup on every
-    /// matching notification system-wide, so a rule set that never mentions
+    /// Only what some plugin watches. An observer costs a wakeup on every
+    /// matching notification system-wide, so a plugin set that never watches
     /// the focused application installs none.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {
         let asked = |id: &str| wanted.iter().any(|c| c.as_str() == id);

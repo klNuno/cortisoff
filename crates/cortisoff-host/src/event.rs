@@ -8,7 +8,7 @@ use crate::value::Value;
 /// The application that owns the foreground.
 ///
 /// `pid` is paired with `started_at_ms` on purpose: Windows reuses PIDs, and a
-/// name cache keyed on the PID alone eventually fires a rule on the wrong
+/// name cache keyed on the PID alone eventually fires a plugin on the wrong
 /// application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRef {
@@ -65,8 +65,8 @@ pub enum Event {
     /// at startup, when the engine's schedule timer fires, and after anything
     /// that moves the clock underneath a sleeping timer: resume from sleep, a
     /// timezone or DST change. Never pushed every minute; the engine asks for
-    /// exactly the wakeups its schedule rules need, with subsecond frames
-    /// while a rule fades and only schedule edges otherwise.
+    /// exactly the wakeups its schedules need, with subsecond frames
+    /// while a claim fades and only schedule edges otherwise.
     TimeOfDay {
         minute: u16,
         #[serde(default)]

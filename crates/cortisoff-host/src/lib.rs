@@ -43,7 +43,7 @@ use std::time::Duration;
 
 /// One operating system's implementation.
 ///
-/// The daemon drives it: probe, install what the rules read, then call
+/// The daemon drives it: probe, install what the plugins watch, then call
 /// [`Host::poll`] in a loop and feed what comes back to the supervisor.
 pub trait Host {
     /// Probe what this machine can actually do, right now. Never a `#[cfg]`
@@ -51,7 +51,7 @@ pub trait Host {
     /// NVIDIA machine and on an Intel laptop.
     fn probe(&self) -> CapabilitySet;
 
-    /// Configure the inactivity thresholds read by enabled rules.
+    /// Configure the inactivity thresholds watched by running plugins.
     fn set_idle_thresholds(&mut self, _seconds: &[u32]) {}
 
     /// Update the activity indicator when a plugin is enabled or a manual claim is held.

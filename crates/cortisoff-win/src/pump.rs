@@ -42,7 +42,7 @@ use crate::wallpaper::Wallpaper;
 /// The wall clock, local, as year, month, day, hour, minute, second and
 /// millisecond.
 ///
-/// The one reading in the project: the rule engine's clock events and the
+/// The one reading in the project: the plugins' clock events and the
 /// daemon's log both come through here, so they never disagree about the hour
 /// across a daylight-saving change.
 pub fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
@@ -75,7 +75,7 @@ const NOTICE_LINGER: Duration = Duration::from_secs(30);
 /// written inside that window is accepted and then dropped when the driver
 /// finishes reprogramming the output, which is what made switching a monitor
 /// off and on look like cortisoff had quit: the ramp went back to neutral and
-/// nothing asked for it again until the rule's next edge, hours later. So the
+/// nothing asked for it again until the plugin's next claim, hours later. So the
 /// answer is pushed again as the configuration settles. Three extra applies
 /// per display change cost a few ramp writes and nothing else.
 const SETTLE: [Duration; 3] = [
@@ -91,7 +91,7 @@ const ENGINE_TIMER_BASE: usize = 1;
 /// so this is a poll, one of the two in the whole daemon.
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// How often `audio.active` is read while a rule reads it. A meter has no
+/// How often `audio.active` is read while a plugin watches it. A meter has no
 /// event, and a film starting is not a frame deadline.
 const AUDIO_EVERY: Duration = Duration::from_secs(30);
 
@@ -122,7 +122,7 @@ pub struct WinHost {
     vibrance: Option<Vibrance>,
     display_mode: Option<DisplayMode>,
     wallpaper: Option<Wallpaper>,
-    /// The first poll answers with a snapshot: rules are predicates over a
+    /// The first poll answers with a snapshot: plugins decide from the
     /// world, so they need the world before they can mean anything.
     snapshot_sent: bool,
     /// How far through [`SETTLE`] the current display change is. `None`
@@ -214,22 +214,22 @@ impl WinHost {
                     .to_owned(),
             );
         }
-        // Only when it would surprise someone writing a rule. Every NVIDIA
+        // Only when it would surprise someone writing a plugin. Every NVIDIA
         // driver seen so far reports 0 to 100 with 50 as neutral, and saying
         // so every time would be noise.
         if let Some((min, max, default)) = self.vibrance.as_ref().and_then(Vibrance::range) {
             if (min, max, default) != (0, 100, 50) {
                 out.push(format!(
-                    "this driver reports vibrance from {min} to {max}, neutral at {default}, not the usual 0 to 100. a rule's value is clamped to that range"
+                    "this driver reports vibrance from {min} to {max}, neutral at {default}, not the usual 0 to 100. a claimed value is clamped to that range"
                 ));
             }
         }
         out
     }
 
-    /// How long without input counts as away. The rule format says `idle =
-    /// true`, not a duration, so the threshold is the host's and it is the
-    /// same for every rule.
+    /// How long without input sets the world's `idle` flag. A plugin wanting
+    /// its own delay passes `after` to `cx:watch("user.idle")`, which reaches
+    /// `set_idle_thresholds`; this is the default for every other plugin.
     pub fn idle_after(mut self, after: Duration) -> Self {
         self.idle_after = after;
         self
@@ -327,8 +327,8 @@ impl WinHost {
         Some(Event::Maximized { maximized })
     }
 
-    /// Everything a rule could already be true about, pushed before the first
-    /// real event so no rule fires on a half-known world.
+    /// Everything a plugin could already be told about, pushed before the first
+    /// real event so no plugin acts on a half-known world.
     fn snapshot(&mut self) -> Vec<Event> {
         self.fullscreen = self.fullscreen_now();
         let idle_event = self.sample_idle();
@@ -626,13 +626,13 @@ impl Host for WinHost {
         }
     }
 
-    /// Only what some rule reads. An installed hook costs on every system-wide
-    /// event, so a rule set that never mentions the focused application must
+    /// Only what some plugin watches. An installed hook costs on every system-wide
+    /// event, so a plugin set that never watches the focused application must
     /// not install the foreground hook at all.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {
         let asked = |id: &str| wanted.iter().any(|c| c.as_str() == id);
 
-        // A rule reading only whether something is maximised still needs to
+        // A plugin reading only whether something is maximised still needs to
         // know when the focus moves to a window that is, so the foreground
         // hook serves both.
         let foreground = asked(ids::APP_FOCUS) || asked(ids::APP_MAXIMIZED);

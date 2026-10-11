@@ -65,8 +65,8 @@ impl Paths {
     }
 
     /// `env` returns a variable's value, or `None` when it is unset or empty.
-    /// An empty value counts as unset: `HOME=` would otherwise put the rule
-    /// file at `/.config/cortisoff`.
+    /// An empty value counts as unset: `HOME=` would otherwise put the plugin
+    /// store at `/.config/cortisoff`.
     pub fn resolve(
         layout: Layout,
         env: impl Fn(&str) -> Option<String>,

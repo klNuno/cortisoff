@@ -58,7 +58,7 @@ impl<J: JournalStore> Dispatcher<J> {
     }
 
     /// Put back what a previous run left applied. Runs once at startup, before
-    /// any rule fires.
+    /// any plugin claims.
     ///
     /// An entry is cleared only after its restore succeeded, so a monitor that
     /// is unplugged today keeps its entry for the run where it comes back.

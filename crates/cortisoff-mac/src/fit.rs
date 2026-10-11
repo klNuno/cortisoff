@@ -44,7 +44,7 @@ const SIDE_SLACK: f64 = 120.0;
 /// Room left for the menu bar and a bottom Dock, in points. A window less
 /// than this short of its display's height is zoomed; one shorter than that
 /// is a large window the user placed, and treating it as maximised would
-/// switch the blue light rule off under a document.
+/// switch Night light off under a document.
 const HEIGHT_SLACK: f64 = 160.0;
 /// Rounding between window and display bounds, in points.
 const EDGE: f64 = 1.0;

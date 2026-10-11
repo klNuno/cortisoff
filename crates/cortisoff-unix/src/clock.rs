@@ -1,4 +1,4 @@
-//! The wall clock, local, for the rule engine's clock events and the
+//! The wall clock, local, for the plugins' clock events and the
 //! daemon's log, so the two never disagree about the hour across a
 //! daylight-saving change.
 

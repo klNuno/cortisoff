@@ -2,7 +2,7 @@
 //!
 //! `SHQueryUserNotificationState` only knows about exclusive D3D fullscreen,
 //! and almost nothing runs that way any more: games default to borderless, a
-//! browser is maximised, a film is a maximised player. A rule that says "not
+//! browser is maximised, a film is a maximised player. A plugin that says "not
 //! while an app is fullscreen" means all three, so this reads the window
 //! itself: maximised, or its frame covering the whole monitor it sits on.
 
@@ -24,7 +24,7 @@ const SHELL_CLASSES: &[&str] = &[
 ];
 
 /// True when `hwnd` is maximised or its frame covers the monitor it is on.
-/// An invalid or vanished window answers false, which is what a rule wants
+/// An invalid or vanished window answers false, which is what a plugin wants
 /// on a fast alt-tab.
 pub fn covers_monitor(hwnd: HWND) -> bool {
     if hwnd.is_invalid() || is_shell(hwnd) {

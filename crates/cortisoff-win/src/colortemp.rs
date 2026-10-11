@@ -364,7 +364,7 @@ impl Actuator for ColorTemp {
         // A panel that refused a write while its monitor was renegotiating
         // its link is not a panel that cannot do DDC/CI. Without this, one
         // refusal during a display change left that monitor on the gamma path
-        // until the claim ended, which for the blue light rule is all night.
+        // until the claim ended, which for Night light is all night.
         live.refused.clear();
 
         let fresh: Vec<(String, Ramp)> = screen::device_names()

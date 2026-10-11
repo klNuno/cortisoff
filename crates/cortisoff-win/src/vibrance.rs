@@ -6,8 +6,8 @@
 //! user who has already moved the NVIDIA slider does not want it snapped back
 //! to the driver default.
 //!
-//! AMD's ADL belongs behind this same capability, not behind a second one. The
-//! rule says `set.display.vibrance = 100` either way.
+//! AMD's ADL belongs behind this same capability, not behind a second one. A
+//! plugin claims `display.vibrance` at 100 either way.
 
 use cortisoff_host::{ids, Actuator, ActuatorError, CapabilityId, Control, Value};
 
@@ -27,7 +27,7 @@ impl Vibrance {
     }
 
     /// What the doctor shows: the range this driver reports, so a user writing
-    /// a rule knows whether 100 is the maximum or halfway.
+    /// a plugin knows whether 100 is the maximum or halfway.
     pub fn range(&self) -> Option<(i32, i32, i32)> {
         let first = self.nvapi.outputs.first()?;
         let info = self.nvapi.info(first)?;
@@ -75,7 +75,7 @@ impl Actuator for Vibrance {
         })
     }
 
-    /// The level the first output sits at right now, which is what a rule
+    /// The level the first output sits at right now, which is what a plugin
     /// would set to change nothing. A fade with no `from` starts here.
     fn rest(&self) -> Option<Value> {
         let first = self.nvapi.outputs.first()?;

@@ -144,7 +144,7 @@ impl LinuxHost {
         let keymap = x.as_deref().and_then(input::load_keymap);
         if let Some(d) = &x {
             // Always on, as `WM_DISPLAYCHANGE` is on Windows: the colour
-            // tint needs to hear about a monitor change whatever the rules
+            // tint needs to hear about a monitor change whatever the plugins
             // read.
             if d.randr {
                 let _ = d.conn.randr_select_input(
@@ -440,7 +440,7 @@ impl LinuxHost {
         })
     }
 
-    /// Everything a rule could already be true about, before any real event.
+    /// Everything a plugin could already be told about, before any real event.
     fn snapshot(&mut self) -> Vec<Event> {
         self.pending.clear();
         let mut out: Vec<Event> = clock::time_of_day().into_iter().collect();
@@ -771,7 +771,7 @@ impl Host for LinuxHost {
         }
     }
 
-    /// Only what some rule reads: a root property listener wakes the
+    /// Only what some plugin watches: a root property listener wakes the
     /// process on every focus change and every window opening.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {
         let asked = |id: &str| wanted.iter().any(|c| c.as_str() == id);

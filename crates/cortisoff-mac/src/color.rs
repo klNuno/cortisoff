@@ -20,11 +20,11 @@ impl Rgb {
 
 /// The temperature at which the curve below is the identity: every channel at
 /// full, so the table is left exactly as the display's profile set it. Where
-/// a colour rule rests, and where a fade with no `from` starts.
+/// a colour claim rests, and where a fade with no `from` starts.
 pub const NEUTRAL_KELVIN: i64 = 6600;
 
 /// Tanner Helland's blackbody approximation. The same curve as the Windows
-/// host, so a rule tints both systems alike.
+/// host, so a plugin tints both systems alike.
 pub fn from_kelvin(kelvin: f32) -> Rgb {
     let t = kelvin.clamp(1000.0, 40000.0) / 100.0;
 

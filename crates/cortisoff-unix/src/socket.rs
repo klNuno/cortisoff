@@ -33,7 +33,7 @@ use crate::paths;
 
 /// How long the daemon waits on one client's full socket buffer before it
 /// gives up on that client. A `trace` piped into something that stopped
-/// reading would otherwise stall the daemon's loop, and every rule with it.
+/// reading would otherwise stall the daemon's loop, and every plugin with it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the reader threads hand back to the daemon's loop.

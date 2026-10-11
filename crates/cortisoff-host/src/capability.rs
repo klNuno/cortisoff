@@ -139,7 +139,7 @@ pub fn label(id: &str) -> String {
 }
 
 /// The ids the project ships with. A platform may report any subset, and a
-/// community rule may name one that no platform provides yet.
+/// community plugin may name one that no platform provides yet.
 pub mod ids {
     pub const APP_FOCUS: &str = "app.focus";
     pub const APP_FULLSCREEN: &str = "app.fullscreen";

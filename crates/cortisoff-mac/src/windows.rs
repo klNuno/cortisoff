@@ -32,7 +32,7 @@ pub struct Window {
 
 /// Every normal window on screen, front first. Layer 0 is where document
 /// and game windows live; the menu bar, the Dock and overlays sit on other
-/// layers and are not windows a rule means.
+/// layers and are not windows a plugin means.
 pub fn on_screen() -> Vec<Window> {
     let options =
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
@@ -111,7 +111,7 @@ pub fn front_of(windows: &[Window], pid: i32) -> Option<&Window> {
 }
 
 /// The executable's full path, the same shape the Windows host reports, so a
-/// rule written against `exe` reads alike on both.
+/// plugin written against `exe` reads alike on both.
 pub fn exe(pid: i32) -> Option<String> {
     let from_url = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .and_then(|app| app.executableURL())

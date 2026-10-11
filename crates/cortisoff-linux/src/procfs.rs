@@ -22,7 +22,7 @@ pub fn exe(pid: u32) -> Option<String> {
 
 /// The kernel appends ` (deleted)` to the link of a binary replaced on disk
 /// since it started, which is what every package upgrade does to a running
-/// browser. A rule naming the browser must still match it.
+/// browser. A plugin naming the browser must still match it.
 pub fn clean_exe(link: &str) -> String {
     link.strip_suffix(" (deleted)").unwrap_or(link).to_owned()
 }

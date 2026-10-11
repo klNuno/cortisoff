@@ -8,7 +8,7 @@
 //! Wallpaper Engine is told `-control pause` or `-control play`. Lively is
 //! told `app --play false` or `true`. Only a running engine is ever told
 //! anything: `wallpaper64.exe -control play` against an engine that is not
-//! running starts it, which is not what a rule about pausing means.
+//! running starts it, which is not what a plugin about pausing means.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};

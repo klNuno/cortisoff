@@ -2,7 +2,7 @@
 //!
 //! macOS lists modes in points, the "looks like" size System Settings shows,
 //! and several modes can share one: a HiDPI mode and a low resolution one
-//! both called 1440x900, at the same rate. The point size is what a rule
+//! both called 1440x900, at the same rate. The point size is what a plugin
 //! means by a resolution; the pixel size and the IOKit mode id are what tell
 //! apart the modes that share it.
 
@@ -29,7 +29,7 @@ impl Setting {
     }
 }
 
-/// The mode to switch to for a rule asking for `width`x`height` at
+/// The mode to switch to for a plugin asking for `width`x`height` at
 /// `refresh_mhz`, as an index into `modes`. A zero size keeps the current
 /// one, a zero rate keeps the current rate when the size offers it and takes
 /// the fastest otherwise. `None` when no mode has that size: a display is

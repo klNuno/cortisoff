@@ -21,7 +21,7 @@ impl Rgb {
 
 /// The temperature at which the curve below is the identity: every channel at
 /// full, so the ramp is left exactly as the monitor's profile set it. Where
-/// a colour rule rests, and where a fade with no `from` starts.
+/// a colour claim rests, and where a fade with no `from` starts.
 pub const NEUTRAL_KELVIN: i64 = 6600;
 
 /// Tanner Helland's blackbody approximation.

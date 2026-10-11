@@ -97,7 +97,7 @@ mod imp {
         }
     }
 
-    /// The same three shapes the rule file takes, kept here rather than pulled out
+    /// The same three shapes `cortisoff-cli set display.mode` takes, kept here rather than pulled out
     /// of the core so this example stays a test of the Windows half only.
     fn parse(text: &str) -> Option<Value> {
         let (size, refresh) = match text.split_once('@') {

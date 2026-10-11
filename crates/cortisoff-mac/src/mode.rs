@@ -2,7 +2,7 @@
 //! display.
 //!
 //! Only the main display, the one with the menu bar: macOS gives no cheap way
-//! to tell which display a fullscreen game took, and a rule aimed at the game
+//! to tell which display a fullscreen game took, and a plugin aimed at the game
 //! must not move a second monitor instead. The choice of mode itself is in
 //! [`crate::modes`], where it is tested.
 
