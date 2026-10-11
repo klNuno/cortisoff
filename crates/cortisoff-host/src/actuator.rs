@@ -36,7 +36,7 @@ impl std::error::Error for ActuatorError {}
 
 /// One thing on this machine that holds state and can be changed.
 ///
-/// Deliberately tiny. An actuator never sees priorities, rules, other
+/// Deliberately tiny. An actuator never sees priorities, plugins, other
 /// actuators, or the reason it is being changed. That is what makes porting to
 /// a new operating system a small, obvious job instead of a rewrite.
 pub trait Actuator {
@@ -73,8 +73,8 @@ pub trait Actuator {
     /// orange or stuck at 60 Hz after a crash.
     fn volatile(&self) -> bool;
 
-    /// What a rule would have to set to get what the screen shows when nothing
-    /// holds it, in a rule's own shape rather than the baseline's.
+    /// What a plugin would have to claim to get what the screen shows when nothing
+    /// holds it, in a claim's own shape rather than the baseline's.
     ///
     /// This is where a fade with no `from` starts. A colour temperature rests
     /// at the point where its curve leaves the ramp alone, vibrance at the

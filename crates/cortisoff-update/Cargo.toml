@@ -1,0 +1,34 @@
+[package]
+name = "cortisoff-update"
+description = "Installs cortisoff for the current user and updates it from signed GitHub releases."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.23"
+minisign-verify = "0.3"
+semver = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# native-tls on the platform's own trust store: SChannel on Windows,
+# Security.framework on macOS, OpenSSL on Linux. No bundled root list.
+ureq = { version = "3", default-features = false, features = ["native-tls-no-default"] }
+
+# The same version as cortisoff-win, so the workspace builds one copy.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+]
+
+# Signing lives in tests and in the release tooling (examples/keygen.rs,
+# examples/sign.rs), never in the shipped library.
+[dev-dependencies]
+getrandom = "0.4"
+minisign = "0.10"

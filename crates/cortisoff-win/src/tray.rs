@@ -30,8 +30,8 @@ pub const MENU_QUIT: usize = 3;
 const ICON_ID: u32 = 1;
 
 /// The same picture the dashboard wears, so the two read as one application.
-static ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/icon.ico");
-static ACTIVE_ICO: &[u8] = include_bytes!("../../../app/src-tauri/icons/active.ico");
+pub(crate) static ICO: &[u8] = include_bytes!("../../../assets/icon.ico");
+static ACTIVE_ICO: &[u8] = include_bytes!("../../../assets/active.ico");
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -135,6 +135,11 @@ impl Tray {
         }
     }
 
+    /// A notification balloon on this icon.
+    pub fn notify(&self, title: &str, body: &str) -> Result<(), String> {
+        crate::notice::show(self.window, ICON_ID, title, body)
+    }
+
     fn data(&self) -> NOTIFYICONDATAW {
         NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -155,26 +160,17 @@ impl Drop for Tray {
     }
 }
 
-/// The dashboard, started next to this executable. An installed cortisoff
-/// has both side by side; a development build looks for Cargo's name too.
+/// The window: the same executable as the daemon, started with no argument.
+/// It raises an already open window rather than opening a second one.
 pub fn open_dashboard() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "this executable has no directory".to_owned())?;
-    for name in ["cortisoff-dashboard.exe", "cortisoff-app.exe"] {
-        let path = dir.join(name);
-        if path.exists() {
-            return std::process::Command::new(&path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| format!("could not start {}: {e}", path.display()));
-        }
-    }
-    Err(format!("no dashboard next to {}", dir.display()))
+    std::process::Command::new(&exe)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not start {}: {e}", exe.display()))
 }
 
-fn load_icon(ico: &[u8]) -> (HICON, bool) {
+pub(crate) fn load_icon(ico: &[u8]) -> (HICON, bool) {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
     if let Some(bits) = ico_image(ico, size as u32) {
         if let Ok(icon) = unsafe {

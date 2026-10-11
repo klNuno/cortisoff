@@ -1,10 +1,10 @@
-//! Turning a window handle into something a rule can match on.
+//! Turning a window handle into something a plugin can match on.
 //!
 //! Cached, because the foreground window changes far more often than the set
 //! of running processes, and `QueryFullProcessImageNameW` opens a handle every
 //! time. The cache is keyed on the PID *and* the process creation time:
 //! Windows reuses PIDs, and a cache keyed on the PID alone eventually fires a
-//! rule on the wrong application.
+//! plugin on the wrong application.
 
 use std::collections::HashMap;
 

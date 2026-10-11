@@ -41,7 +41,7 @@ impl Frame {
 
 /// A frame this size is either a bug or a client trying to exhaust the
 /// daemon's memory. Comfortably above a doctor report on a machine with
-/// hundreds of rules.
+/// hundreds of plugins.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,50 +165,36 @@ mod tests {
     /// the protocol is a shape serde refuses: a newtype variant holding a
     /// sequence inside an internally tagged enum compiles fine and then kills
     /// the daemon the first time a client asks for it. That is exactly what
-    /// `Response::Rules` was before this test existed.
+    /// the old rule engine's list of rules was before this test existed.
     #[test]
     fn every_request_and_response_shape_encodes_and_comes_back() {
-        let rule = crate::Rule {
-            name: "a rule with every kind of condition".to_owned(),
-            priority: 100,
-            enabled: false,
-            when: crate::Condition::All(vec![
-                crate::Condition::Between {
-                    start: "20:00".parse().expect("a time of day"),
-                    end: "07:00".parse().expect("a time of day"),
-                },
-                crate::Condition::Not(Box::new(crate::Condition::Any(vec![
-                    crate::Condition::App {
-                        exe: Some("vlc.exe".to_owned()),
-                        title_contains: None,
-                    },
-                    crate::Condition::Fullscreen(true),
-                ]))),
-                crate::Condition::Idle(false),
-            ]),
-            set: vec![crate::Assign {
-                cap: CapabilityId::new("display.color_temp"),
-                value: Value::Int(3200),
-            }],
-            transition: Some(cortisoff_core::Transition {
-                seconds: 40 * 60,
-                offset: 0,
-                from: vec![crate::Assign {
-                    cap: CapabilityId::new("display.color_temp"),
-                    value: Value::Int(6600),
-                }],
-            }),
-        };
-
         let requests = [
             Request::Doctor,
             Request::State,
             Request::Subscribe,
             Request::Unsubscribe,
-            Request::Rules,
-            Request::SaveRules {
-                rules: vec![rule.clone()],
+            Request::Plugins,
+            Request::Enable {
+                id: "night-light".to_owned(),
+                enabled: false,
             },
+            Request::Settings {
+                id: "night-light".to_owned(),
+                settings: serde_json::json!({ "night": 3200, "except": ["vlc.exe"] }),
+            },
+            Request::Message {
+                id: "night-light".to_owned(),
+                name: "pause".to_owned(),
+                data: serde_json::json!(3600),
+            },
+            Request::Rescan,
+            Request::Link {
+                path: "D:/plugins/mine".to_owned(),
+            },
+            Request::Remove {
+                id: "mine".to_owned(),
+            },
+            Request::Windows,
             Request::Set {
                 cap: CapabilityId::new("display.mode"),
                 value: Value::Mode {
@@ -227,7 +213,6 @@ mod tests {
             Request::PreviewEnd {
                 cap: CapabilityId::new("display.color_temp"),
             },
-            Request::Reload,
             Request::Shutdown,
         ];
         for request in requests {
@@ -266,7 +251,37 @@ mod tests {
                 ..Default::default()
             })),
             Response::State(Box::default()),
-            Response::Rules { rules: vec![rule] },
+            Response::Plugins {
+                plugins: vec![crate::PluginReport {
+                    id: "night-light".to_owned(),
+                    name: "Night light".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    description: String::new(),
+                    icon: Some("moon".to_owned()),
+                    author: None,
+                    platforms: vec!["windows".to_owned()],
+                    supported: true,
+                    origin: crate::Origin::Builtin,
+                    dir: None,
+                    url: None,
+                    ffi: false,
+                    enabled: true,
+                    running: true,
+                    error: None,
+                    settings: serde_json::json!({ "night": 3200 }),
+                    state: serde_json::json!({ "kelvin": 4100.5 }),
+                    holds: vec![CapabilityId::new("display.color_temp")],
+                }],
+            },
+            Response::Windows {
+                windows: vec![cortisoff_host::WindowInfo {
+                    id: 7,
+                    title: "a game".to_owned(),
+                    exe: "cs2.exe".to_owned(),
+                    pid: 42,
+                    focused: true,
+                }],
+            },
         ];
         for response in responses {
             let frame = Frame::response(RequestId(1), response);

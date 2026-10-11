@@ -3,7 +3,7 @@
 //! Deliberately small. The notifications a client subscribes to live in memory
 //! and die with the process, so the one question they cannot answer is the one
 //! that matters the morning after: why is the daemon not running any more. A
-//! file answers it, as long as it holds the starts, the exits, the rule edges
+//! file answers it, as long as it holds the starts, the exits, the claim edges
 //! and anything at warning level or worse, and nothing per event.
 //!
 //! The shape of a line is `<stamp> <mark> <text>`, and the mark is what makes
@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Rotated past this, keeping one older file. A daemon that logs rule edges
+/// Rotated past this, keeping one older file. A daemon that logs claim edges
 /// and little else writes a few lines a day, so this is months of history and
 /// still nothing a text editor struggles with.
 const MAX_BYTES: u64 = 256 * 1024;
@@ -38,9 +38,9 @@ pub enum Mark {
     Exit,
     /// This process is not the daemon: another one already holds the session.
     Refused,
-    /// A rule took what it claims.
+    /// A plugin took what it claims.
     Hold,
-    /// A rule gave it back.
+    /// A plugin gave it back.
     Release,
     Warn,
     Error,
@@ -227,7 +227,7 @@ impl DaemonLog {
 
     /// One line, on disk before this returns as far as the operating system is
     /// concerned. No `sync_all`: losing the tail to a machine that lost power
-    /// costs a diagnosis, and paying for a flush on every rule edge costs the
+    /// costs a diagnosis, and paying for a flush on every claim edge costs the
     /// user's disk all day. The journal is the file that promises more.
     pub fn line(&mut self, stamp: Stamp, mark: Mark, text: &str) {
         let Some(file) = self.file.as_mut() else {
@@ -394,7 +394,7 @@ mod tests {
 
         let mut second = DaemonLog::open(&path);
         assert_eq!(second.start(stamp(), "pid 2"), Previous::Ended);
-        // This one is killed: its last line is a rule edge.
+        // This one is killed: its last line is a claim edge.
         second.line(stamp(), Mark::Hold, "blue light at night");
         drop(second);
 

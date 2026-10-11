@@ -13,6 +13,7 @@ use crate::capability::{CapabilityId, CapabilitySet, Control};
 use crate::event::Event;
 use crate::event::TimerId;
 use crate::journal::{JournalEntry, JournalStore};
+use crate::keys::{Chord, Hotkey, WindowAction, WindowInfo};
 use crate::value::Value;
 use crate::Host;
 
@@ -173,6 +174,14 @@ pub struct MockHost {
     pub queued: Vec<Event>,
     /// What `time_of_day` answers: the wall clock a test decides.
     pub clock: Option<Event>,
+    /// What `monotonic_ms` answers. A test moves it by hand.
+    pub now_ms: u64,
+    /// The hotkeys registered last.
+    pub hotkeys: Vec<Hotkey>,
+    /// Keys sent, text typed and notifications shown, in order, for asserts.
+    pub desktop: Vec<String>,
+    pub clipboard_text: String,
+    pub open_windows: Vec<WindowInfo>,
     trace: Trace,
 }
 
@@ -262,5 +271,47 @@ impl Host for MockHost {
     /// blocks: the timeout is the platform's business.
     fn poll(&mut self, _timeout: Duration) -> Vec<Event> {
         std::mem::take(&mut self.queued)
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        self.now_ms
+    }
+
+    fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        self.hotkeys = wanted.to_vec();
+        Vec::new()
+    }
+
+    fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {
+        self.desktop.push(format!("keys {chord}"));
+        Ok(())
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), String> {
+        self.desktop.push(format!("type {text}"));
+        Ok(())
+    }
+
+    fn notify(&mut self, title: &str, body: &str) -> Result<(), String> {
+        self.desktop.push(format!("notify {title}: {body}"));
+        Ok(())
+    }
+
+    fn clipboard(&self) -> Result<String, String> {
+        Ok(self.clipboard_text.clone())
+    }
+
+    fn set_clipboard(&mut self, text: &str) -> Result<(), String> {
+        self.clipboard_text = text.to_owned();
+        Ok(())
+    }
+
+    fn windows(&self) -> Vec<WindowInfo> {
+        self.open_windows.clone()
+    }
+
+    fn window_action(&mut self, id: u64, action: WindowAction) -> Result<(), String> {
+        self.desktop.push(format!("window {id} {action:?}"));
+        Ok(())
     }
 }

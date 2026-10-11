@@ -1,9 +1,9 @@
 //! `display.mode` on Windows, through `ChangeDisplaySettingsEx`.
 //!
-//! Resolution and refresh rate, per output. A rule writes `set.display.mode =
-//! "@240"` to change refresh only, or `"2560x1440@240"` to change both, and
-//! the core has already turned either into a [`Value::Mode`] before this file
-//! sees it.
+//! Resolution and refresh rate, per output. A plugin claims `{ refresh = 240 }` to
+//! change refresh only, or `{ width = 2560, height = 1440, refresh = 240 }` to
+//! change both, and the runtime has already turned either into a
+//! [`Value::Mode`] before this file sees it.
 //!
 //! Two things make this less obvious than it looks.
 //!
@@ -15,7 +15,7 @@
 //!
 //! An output that cannot do the wanted resolution is left alone rather than
 //! moved to something near it. A second monitor is not a fallback surface for
-//! a rule aimed at the one the game is on.
+//! a plugin aimed at the one the game is on.
 
 use std::mem::size_of;
 
@@ -228,7 +228,7 @@ pub fn current(device: &str) -> Option<Setting> {
 
 /// Every mode this output offers at 32 bits per pixel. Nothing else is worth
 /// switching to on a machine made after 2005, and letting an 8 bit mode into
-/// the candidate list is how a rule ends up picking one.
+/// the candidate list is how a plugin ends up picking one.
 pub fn supported(device: &str) -> Vec<Setting> {
     let name = wide(device);
     let mut out = Vec::new();
@@ -265,7 +265,7 @@ pub fn supported(device: &str) -> Vec<Setting> {
 ///
 /// Applying them one at a time works and costs one black screen per output.
 /// Staging them costs one for the whole batch, which is the difference between
-/// a rule firing on a game launch being invisible and being a nuisance.
+/// a plugin claiming on a game launch being invisible and being a nuisance.
 fn commit(changes: &[(&str, Setting)]) -> Result<(), String> {
     if changes.is_empty() {
         return Ok(());

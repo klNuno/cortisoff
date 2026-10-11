@@ -1,342 +1,544 @@
-//! The loop's body: everything that happens between an event arriving from
-//! the platform and the hardware being touched.
+//! The loop's body: everything between an event arriving from the platform
+//! and the hardware being touched.
 //!
-//! The platform owns the loop itself, so this is not a thread and not a
-//! runtime. It is a function of an event, and the only reason it lives in the
-//! daemon rather than in the core is that it routes side effects: timers,
-//! child processes, the journal, and the notification stream clients read.
+//! Three things meet here. [`Claims`] decides who wins each capability and
+//! fades between winners. The plugin [`Runtime`] hears events, timers and
+//! hotkeys and answers with claims. The [`Dispatcher`] journals a baseline
+//! before anything is applied. The platform owns the loop itself, so this is
+//! not a thread: it is a function of an event.
 
-use cortisoff_core::{Condition, Engine, OwnerId, Rule, RuleState, Signals};
-use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
+use cortisoff_core::{priority, CapTable, Claims, OwnerId, FADE_TIMER, PREVIEW_FADE_MS};
 use cortisoff_host::{
-    ids, Action, ActuatorError, CapIndex, CapabilityId, CapabilitySet, Event, Host, JournalStore,
-    LogLevel, Value,
+    Action, ActuatorError, CapIndex, CapabilityId, CapabilitySet, Dispatcher, Event, Host,
+    JournalStore, LogLevel, TimerId, Value,
 };
 use cortisoff_ipc::{
-    CapabilityReport, ClaimReport, DoctorReport, Notification, RuleReport, RuleStateReport,
-    StateReport, WorldReport,
+    CapabilityReport, ClaimReport, DoctorReport, Notification, Origin, PluginReport, StateReport,
+    WorldReport,
 };
+use cortisoff_runtime::{install, Command, Env, Package, Runtime, Store};
 
 use crate::startup::Interference;
 
-/// Every source a rule can read, paired with the signal that says a rule reads
-/// it. Installing a hook nobody reads costs on every system-wide event, so the
-/// host is asked for exactly this subset and nothing more.
-const SOURCES: &[(Signals, &str)] = &[
-    (Signals::APP, ids::APP_FOCUS),
-    (Signals::FULLSCREEN, ids::APP_FULLSCREEN),
-    (Signals::MAXIMIZED, ids::APP_MAXIMIZED),
-    (Signals::IDLE, ids::USER_IDLE),
-    (Signals::LOCKED, ids::SESSION_LOCK),
-    (Signals::POWER, ids::POWER_SOURCE),
-    (Signals::AUDIO, ids::AUDIO_ACTIVE),
-    // Signals::TIME has no source. The engine asks for a timer at its own
-    // schedule edges instead, which is why a blue light rule costs nothing
-    // between them.
-];
+/// The plugins' own timers, all folded onto one host timer armed for the
+/// earliest.
+pub const PLUGIN_TIMER: TimerId = TimerId(2);
+
+/// While a plugin is read from a folder, its files are looked at this often
+/// so a save reloads it.
+pub const WATCH_TIMER: TimerId = TimerId(3);
+const WATCH_MS: u64 = 1000;
+
+/// Past this many unread notifications the oldest are dropped, so a stalled
+/// `cortisoff-cli trace` costs a bounded amount of memory.
+const MAX_PENDING: usize = 4096;
 
 pub struct Supervisor<J> {
-    engine: Engine,
-    dispatcher: cortisoff_host::Dispatcher<J>,
+    claims: Claims,
+    runtime: Runtime,
+    store: Store,
+    dispatcher: Dispatcher<J>,
     gate: Interference,
-    /// Everything a subscriber has not read yet. Bounded, because a client
-    /// that stops reading must not grow the daemon without limit.
+    probed: CapabilitySet,
+    /// Where installed plugins live, for a rescan. `None` in tests.
+    plugins_dir: Option<PathBuf>,
     pending: Vec<Notification>,
     warnings: Vec<String>,
     errors: Vec<ActuatorError>,
-    rules_path: Option<std::path::PathBuf>,
-    /// The rules as authored, kept so an editing client gets what is running
-    /// rather than what the disk happens to hold, and so it never has to parse
-    /// TOML to show a switch.
-    authored: Vec<Rule>,
-    /// Where each previewed capability rested before its drag began, read
-    /// once at the first preview: an actuator whose rest is "what the driver
-    /// shows now" would otherwise report the preview itself.
+    /// When [`PLUGIN_TIMER`] is armed for, on the monotonic clock.
+    plugin_armed: Option<u64>,
+    watching: bool,
     stopped: bool,
-    previewing: BTreeMap<CapabilityId, Option<Value>>,
 }
 
-/// Past this many unread notifications the oldest are dropped and the drop is
-/// itself reported, so a stalled `cortisoff trace` costs a bounded amount of
-/// memory instead of the machine.
-const MAX_PENDING: usize = 4096;
-
 impl<J: JournalStore> Supervisor<J> {
-    pub fn new(engine: Engine, journal: J, gate: Interference) -> Self {
-        let mut warnings = gate.warnings.clone();
-        warnings.shrink_to_fit();
+    pub fn new(
+        probed: CapabilitySet,
+        journal: J,
+        gate: Interference,
+        runtime: Runtime,
+        store: Store,
+    ) -> Self {
+        let warnings = gate.warnings.clone();
         Self {
-            engine,
-            dispatcher: cortisoff_host::Dispatcher::new(journal),
+            claims: Claims::new(CapTable::from_set(&probed)),
+            runtime,
+            store,
+            dispatcher: Dispatcher::new(journal),
             gate,
+            probed,
+            plugins_dir: None,
             pending: Vec::new(),
             warnings,
             errors: Vec::new(),
-            rules_path: None,
-            authored: Vec::new(),
+            plugin_armed: None,
+            watching: false,
             stopped: false,
-            previewing: BTreeMap::new(),
         }
     }
 
-    /// Extra sentences for the doctor that came from outside the engine, such
-    /// as a journal file that could not be read.
+    /// Where `Rescan` and `Remove` look for installed plugins.
+    pub fn with_plugins_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.plugins_dir = Some(dir.into());
+        self
+    }
+
+    /// Sentences for the doctor that came from outside, such as a journal
+    /// file that could not be read.
     pub fn warn(&mut self, message: impl Into<String>) {
         self.warnings.push(message.into());
     }
 
-    pub fn engine(&self) -> &Engine {
-        &self.engine
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
     }
 
-    /// Put back whatever a previous run left applied, install only the sources
-    /// some rule actually reads, then evaluate once against the world the host
-    /// has already pushed.
+    /// Put back whatever a previous run left applied, then start every
+    /// enabled plugin against the world the host has already pushed.
     ///
-    /// Recovery comes first on purpose: a rule that fires immediately would
+    /// Recovery comes first on purpose: a plugin that claims at once would
     /// otherwise capture a poisoned baseline as this run's neutral.
     pub fn start(&mut self, host: &mut dyn Host) {
         self.stopped = false;
         for e in self.dispatcher.recover(&*host) {
             self.fail(e);
         }
-
-        let mut thresholds = Vec::new();
-        for rule in self.engine.rules().iter().filter(|rule| rule.is_active()) {
-            rule.when.idle_thresholds(&mut thresholds);
+        if let Some(now @ Event::TimeOfDay { .. }) = host.time_of_day() {
+            let (_, actions) = self.claims.on_event(&now);
+            self.run(host, actions);
         }
-        thresholds.sort_unstable();
-        thresholds.dedup();
-        host.set_idle_thresholds(&thresholds);
-        let wanted = self.wanted_sources();
-        if let Err(e) = host.install_sources(&wanted) {
-            self.fail(e);
-        }
-
-        let actions = self.engine.sync();
-        self.run(host, actions);
+        let commands = self.call(host, |rt, env| rt.start_all(env));
+        self.apply(host, commands);
+        self.settle(host);
     }
 
     /// One event, all the way to the hardware.
     pub fn handle(&mut self, host: &mut dyn Host, event: Event) {
-        // Timer identities are internal. Keep existing trace clients compatible
-        // and publish the clock and resulting actions as before.
-        if !matches!(event, Event::TimerFired { .. }) {
-            self.note(Notification::Event(event.clone()));
-        }
-        // Monitors moved. Whatever is applied may now cover hardware that
-        // arrived after its baseline was captured, so the baseline grows
-        // before the engine pushes anything else at it. The engine also
-        // reschedules here, so it hears the time first.
-        if matches!(event, Event::DisplayConfigChanged) {
-            self.catch_up(host);
-            for e in self.dispatcher.rebaseline(&*host) {
-                self.fail(e);
+        match event {
+            Event::TimerFired { id } if id == FADE_TIMER => {
+                let now = host.monotonic_ms();
+                let actions = self.claims.tick(now);
+                self.run(host, actions);
+            }
+            Event::TimerFired { id } if id == PLUGIN_TIMER => {
+                self.plugin_armed = None;
+                let commands = self.call(host, |rt, env| rt.on_timer(env));
+                self.apply(host, commands);
+            }
+            Event::TimerFired { id } if id == WATCH_TIMER => {
+                self.watching = false;
+                let commands = self.call(host, |rt, env| rt.reload_changed(env));
+                self.apply(host, commands);
+            }
+            Event::TimerFired { .. } => {}
+            Event::Hotkey { id } => {
+                let commands = self.call(host, |rt, env| rt.on_hotkey(env, id));
+                self.apply(host, commands);
+            }
+            Event::Shutdown => self.shutdown(host),
+            event => {
+                self.note(Notification::Event(event.clone()));
+                // Monitors moved. Whatever is applied may now cover hardware
+                // that arrived after its baseline was captured, so the
+                // baseline grows before anything else is pushed at it.
+                if matches!(event, Event::DisplayConfigChanged) {
+                    for e in self.dispatcher.rebaseline(&*host) {
+                        self.fail(e);
+                    }
+                }
+                let (_, actions) = self.claims.on_event(&event);
+                self.run(host, actions);
+                let commands = self.call(host, |rt, env| rt.on_event(env, &event));
+                self.apply(host, commands);
             }
         }
-        let before = self.holding_names();
-        let actions = self.engine.on_event(&event);
-        self.report_edges(before);
+        // An HTTP answer a plugin waited for wakes the loop with no event of
+        // its own, so every turn looks.
+        let commands = self.call(host, |rt, env| rt.on_http(env));
+        self.apply(host, commands);
+        self.settle(host);
+    }
+
+    /// Nothing arrived but the loop woke: an HTTP answer, most likely.
+    pub fn idle_turn(&mut self, host: &mut dyn Host) {
+        let commands = self.call(host, |rt, env| rt.on_http(env));
+        if !commands.is_empty() {
+            self.apply(host, commands);
+            self.settle(host);
+        }
+    }
+
+    /// A call into the runtime with an [`Env`] built from this supervisor's
+    /// world and probe.
+    fn call<R>(&mut self, host: &mut dyn Host, f: impl FnOnce(&mut Runtime, &mut Env) -> R) -> R {
+        let now = host.monotonic_ms();
+        let mut env = Env {
+            host,
+            world: self.claims.world(),
+            probed: &self.probed,
+            now,
+        };
+        f(&mut self.runtime, &mut env)
+    }
+
+    /// Carry out what plugins asked for.
+    fn apply(&mut self, host: &mut dyn Host, commands: Vec<Command>) {
+        let mut save = false;
+        for command in commands {
+            match command {
+                Command::Claim {
+                    owner,
+                    cap,
+                    value,
+                    priority,
+                    fade_ms,
+                } => {
+                    let Ok(index) = self.claims.index_of(&cap) else {
+                        continue;
+                    };
+                    let fade = if self.stopped { 0 } else { fade_ms };
+                    let rest = rest_of(host, &cap);
+                    let now = host.monotonic_ms();
+                    let actions = self.claims.claim(
+                        index,
+                        OwnerId::Plugin(owner),
+                        priority,
+                        value,
+                        fade,
+                        now,
+                        rest.as_ref(),
+                    );
+                    self.run(host, actions);
+                }
+                Command::Release {
+                    owner,
+                    cap,
+                    fade_ms,
+                } => {
+                    let Ok(index) = self.claims.index_of(&cap) else {
+                        continue;
+                    };
+                    self.release(host, index, OwnerId::Plugin(owner), fade_ms);
+                }
+                Command::ReleaseAll { owner, fade_ms } => {
+                    let owner = OwnerId::Plugin(owner);
+                    if fade_ms == 0 || self.stopped {
+                        let actions = self.claims.release_owner(owner);
+                        self.run(host, actions);
+                    } else {
+                        for index in self.held_by(owner) {
+                            self.release(host, index, owner, fade_ms);
+                        }
+                    }
+                }
+                Command::Run { program, args } => self.spawn(&program, &args),
+                Command::Log { level, message } => self.note(Notification::Log { level, message }),
+                Command::Changed { id } => {
+                    if let Some(report) = self.report(&id) {
+                        self.note(Notification::Plugin(Box::new(report)));
+                    }
+                }
+                Command::ListChanged => self.note(Notification::Plugins),
+                Command::Save => save = true,
+            }
+        }
+        if save {
+            self.save_store();
+        }
+    }
+
+    fn release(&mut self, host: &mut dyn Host, index: CapIndex, owner: OwnerId, fade_ms: u64) {
+        let fade = if self.stopped { 0 } else { fade_ms };
+        let cap = self.claims.arbiter().table().id(index).clone();
+        let rest = self.baseline(host, &cap);
+        let now = host.monotonic_ms();
+        let actions = self.claims.release(index, owner, fade, now, rest.as_ref());
         self.run(host, actions);
     }
 
-    /// Tell the engine the time before something makes it reschedule outside
-    /// a clock event. See [`Host::time_of_day`].
-    fn catch_up(&mut self, host: &mut dyn Host) {
-        if let Some(now @ Event::TimeOfDay { .. }) = host.time_of_day() {
-            self.handle(host, now);
+    /// Where a capability goes once nobody holds it: the baseline captured
+    /// before the first apply, which is exactly what the restore puts back.
+    /// The actuator's own idea of rest before anything was applied.
+    fn baseline(&self, host: &dyn Host, cap: &CapabilityId) -> Option<Value> {
+        self.dispatcher
+            .baseline(cap)
+            .cloned()
+            .or_else(|| rest_of(host, cap))
+    }
+
+    fn held_by(&self, owner: OwnerId) -> Vec<CapIndex> {
+        let arbiter = self.claims.arbiter();
+        (0..arbiter.table().len())
+            .map(|i| CapIndex(i as u16))
+            .filter(|&cap| arbiter.stack(cap).iter().any(|c| c.owner == owner))
+            .collect()
+    }
+
+    fn save_store(&mut self) {
+        self.runtime.store_into(&mut self.store);
+        if let Err(e) = self.store.save() {
+            self.note(Notification::Log {
+                level: LogLevel::Error,
+                message: format!("plugin settings were not saved: {e}"),
+            });
         }
     }
 
-    /// A timer the engine asked for has fired. The host converts it back into
-    /// whatever event it stood for, except the schedule timer, which the host
-    /// answers with the current [`Event::TimeOfDay`].
-    pub fn timer_fired(&mut self, host: &mut dyn Host, minute: u16, second: u8) {
-        self.handle(
-            host,
-            Event::TimeOfDay {
-                minute,
-                second,
-                millisecond: 0,
-            },
-        );
-    }
-
-    /// Where `Request::Reload` reads from. Absent when the daemon was handed
-    /// its rules directly, which is what the tests do.
-    pub fn with_rules_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.rules_path = Some(path.into());
-        self
-    }
-
-    /// The same rules the engine was built from. The engine keeps them
-    /// compiled, which loses everything a client would need to show them back.
-    pub fn with_rules(mut self, rules: Vec<Rule>) -> Self {
-        self.authored = rules;
-        self
-    }
-
-    pub fn authored(&self) -> &[Rule] {
-        &self.authored
-    }
-
-    /// Write these rules to the rule file, then load them.
-    ///
-    /// The whole file, because a set is the only thing a client can hand over
-    /// without an identity to keep in sync. A set that does not survive the
-    /// round trip through TOML never reaches the disk, and a set that reaches
-    /// the disk but fails to load puts the previous file back: the way to lose
-    /// a working configuration is to half-apply a bad one.
-    pub fn save_rules(&mut self, host: &mut dyn Host, rules: Vec<Rule>) -> Result<(), String> {
-        let path = self
-            .rules_path
-            .clone()
-            .ok_or_else(|| "this daemon was not started from a rule file".to_owned())?;
-
-        let mut seen = std::collections::BTreeSet::new();
-        for rule in &rules {
-            if rule.name.trim().is_empty() {
-                return Err("a rule needs a name. It is what the trace prints".to_owned());
-            }
-            if !seen.insert(rule.name.clone()) {
-                return Err(format!(
-                    "two rules are called {:?}. Names are how a rule is pointed at",
-                    rule.name
-                ));
+    /// After every turn: hand the host what plugins now watch and which keys
+    /// they listen for, and arm the timers they need.
+    fn settle(&mut self, host: &mut dyn Host) {
+        if let Some((sources, thresholds)) = self.runtime.take_sources() {
+            host.set_idle_thresholds(&thresholds);
+            if let Err(e) = host.install_sources(&sources) {
+                self.fail(e);
             }
         }
-
-        let text = cortisoff_core::write_rules(&rules);
-        // Reading back what we are about to write catches the one bug this
-        // whole path can have: a rule the writer cannot express.
-        // Compared without order: the file sorts keys, so a set listed as
-        // vibrance then colour comes back as colour then vibrance and means
-        // exactly the same thing.
-        match cortisoff_core::parse_rules(&text) {
-            Ok(back) if canonical(&back) == canonical(&rules) => {}
-            Ok(_) => {
-                return Err(
-                    "these rules do not survive being written out. Nothing was saved".to_owned(),
-                )
-            }
-            Err(e) => return Err(format!("writing these rules produced a bad file: {e}")),
-        }
-
-        let previous = std::fs::read_to_string(&path).ok();
-        write_atomically(&path, &text)?;
-
-        match self.reload(host) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // The daemon kept running on the old rules, so the file has to
-                // go back to matching them.
-                if let Some(previous) = previous {
-                    let _ = write_atomically(&path, &previous);
-                }
-                Err(e)
+        if let Some(hotkeys) = self.runtime.take_hotkeys() {
+            let refused = host.set_hotkeys(&hotkeys);
+            if !refused.is_empty() {
+                let commands = self.runtime.hotkeys_refused(refused);
+                self.apply(host, commands);
             }
         }
+        let now = host.monotonic_ms();
+        match self.runtime.next_due() {
+            Some(due) if self.plugin_armed != Some(due) => {
+                let after = due.saturating_sub(now);
+                let slack = (after / 20).clamp(1, 500);
+                host.set_timer(
+                    PLUGIN_TIMER,
+                    Duration::from_millis(after),
+                    Duration::from_millis(slack),
+                );
+                self.plugin_armed = Some(due);
+            }
+            None if self.plugin_armed.is_some() => {
+                host.cancel_timer(PLUGIN_TIMER);
+                self.plugin_armed = None;
+            }
+            _ => {}
+        }
+        let watch = !self.stopped && self.runtime.watches_folders();
+        if watch && !self.watching {
+            host.set_timer(
+                WATCH_TIMER,
+                Duration::from_millis(WATCH_MS),
+                Duration::from_millis(250),
+            );
+            self.watching = true;
+        } else if !watch && self.watching {
+            host.cancel_timer(WATCH_TIMER);
+            self.watching = false;
+        }
+        host.set_active(self.active());
     }
 
-    /// A value the user set by hand. It outranks every rule until it is
-    /// cleared, and the rule underneath keeps holding meanwhile.
+    // ---- what clients ask -------------------------------------------------
+
+    /// A value the user set by hand. It outranks every plugin until it is
+    /// cleared, and the plugins underneath keep holding meanwhile.
     pub fn manual_set(
         &mut self,
         host: &mut dyn Host,
         cap: &CapabilityId,
-        value: cortisoff_host::Value,
+        value: Value,
     ) -> Result<(), String> {
-        let actions = self.engine.manual_set(cap, value)?;
+        let index = self.settable(host, cap)?;
+        let now = host.monotonic_ms();
+        let actions = self.claims.claim(
+            index,
+            OwnerId::Manual,
+            priority::MANUAL,
+            value,
+            0,
+            now,
+            None,
+        );
         self.run(host, actions);
+        self.settle(host);
         Ok(())
     }
 
     pub fn manual_clear(&mut self, host: &mut dyn Host, cap: &CapabilityId) -> Result<(), String> {
-        let actions = self.engine.manual_clear(cap)?;
-        self.run(host, actions);
+        let index = self.settable(host, cap)?;
+        self.release(host, index, OwnerId::Manual, 0);
+        self.settle(host);
         Ok(())
     }
 
-    /// A slider mid-drag. The first call remembers where the screen rested,
-    /// every call pushes the value.
+    /// A slider mid-drag. Every call pushes the value at once.
     pub fn preview(
         &mut self,
         host: &mut dyn Host,
         cap: &CapabilityId,
         value: Value,
     ) -> Result<(), String> {
-        if !self.previewing.contains_key(cap) {
-            let rest = host.actuator(cap).and_then(|a| a.rest());
-            self.previewing.insert(cap.clone(), rest);
-        }
-        let actions = self.engine.preview(cap, value)?;
+        let index = self.settable(host, cap)?;
+        let now = host.monotonic_ms();
+        let actions = self.claims.claim(
+            index,
+            OwnerId::Preview,
+            priority::PREVIEW,
+            value,
+            0,
+            now,
+            None,
+        );
         self.run(host, actions);
         Ok(())
     }
 
-    /// The drag ended, or the client that was dragging went away.
+    /// The drag ended, or the client that was dragging went away. The value
+    /// eases back to whatever holds the capability underneath.
     pub fn preview_end(&mut self, host: &mut dyn Host, cap: &CapabilityId) -> Result<(), String> {
-        let rest = self.previewing.remove(cap).flatten();
-        let actions = self.engine.preview_end(cap, rest)?;
+        let index = self.claims.index_of(cap)?;
+        let rest = self.baseline(host, cap);
+        let now = host.monotonic_ms();
+        let actions =
+            self.claims
+                .release(index, OwnerId::Preview, PREVIEW_FADE_MS, now, rest.as_ref());
         self.run(host, actions);
         Ok(())
     }
 
-    /// Re-read the rule file. A file that does not parse leaves the running
-    /// rules untouched, because losing a working configuration to a missing
-    /// bracket is not acceptable.
-    pub fn reload(&mut self, host: &mut dyn Host) -> Result<(), String> {
-        let path = self
-            .rules_path
-            .clone()
-            .ok_or_else(|| "this daemon was not started from a rule file".to_owned())?;
-        let source = std::fs::read_to_string(&path)
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        let rules = cortisoff_core::parse_rules(&source)
-            .map_err(|e| format!("{}: {}: {}", path.display(), e.at, e.message))?;
+    fn settable(&self, host: &dyn Host, cap: &CapabilityId) -> Result<CapIndex, String> {
+        if host.actuator(cap).is_none() {
+            return Err(match self.probed.reason_missing(cap) {
+                Some(why) => format!("{cap}: {why}"),
+                None => format!("{cap} is not something cortisoff can set on this machine"),
+            });
+        }
+        self.claims.index_of(cap)
+    }
 
-        self.authored = rules.clone();
-        self.catch_up(host);
-        let actions = self.engine.reload(resting(host, rules));
-        // A rule added from the dashboard may read something no rule read at
-        // startup, and one switched off may leave a hook nobody needs.
-        let mut thresholds = Vec::new();
-        for rule in self.engine.rules().iter().filter(|rule| rule.is_active()) {
-            rule.when.idle_thresholds(&mut thresholds);
-        }
-        thresholds.sort_unstable();
-        thresholds.dedup();
-        host.set_idle_thresholds(&thresholds);
-        let wanted = self.wanted_sources();
-        if let Err(e) = host.install_sources(&wanted) {
-            self.fail(e);
-        }
-        self.run(host, actions);
+    pub fn set_enabled(&mut self, host: &mut dyn Host, id: &str, on: bool) -> Result<(), String> {
+        let commands = self.call(host, |rt, env| rt.set_enabled(env, id, on))?;
+        self.apply(host, commands);
+        self.settle(host);
         Ok(())
     }
 
-    /// Hand every screen back the way it was found, then say so.
+    pub fn set_settings(
+        &mut self,
+        host: &mut dyn Host,
+        id: &str,
+        settings: serde_json::Value,
+    ) -> Result<(), String> {
+        let commands = self.call(host, |rt, env| rt.set_settings(env, id, settings))?;
+        self.apply(host, commands);
+        self.settle(host);
+        Ok(())
+    }
+
+    pub fn message(
+        &mut self,
+        host: &mut dyn Host,
+        id: &str,
+        name: &str,
+        data: &serde_json::Value,
+    ) -> Result<(), String> {
+        let commands = self.call(host, |rt, env| rt.message(env, id, name, data))?;
+        self.apply(host, commands);
+        self.settle(host);
+        Ok(())
+    }
+
+    /// Read every plugin folder again: one was installed, updated or removed.
+    pub fn rescan(&mut self, host: &mut dyn Host) -> Result<(), String> {
+        let packages = self.discover();
+        let store = self.store.clone();
+        let commands = self.call(host, |rt, env| rt.replace(env, packages, &store));
+        self.apply(host, commands);
+        self.save_store();
+        self.settle(host);
+        Ok(())
+    }
+
+    fn discover(&mut self) -> Vec<Package> {
+        let Some(dir) = self.plugins_dir.clone() else {
+            return cortisoff_runtime::builtin();
+        };
+        let (packages, problems) = cortisoff_runtime::discover(&dir, &self.store.links);
+        for problem in problems {
+            self.note(Notification::Log {
+                level: LogLevel::Warn,
+                message: problem,
+            });
+        }
+        packages
+    }
+
+    /// Run a plugin from a folder in place, switched on, reloaded on save.
+    pub fn link(&mut self, host: &mut dyn Host, path: &str) -> Result<String, String> {
+        let dir = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
+        let pkg = Package::from_dir(&dir, Origin::Linked)?;
+        let id = pkg.manifest.id.clone();
+        if !self.store.links.contains(&dir) {
+            self.store.links.push(dir);
+        }
+        self.store.plugins.entry(id.clone()).or_default().enabled = true;
+        self.rescan(host)?;
+        Ok(id)
+    }
+
+    /// Forget a linked folder or delete an installed plugin. A built-in one
+    /// only switches off.
+    pub fn remove(&mut self, host: &mut dyn Host, id: &str) -> Result<(), String> {
+        match self.runtime.origin(id) {
+            None => return Err(format!("no plugin is called {id:?}")),
+            Some(Origin::Builtin) => {
+                return Err(format!(
+                    "{id} is built in. It switches off, it does not uninstall"
+                ))
+            }
+            Some(Origin::Linked) => {
+                let dir = self.runtime.dir(id);
+                self.store.links.retain(|l| Some(l) != dir.as_ref());
+            }
+            Some(Origin::Installed) => {
+                let (Some(dir), Some(root)) = (self.runtime.dir(id), self.plugins_dir.clone())
+                else {
+                    return Err(format!("{id} has no folder to remove"));
+                };
+                // Stopped first: on Windows a file in use cannot be deleted.
+                self.set_enabled(host, id, false)?;
+                install::uninstall(&dir, &root)?;
+            }
+        }
+        self.store.plugins.remove(id);
+        self.rescan(host)
+    }
+
+    /// Hand every screen back the way it was found.
     ///
-    /// Called on the way out, and it is the reason a user can quit cortisoff
-    /// without rebooting. The restores go through the dispatcher like any
-    /// other action, so each journal entry is cleared only once its restore
-    /// actually succeeded and a monitor that refuses keeps its entry for the
-    /// next run.
+    /// Plugins hear `stop` first, then whatever still holds anything is
+    /// released at once. The restores go through the dispatcher like any
+    /// other action, so a journal entry is cleared only once its restore
+    /// succeeded and a monitor that refuses keeps its entry for the next run.
     pub fn shutdown(&mut self, host: &mut dyn Host) {
+        if self.stopped {
+            return;
+        }
         self.stopped = true;
-        let actions = self.engine.shutdown();
+        let commands = self.call(host, |rt, env| rt.shutdown(env));
+        self.apply(host, commands);
+        let actions = self.claims.shutdown();
         self.run(host, actions);
+        host.cancel_timer(PLUGIN_TIMER);
+        host.cancel_timer(WATCH_TIMER);
+        host.set_hotkeys(&[]);
+        host.set_active(false);
     }
 
-    /// The last thing a subscriber sees. Sent before the transport closes, so
-    /// a client can tell a clean exit from a crash.
+    /// The last thing a subscriber sees, so a client can tell a clean exit
+    /// from a crash.
     pub fn note_closing(&mut self) {
         self.note(Notification::Closing);
     }
 
-    /// Notifications nobody has read yet. Draining is the subscriber's job, so
-    /// a daemon with no client attached keeps only what fits in the bound.
     pub fn drain(&mut self) -> Vec<Notification> {
         std::mem::take(&mut self.pending)
     }
@@ -345,23 +547,14 @@ impl<J: JournalStore> Supervisor<J> {
         &self.errors
     }
 
-    fn wanted_sources(&self) -> Vec<CapabilityId> {
-        let read: Signals = self
-            .engine
-            .rules()
-            .iter()
-            .filter(|r| r.is_active())
-            .fold(Signals::NONE, |acc, r| acc | r.reads);
-        SOURCES
-            .iter()
-            .filter(|(signal, _)| read.intersects(*signal))
-            .map(|(_, id)| CapabilityId::new(*id))
-            .collect()
-    }
+    // ---- the hardware ----------------------------------------------------
 
     /// Execute a batch, in order. Apply and restore go to the dispatcher, and
     /// everything it hands back is routed here.
     fn run(&mut self, host: &mut dyn Host, actions: Vec<Action>) {
+        if actions.is_empty() {
+            return;
+        }
         let (allowed, refused) = self.split_blocked(actions);
         for cap in refused {
             self.note(Notification::Log {
@@ -369,16 +562,18 @@ impl<J: JournalStore> Supervisor<J> {
                 message: format!("{cap} is left alone this run, another application drives it"),
             });
         }
-
         for action in &allowed {
-            self.note(Notification::Action(action.clone()));
+            if matches!(
+                action,
+                Action::Apply { .. } | Action::RestoreBaseline { .. }
+            ) {
+                self.note(Notification::Action(action.clone()));
+            }
         }
-
         let outcome = self.dispatcher.execute(&*host, allowed);
         for e in outcome.errors {
             self.fail(e);
         }
-
         for action in outcome.deferred {
             match action {
                 Action::SetTimer {
@@ -389,27 +584,20 @@ impl<J: JournalStore> Supervisor<J> {
                 Action::CancelTimer { id } => host.cancel_timer(id),
                 Action::Log { level, message } => self.note(Notification::Log { level, message }),
                 Action::Run { program, args } => self.spawn(&program, &args),
-                // The dispatcher owns these two and never defers them.
                 Action::Apply { .. } | Action::RestoreBaseline { .. } => {}
             }
         }
-        host.set_active(self.active());
     }
 
-    /// Enabled plugins remain active while waiting for their conditions.
+    /// A running plugin, or a manual value that is not blocked.
     fn active(&self) -> bool {
         if self.stopped {
             return false;
         }
-        if self
-            .engine
-            .rules()
-            .iter()
-            .any(|r| !matches!(r.state, RuleState::Disabled))
-        {
+        if self.runtime.active() {
             return true;
         }
-        let arbiter = self.engine.arbiter();
+        let arbiter = self.claims.arbiter();
         let table = arbiter.table();
         (0..table.len()).any(|i| {
             let cap = CapIndex(i as u16);
@@ -429,7 +617,11 @@ impl<J: JournalStore> Supervisor<J> {
                 _ => None,
             };
             match cap {
-                Some(cap) if self.gate.blocks(cap) => refused.push(cap.clone()),
+                Some(cap) if self.gate.blocks(cap) => {
+                    if !refused.contains(cap) {
+                        refused.push(cap.clone());
+                    }
+                }
                 _ => allowed.push(action),
             }
         }
@@ -437,9 +629,14 @@ impl<J: JournalStore> Supervisor<J> {
     }
 
     fn spawn(&mut self, program: &str, args: &[String]) {
-        // Detached on purpose: the wallpaper adapters are one-shot commands
-        // and the daemon must never sit waiting on one.
-        match std::process::Command::new(program).args(args).spawn() {
+        // Detached on purpose: the daemon must never sit waiting on a child.
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
             Ok(_) => self.note(Notification::Log {
                 level: LogLevel::Trace,
                 message: format!("ran {program}"),
@@ -466,31 +663,67 @@ impl<J: JournalStore> Supervisor<J> {
         self.pending.push(notification);
     }
 
-    fn holding_names(&self) -> Vec<String> {
-        self.engine.firing().map(|r| r.name.clone()).collect()
+    // ---- reports ---------------------------------------------------------
+
+    fn owner_name(&self, owner: OwnerId) -> String {
+        match owner {
+            OwnerId::Plugin(key) => self
+                .runtime
+                .name_of(key)
+                .map_or_else(|| format!("plugin {key}"), str::to_owned),
+            OwnerId::Manual => "manual".to_owned(),
+            OwnerId::Preview => "preview".to_owned(),
+        }
     }
 
-    /// The `cortisoff trace` line. Computed by comparing the firing set before
-    /// and after, because the engine reports actions and not edges, and an
-    /// edge that claims nothing is still worth seeing when debugging a rule.
-    fn report_edges(&mut self, before: Vec<String>) {
-        let after = self.holding_names();
-        for name in after.iter().filter(|n| !before.contains(n)) {
-            self.note(Notification::RuleEdge {
-                rule: name.clone(),
-                holding: true,
-            });
+    fn holds(&self, key: u32) -> Vec<CapabilityId> {
+        let table = self.claims.arbiter().table();
+        self.held_by(OwnerId::Plugin(key))
+            .into_iter()
+            .map(|cap| table.id(cap).clone())
+            .collect()
+    }
+
+    pub fn plugins(&self) -> Vec<PluginReport> {
+        let mut reports = self.runtime.reports();
+        for (report, key) in reports.iter_mut().zip(self.runtime.keys()) {
+            report.holds = self.holds(key);
         }
-        for name in before.iter().filter(|n| !after.contains(n)) {
-            self.note(Notification::RuleEdge {
-                rule: name.clone(),
-                holding: false,
-            });
+        reports
+    }
+
+    pub fn report(&self, id: &str) -> Option<PluginReport> {
+        let mut report = self.runtime.report(id)?;
+        if let Some(key) = self.runtime.key_of(id) {
+            report.holds = self.holds(key);
         }
+        Some(report)
     }
 
     pub fn state(&self) -> StateReport {
-        let w = self.engine.world();
+        let w = self.claims.world();
+        let arbiter = self.claims.arbiter();
+        let table = arbiter.table();
+        let claims = (0..table.len())
+            .filter_map(|i| {
+                let cap = CapIndex(i as u16);
+                // Highest priority first, the latest claim first among
+                // equals: the order the arbiter picks a winner in.
+                let mut stack: Vec<_> = arbiter.stack(cap).iter().rev().collect();
+                stack.sort_by_key(|c| std::cmp::Reverse(c.priority));
+                let top = stack.first()?;
+                Some(ClaimReport {
+                    cap: table.id(cap).clone(),
+                    owner: self.owner_name(top.owner),
+                    priority: top.priority,
+                    value: top.value.clone(),
+                    shadowed: stack[1..]
+                        .iter()
+                        .map(|c| self.owner_name(c.owner))
+                        .collect(),
+                })
+            })
+            .collect();
         StateReport {
             active: self.active(),
             world: WorldReport {
@@ -503,16 +736,16 @@ impl<J: JournalStore> Supervisor<J> {
                 audio_active: w.audio_active,
                 minute_of_day: w.minute_of_day(),
             },
-            rules: self.rule_reports(),
-            claims: self.claim_reports(),
+            plugins: self.plugins(),
+            claims,
         }
     }
 
-    /// `host` is here only to answer one question per capability: is there an
-    /// actuator behind it. A sensor and an actuator are both capabilities and
-    /// the probe does not separate them, but a client showing an override box
-    /// on `app.focus` is offering something that can only be refused.
-    pub fn doctor(&self, host: &dyn Host, probed: &CapabilitySet) -> DoctorReport {
+    /// `host` answers one question per capability: is there an actuator
+    /// behind it. A sensor and an actuator are both capabilities and the
+    /// probe does not separate them.
+    pub fn doctor(&self, host: &dyn Host) -> DoctorReport {
+        let probed = &self.probed;
         let mut capabilities: Vec<CapabilityReport> = probed
             .ids()
             .map(|id| {
@@ -535,176 +768,93 @@ impl<J: JournalStore> Supervisor<J> {
             label: cortisoff_host::label(gap.id.as_str()),
             control: None,
         }));
-
         let journal_dirty = self
             .dispatcher
             .journal()
             .dirty()
             .map(|entries| entries.into_iter().map(|e| e.cap).collect())
             .unwrap_or_default();
-
         DoctorReport {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
             capabilities,
-            rules: self.rule_reports(),
+            plugins: self.plugins(),
             journal_dirty,
             warnings: self.warnings.clone(),
         }
     }
+}
 
-    fn rule_reports(&self) -> Vec<RuleReport> {
-        let table = self.engine.arbiter().table();
-        let firing: Vec<u32> = self.engine.firing().map(|r| r.id).collect();
-        self.engine
-            .rules()
-            .iter()
-            .map(|rule| RuleReport {
-                name: rule.name.clone(),
-                priority: rule.priority,
-                state: match &rule.state {
-                    RuleState::Active => RuleStateReport::Active,
-                    RuleState::Disabled => RuleStateReport::Disabled,
-                    RuleState::Empty => RuleStateReport::Empty,
-                    RuleState::Unsupported { missing } => RuleStateReport::Unsupported {
-                        missing: missing.clone(),
-                    },
-                },
-                holding: firing.contains(&rule.id),
-                sets: rule.set.iter().map(|(i, _)| table.id(*i).clone()).collect(),
-            })
-            .collect()
-    }
+fn rest_of(host: &dyn Host, cap: &CapabilityId) -> Option<Value> {
+    host.actuator(cap).and_then(|a| a.rest())
+}
 
-    fn claim_reports(&self) -> Vec<ClaimReport> {
-        let arbiter = self.engine.arbiter();
-        let table = arbiter.table();
-        let mut out = Vec::new();
-        for i in 0..table.len() {
-            let cap = CapIndex(i as u16);
-            let Some(owner) = arbiter.holder(cap) else {
-                continue;
-            };
-            let stack = arbiter.stack(cap);
-            let Some(top) = stack.iter().find(|c| c.owner == owner) else {
-                continue;
-            };
-            let mut shadowed: Vec<&cortisoff_core::Claim> =
-                stack.iter().filter(|c| c.owner != owner).collect();
-            shadowed.sort_by_key(|c| std::cmp::Reverse(c.priority));
-            out.push(ClaimReport {
-                cap: table.id(cap).clone(),
-                owner: self.owner_name(owner),
-                priority: top.priority,
-                value: top.value.clone(),
-                shadowed: shadowed
-                    .into_iter()
-                    .map(|c| self.owner_name(c.owner))
-                    .collect(),
-            });
-        }
-        out
-    }
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use cortisoff_host::mock::{MemJournal, MockHost, Trace};
+    use cortisoff_runtime::{Files, Manifest};
 
-    fn owner_name(&self, owner: OwnerId) -> String {
-        match owner {
-            OwnerId::Manual => "manual".to_owned(),
-            OwnerId::Preview => "preview".to_owned(),
-            OwnerId::Rule(id) => self
-                .engine
-                .rules()
-                .iter()
-                .find(|r| r.id == id)
-                .map(|r| r.name.clone())
-                .unwrap_or_else(|| format!("rule {id}")),
+    /// A plugin from one script, switched on.
+    pub(crate) fn plugin(id: &str, script: &'static str) -> Package {
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\nplatforms = [\"windows\", \"linux\", \"macos\"]\n"
+        );
+        let files: &'static [(&'static str, &'static str)] =
+            Box::leak(Box::new([("init.lua", script)]));
+        Package {
+            manifest: Manifest::parse(&manifest).unwrap(),
+            files: Files::Builtin(files),
+            origin: Origin::Installed,
+            url: None,
         }
     }
-}
 
-/// The rules as the engine should run them: every fade that names no start
-/// begins from what its actuator says the screen shows when nothing holds it.
-///
-/// Only the engine's copy. What the user wrote, and what the dashboard is
-/// shown, keeps saying "from the current value" by leaving `from` out, so a
-/// monitor that changes its resting point changes the fade with it.
-pub fn resting(host: &dyn Host, mut rules: Vec<Rule>) -> Vec<Rule> {
-    cortisoff_core::start_from_rest(&mut rules, |cap| host.actuator(cap).and_then(|a| a.rest()));
-    rules
-}
-
-/// Rules with every order that carries no meaning taken out: what a rule sets,
-/// where its fades start, and the branches of `all` and `any`.
-fn canonical(rules: &[Rule]) -> Vec<Rule> {
-    rules
-        .iter()
-        .cloned()
-        .map(|mut rule| {
-            rule.set.sort_by(|a, b| a.cap.cmp(&b.cap));
-            if let Some(t) = &mut rule.transition {
-                t.from.sort_by(|a, b| a.cap.cmp(&b.cap));
-            }
-            rule.when = canonical_condition(rule.when);
-            rule
-        })
-        .collect()
-}
-
-fn canonical_condition(condition: Condition) -> Condition {
-    let sorted = |branches: Vec<Condition>| {
-        let mut branches: Vec<Condition> = branches.into_iter().map(canonical_condition).collect();
-        branches.sort_by_cached_key(|c| format!("{c:?}"));
-        branches
-    };
-    match condition {
-        Condition::All(branches) => Condition::All(sorted(branches)),
-        Condition::Any(branches) => Condition::Any(sorted(branches)),
-        Condition::Not(inner) => Condition::Not(Box::new(canonical_condition(*inner))),
-        other => other,
+    pub(crate) fn supervisor(host: &MockHost, packages: Vec<Package>) -> Supervisor<MemJournal> {
+        let mut store = Store::in_memory();
+        for p in &packages {
+            store
+                .plugins
+                .entry(p.manifest.id.clone())
+                .or_default()
+                .enabled = true;
+        }
+        let runtime = Runtime::new(packages, &store, None);
+        Supervisor::new(
+            host.probe(),
+            MemJournal::new(Trace::default()),
+            Interference::clear(),
+            runtime,
+            store,
+        )
     }
-}
-
-/// Temporary file, flush, rename, the same shape the journal uses. A rule file
-/// truncated by a crash mid-write is a user losing every rule they wrote.
-fn write_atomically(path: &std::path::Path, contents: &str) -> Result<(), String> {
-    use std::io::Write;
-
-    let fail = |what: &str, e: std::io::Error| format!("could not {what} {}: {e}", path.display());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| fail("create the directory for", e))?;
-    }
-    let temp = path.with_extension("toml.tmp");
-    let mut file = std::fs::File::create(&temp).map_err(|e| fail("write", e))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|e| fail("write", e))?;
-    file.sync_all().map_err(|e| fail("flush", e))?;
-    drop(file);
-    std::fs::rename(&temp, path).map_err(|e| fail("replace", e))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::testing::{plugin, supervisor};
     use super::*;
-    use cortisoff_core::{parse_rules, Assign, CapTable};
+    use cortisoff_host::ids;
     use cortisoff_host::mock::{MemJournal, MockHost, Trace};
-    use cortisoff_host::{AppRef, Value};
-
-    const VIBRANCE: &str = ids::DISPLAY_VIBRANCE;
-    const TEMP: &str = ids::DISPLAY_COLOR_TEMP;
 
     fn host() -> MockHost {
-        MockHost::new()
-            .with_actuator(VIBRANCE, Value::Int(50), false)
-            .with_actuator(TEMP, Value::Int(6500), false)
+        let mut host = MockHost::new()
+            .with_actuator(ids::DISPLAY_VIBRANCE, Value::Int(50), false)
+            .with_actuator(ids::DISPLAY_COLOR_TEMP, Value::Int(6500), false);
+        host.now_ms = 10_000;
+        host
     }
 
-    fn supervisor(host: &MockHost, source: &str, gate: Interference) -> Supervisor<MemJournal> {
-        let rules = parse_rules(source).expect("test rules parse");
-        let engine = Engine::new(CapTable::from_set(&host.probe()), rules);
-        Supervisor::new(engine, MemJournal::new(Trace::default()), gate)
-    }
+    const GAME: &str = "return {
+        start = function(cx) cx:watch('app.focus') end,
+        on = function(cx, s, ev)
+          if ev.exe == 'game.exe' then cx:claim('display.vibrance', 100, { priority = 100 })
+          else cx:release('display.vibrance') end
+        end,
+    }";
 
     fn focus(exe: &str) -> Event {
-        Event::AppFocus(AppRef {
+        Event::AppFocus(cortisoff_host::AppRef {
             exe: exe.to_owned(),
             title: None,
             pid: 1,
@@ -712,579 +862,163 @@ mod tests {
         })
     }
 
-    const FOCUS_RULE: &str = r#"
-[[rule]]
-name = "vibrance in game"
-when.app = "game.exe"
-set.display.vibrance = 100
-"#;
-
-    /// An installed hook costs on every system-wide event, so a rule set that
-    /// reads nothing but the focused application must not get an idle timer.
     #[test]
-    fn only_the_sources_some_rule_reads_are_installed() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        assert_eq!(h.installed, vec![CapabilityId::new(ids::APP_FOCUS)]);
-    }
-
-    #[test]
-    fn saving_an_idle_delay_updates_the_host_and_persisted_rule() {
-        let dir = std::env::temp_dir().join(format!("cortisoff-idle-delay-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        let source = "[[rule]]\nname = 'idle'\nwhen.idle_for = 120\nset.display.vibrance = 80\n";
-        std::fs::write(&file, source).unwrap();
-        let mut h = host();
-        let mut s = supervisor(&h, source, Interference::clear())
-            .with_rules_path(&file)
-            .with_rules(parse_rules(source).unwrap());
-        s.start(&mut h);
-        assert_eq!(h.idle_thresholds, vec![120]);
-        let mut rules = s.authored().to_vec();
-        rules[0].when = Condition::IdleFor(90);
-        s.save_rules(&mut h, rules.clone()).unwrap();
-        assert_eq!(h.idle_thresholds, vec![90]);
+    fn a_plugin_claim_reaches_the_hardware_and_its_release_gives_it_back() {
+        let mut host = host();
+        let mut sup = supervisor(&host, vec![plugin("game", GAME)]);
+        sup.start(&mut host);
+        assert_eq!(host.installed, vec![CapabilityId::new(ids::APP_FOCUS)]);
+        sup.handle(&mut host, focus("game.exe"));
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
         assert_eq!(
-            parse_rules(&std::fs::read_to_string(&file).unwrap()).unwrap(),
-            rules
+            sup.plugins()[0].holds,
+            vec![CapabilityId::new(ids::DISPLAY_VIBRANCE)]
         );
-        rules[0].enabled = false;
-        s.save_rules(&mut h, rules).unwrap();
-        assert!(h.idle_thresholds.is_empty());
-        assert!(!h.active);
-        std::fs::remove_dir_all(dir).unwrap();
+        sup.handle(&mut host, focus("notepad.exe"));
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
     }
 
     #[test]
-    fn disabled_plugins_leave_the_logo_red() {
-        let mut h = host();
-        let mut s = supervisor(
-            &h,
-            &FOCUS_RULE.replace("when.app", "enabled = false\nwhen.app"),
-            Interference::clear(),
+    fn a_manual_value_beats_the_plugin_and_gives_it_back_on_clear() {
+        let mut host = host();
+        let mut sup = supervisor(&host, vec![plugin("game", GAME)]);
+        sup.start(&mut host);
+        sup.handle(&mut host, focus("game.exe"));
+        let cap = CapabilityId::new(ids::DISPLAY_VIBRANCE);
+        sup.manual_set(&mut host, &cap, Value::Int(10)).unwrap();
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(10)));
+        let state = sup.state();
+        assert_eq!(state.claims[0].owner, "manual");
+        assert_eq!(state.claims[0].shadowed, vec!["game".to_owned()]);
+        sup.manual_clear(&mut host, &cap).unwrap();
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
+    }
+
+    #[test]
+    fn switching_a_plugin_off_fades_its_claims_away() {
+        let mut host = host();
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "warm",
+                "return { start = function(cx) cx:claim('display.color_temp', 3200) end }",
+            )],
         );
-        s.start(&mut h);
-        assert!(!h.active && !s.state().active);
-    }
-
-    #[test]
-    fn an_enabled_waiting_plugin_keeps_the_logo_green() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        assert!(s.state().claims.is_empty());
-        assert!(h.active && s.state().active);
-    }
-
-    #[test]
-    fn a_rule_firing_reaches_the_actuator_and_going_back_restores_it() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        assert!(h.active && s.state().active);
-
-        s.handle(&mut h, focus("game.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-        assert!(h.active && s.state().active);
-
-        s.handle(&mut h, focus("notepad.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert!(h.active && s.state().active);
-    }
-
-    /// Ctrl-C is not a crash. Quitting has to hand every screen back, or a
-    /// user who tries cortisoff once is left with an orange screen and no
-    /// process left to fix it.
-    #[test]
-    fn shutting_down_puts_every_baseline_back_and_empties_the_journal() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-
-        s.shutdown(&mut h);
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert!(
-            s.dispatcher
-                .journal()
-                .dirty()
-                .expect("the mock journal always reads")
-                .is_empty(),
-            "a cleanly restored baseline has nothing left to recover"
-        );
-    }
-
-    /// A monitor that arrives while a rule holds the screen: the baseline
-    /// grows before the rule is pushed at it, so releasing the rule puts that
-    /// monitor back too.
-    #[test]
-    fn a_display_change_grows_the_baseline_before_anything_is_pushed_again() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-
-        h.grow_baseline(VIBRANCE, Value::Int(55));
-        s.handle(&mut h, Event::DisplayConfigChanged);
-
-        // The rule still holds, so the screen keeps the rule's value.
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-        s.handle(&mut h, focus("notepad.exe"));
-        assert_eq!(
-            h.value(VIBRANCE),
-            Some(Value::Int(55)),
-            "the baseline captured after the monitors moved is the one that goes back"
-        );
-    }
-
-    /// A manual override is the user's, not a rule's, and nothing survives the
-    /// daemon to undo it either.
-    #[test]
-    fn shutting_down_also_drops_a_manual_override() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.manual_set(&mut h, &CapabilityId::new(VIBRANCE), Value::Int(70))
-            .expect("the capability exists");
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(70)));
-        assert!(h.active && s.state().active);
-
-        s.shutdown(&mut h);
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert!(!h.active && !s.state().active);
-    }
-
-    /// What clicking the switch on a card does, end to end: the file changes,
-    /// the rule stops holding, and the screen goes back on its own.
-    #[test]
-    fn switching_a_rule_off_rewrites_the_file_and_releases_what_it_held() {
-        let dir = std::env::temp_dir().join("cortisoff-save-rules");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        std::fs::write(&file, FOCUS_RULE).unwrap();
-
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear())
-            .with_rules_path(&file)
-            .with_rules(parse_rules(FOCUS_RULE).unwrap());
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-
-        let mut rules = s.authored().to_vec();
-        rules[0].enabled = false;
-        s.save_rules(&mut h, rules).expect("the set is saveable");
-
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        // Nothing reads the focused application any more, so its hook goes.
-        assert!(h.installed.is_empty(), "still installed: {:?}", h.installed);
-        let on_disk = std::fs::read_to_string(&file).unwrap();
-        assert!(on_disk.contains("enabled = false"), "wrote:\n{on_disk}");
-        assert!(!s.authored()[0].enabled);
-        // Still holding on paper, which is what makes the card say "would be
-        // holding" rather than pretending the condition stopped being true.
-        assert_eq!(
-            s.state().rules[0].state,
-            cortisoff_ipc::RuleStateReport::Disabled
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// What the settings dialog sends: rows in the order a person added them,
-    /// which is not the order the file sorts them into. It used to be refused
-    /// as a set that "does not survive being written out".
-    #[test]
-    fn a_rule_listed_in_another_order_than_the_file_uses_still_saves() {
-        let dir = std::env::temp_dir().join("cortisoff-save-order");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        std::fs::write(&file, FOCUS_RULE).unwrap();
-
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear())
-            .with_rules_path(&file)
-            .with_rules(parse_rules(FOCUS_RULE).unwrap());
-        s.start(&mut h);
-
-        let rule = Rule {
-            name: "rows in person order".to_owned(),
-            when: Condition::All(vec![
-                Condition::Not(Box::new(Condition::App {
-                    exe: Some("vlc.exe".to_owned()),
-                    title_contains: None,
-                })),
-                Condition::Between {
-                    start: "20:00".parse().unwrap(),
-                    end: "07:00".parse().unwrap(),
-                },
-            ]),
-            priority: 0,
-            enabled: true,
-            set: vec![
-                Assign {
-                    cap: CapabilityId::new(VIBRANCE),
-                    value: Value::Int(60),
-                },
-                Assign {
-                    cap: CapabilityId::new(TEMP),
-                    value: Value::Int(3200),
-                },
-            ],
-            transition: None,
-        };
-        s.save_rules(&mut h, vec![rule])
-            .expect("order carries no meaning");
-        assert_eq!(s.authored()[0].name, "rows in person order");
-        // Reading the clock now, and the application too.
-        assert_eq!(h.installed, vec![CapabilityId::new(ids::APP_FOCUS)]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The rule file is the one thing a user cannot rebuild from memory. A
-    /// refused save leaves it exactly as it was.
-    #[test]
-    fn a_refused_save_leaves_the_file_and_the_running_rules_alone() {
-        let dir = std::env::temp_dir().join("cortisoff-save-refused");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        std::fs::write(&file, FOCUS_RULE).unwrap();
-
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear())
-            .with_rules_path(&file)
-            .with_rules(parse_rules(FOCUS_RULE).unwrap());
-        s.start(&mut h);
-
-        let twice = vec![s.authored()[0].clone(), s.authored()[0].clone()];
-        let refused = s
-            .save_rules(&mut h, twice)
-            .expect_err("two rules, one name");
-        assert!(refused.contains("two rules are called"), "{refused}");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), FOCUS_RULE);
-        assert_eq!(s.authored().len(), 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The whole point of the startup gate: LightBulb is driving the ramp, so
-    /// the colour temperature is left alone while everything else still works.
-    #[test]
-    fn a_blocked_capability_is_never_touched_and_the_rest_of_the_batch_lands() {
-        let source = r#"
-[[rule]]
-name = "both at once"
-when.app = "game.exe"
-set.display.vibrance = 100
-set.display.color_temp = 3400
-"#;
-        let mut h = host();
-        let mut s = supervisor(&h, source, Interference::assess(["lightbulb.exe"], None));
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-
-        assert_eq!(h.value(TEMP), Some(Value::Int(6500)));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-        assert!(s.errors().is_empty());
-    }
-
-    #[test]
-    fn a_blocked_capability_says_so_once_in_the_stream() {
-        let mut h = host();
-        let source = r#"
-[[rule]]
-name = "night"
-when.app = "game.exe"
-set.display.color_temp = 3400
-"#;
-        let mut s = supervisor(&h, source, Interference::assess(["flux.exe"], None));
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-        assert!(h.active && s.state().active);
-
-        let warned = s
-            .drain()
-            .into_iter()
-            .filter(|n| {
-                matches!(n, Notification::Log { level: LogLevel::Warn, message } if message.contains(TEMP))
-            })
-            .count();
-        assert_eq!(warned, 1);
-    }
-
-    #[test]
-    fn both_edges_of_a_rule_reach_a_subscriber() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.drain();
-
-        s.handle(&mut h, focus("game.exe"));
-        s.handle(&mut h, focus("notepad.exe"));
-
-        let edges: Vec<(String, bool)> = s
-            .drain()
-            .into_iter()
-            .filter_map(|n| match n {
-                Notification::RuleEdge { rule, holding } => Some((rule, holding)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            edges,
-            vec![
-                ("vibrance in game".to_owned(), true),
-                ("vibrance in game".to_owned(), false),
-            ]
-        );
-    }
-
-    /// A clean exit is the reason a normal shutdown never leaves a tint
-    /// behind, and the journal has to be empty afterwards or the next run
-    /// restores something nobody applied.
-    #[test]
-    fn shutdown_puts_everything_back_and_empties_the_journal() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-        s.handle(&mut h, Event::Shutdown);
-
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert!(s.doctor(&h, &h.probe()).journal_dirty.is_empty());
-    }
-
-    #[test]
-    fn a_schedule_rule_asks_the_host_for_exactly_one_wakeup() {
-        let source = r#"
-[[rule]]
-name = "blue light"
-when.between = "20:00-07:00"
-set.display.color_temp = 3400
-"#;
-        let mut h = host();
-        let mut s = supervisor(&h, source, Interference::clear());
-        s.start(&mut h);
-        // Nothing to schedule until the host says what time it is.
-        assert!(h.timers.is_empty());
-
-        s.handle(
-            &mut h,
-            Event::TimeOfDay {
-                minute: 21 * 60,
-                second: 0,
-                millisecond: 0,
-            },
-        );
-        assert_eq!(h.value(TEMP), Some(Value::Int(3400)));
-        assert_eq!(h.timers.len(), 1);
-        // 21:00 to 07:00 is ten hours, and not one wakeup in between.
-        assert_eq!(h.timers[0].1.as_secs(), 10 * 60 * 60);
-    }
-
-    /// The engine hears the time only from clock events. Anything else that
-    /// reschedules has to tell it first, or the next edge is counted from
-    /// whenever it last heard: a daemon started at 09:01 and whose monitors
-    /// woke at 15:00 armed 20:00 for 02:00, and the night filter never came.
-    #[test]
-    fn rescheduling_outside_a_clock_event_counts_from_the_real_time() {
-        let source = r#"
-[[rule]]
-name = "blue light"
-when.between = "20:00-07:00"
-set.display.color_temp = 3400
-"#;
-        let at = |minute: u16| Event::TimeOfDay {
-            minute,
-            second: 0,
-            millisecond: 0,
-        };
-        let file =
-            std::env::temp_dir().join(format!("cortisoff-clock-{}.toml", std::process::id()));
-        std::fs::write(&file, source).unwrap();
-        let mut h = host();
-        let mut s = supervisor(&h, source, Interference::clear()).with_rules_path(&file);
-        s.start(&mut h);
-        s.handle(&mut h, at(9 * 60 + 1));
-        assert_eq!(h.timers.last().unwrap().1.as_secs(), (10 * 60 + 59) * 60);
-
-        h.clock = Some(at(15 * 60));
-        s.handle(&mut h, Event::DisplayConfigChanged);
-        assert_eq!(h.timers.last().unwrap().1.as_secs(), 5 * 60 * 60);
-
-        h.clock = Some(at(19 * 60));
-        let reloaded = s.reload(&mut h);
-        let _ = std::fs::remove_file(&file);
-        reloaded.unwrap();
-        assert_eq!(h.timers.last().unwrap().1.as_secs(), 60 * 60);
-    }
-
-    #[test]
-    fn the_doctor_reports_the_gate_warnings_verbatim() {
-        let h = host();
-        let gate = Interference::assess(["lightbulb.exe"], None);
-        let expected = gate.warnings.clone();
-        let s = supervisor(&h, FOCUS_RULE, gate);
-        assert_eq!(s.doctor(&h, &h.probe()).warnings, expected);
-    }
-
-    /// A rule naming a capability this machine does not have is a line in the
-    /// doctor, never an error and never a panic.
-    #[test]
-    fn an_unsupported_rule_is_listed_rather_than_dropped() {
-        let source = r#"
-[[rule]]
-name = "wallpaper"
-when.idle = true
-set.wallpaper.playback = false
-"#;
-        let h = host();
-        let s = supervisor(&h, source, Interference::clear());
-        let report = s.doctor(&h, &h.probe());
-        assert_eq!(report.rules.len(), 1);
-        assert!(matches!(
-            report.rules[0].state,
-            RuleStateReport::Unsupported { .. }
-        ));
-    }
-
-    #[test]
-    fn display_profile_applies_on_focus_and_restores_both_settings_on_blur() {
-        let mode = ids::DISPLAY_MODE;
-        let baseline = Value::Mode {
-            width: 1920,
-            height: 1080,
-            refresh_mhz: 60000,
-        };
-        let mut h = host().with_actuator(mode, baseline.clone(), false);
-        let mut s = supervisor(
-            &h,
-            r#"
-[[rule]]
-name = "display profile"
-priority = 100
-when.app = "cs2.exe"
-set.display.vibrance = 100
-set.display.mode = "2560x1440@240"
-"#,
-            Interference::clear(),
-        );
-        s.start(&mut h);
-        s.handle(&mut h, focus("cs2.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(100)));
-        assert_eq!(
-            h.value(mode),
-            Some(Value::Mode {
-                width: 2560,
-                height: 1440,
-                refresh_mhz: 240000
-            })
-        );
-        s.handle(&mut h, focus("notepad.exe"));
-        assert_eq!(h.value(VIBRANCE), Some(Value::Int(50)));
-        assert_eq!(h.value(mode), Some(baseline));
-        assert!(s.state().claims.is_empty());
-        assert!(s.dispatcher.journal().dirty().unwrap().is_empty());
-    }
-
-    #[test]
-    fn wallpaper_resumes_when_the_user_returns() {
-        let wallpaper = ids::WALLPAPER_PLAYBACK;
-        let mut h = host().with_actuator(wallpaper, Value::Bool(true), false);
-        let mut s = supervisor(
-            &h,
-            r#"
-[[rule]]
-name = "pause wallpaper while away"
-when.idle = true
-set.wallpaper.playback = false
-"#,
-            Interference::clear(),
-        );
-        s.start(&mut h);
-        for _ in 0..2 {
-            s.handle(
-                &mut h,
-                Event::Idle {
-                    idle: true,
-                    seconds: 300,
-                },
-            );
-            assert_eq!(h.value(wallpaper), Some(Value::Bool(false)));
-            s.handle(
-                &mut h,
-                Event::Idle {
-                    idle: false,
-                    seconds: 0,
-                },
-            );
-            assert_eq!(h.value(wallpaper), Some(Value::Bool(true)));
-            assert!(s.state().claims.is_empty());
-            assert!(s.dispatcher.journal().dirty().unwrap().is_empty());
+        sup.start(&mut host);
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
+        sup.set_enabled(&mut host, "warm", false).unwrap();
+        // Fading: one step in, not back yet.
+        assert_ne!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(6500)));
+        for _ in 0..100 {
+            host.now_ms += 40;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
         }
-    }
-
-    /// An unsupported rule reads idle, but nothing can ever act on it, so
-    /// installing the idle source would cost for nothing.
-    #[test]
-    fn an_unsupported_rule_installs_no_source() {
-        let source = r#"
-[[rule]]
-name = "wallpaper"
-when.idle = true
-set.wallpaper.playback = false
-"#;
-        let mut h = host();
-        let mut s = supervisor(&h, source, Interference::clear());
-        s.start(&mut h);
-        assert!(h.installed.is_empty());
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(6500)));
+        assert!(sup.plugins()[0].holds.is_empty());
     }
 
     #[test]
-    fn the_state_report_names_who_holds_what() {
-        let mut h = host();
-        let mut s = supervisor(&h, FOCUS_RULE, Interference::clear());
-        s.start(&mut h);
-        s.handle(&mut h, focus("game.exe"));
-
-        let state = s.state();
-        assert_eq!(state.claims.len(), 1);
-        assert_eq!(state.claims[0].owner, "vibrance in game");
-        assert_eq!(state.claims[0].value, Value::Int(100));
-        assert_eq!(state.world.app.unwrap().exe, "game.exe");
-    }
-
-    /// A fade that names no start begins from the actuator's resting value,
-    /// on the engine's copy only: the rules as authored keep saying nothing.
-    #[test]
-    fn a_fade_with_no_start_is_given_the_actuators_rest() {
-        let source = r#"
-[[rule]]
-name = "night"
-when.between = "20:00-07:00"
-set.display.color_temp = 3200
-transition.duration = "40m"
-"#;
-        let h = host();
-        let authored = parse_rules(source).expect("test rules parse");
-        assert!(authored[0].transition.as_ref().unwrap().from.is_empty());
-
-        let running = resting(&h, authored.clone());
-        assert_eq!(
-            running[0].transition.as_ref().unwrap().from,
-            vec![Assign {
-                cap: CapabilityId::new(TEMP),
-                value: Value::Int(6500),
-            }]
+    fn plugin_timers_ride_one_host_timer() {
+        let mut host = host();
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "t",
+                "local n = 0
+                 return { start = function(cx)
+                   cx:every(5000, function(cx) n = n + 1 cx:publish({ n = n }) end)
+                 end }",
+            )],
         );
-        assert!(authored[0].transition.as_ref().unwrap().from.is_empty());
+        sup.start(&mut host);
+        assert!(host
+            .timers
+            .iter()
+            .any(|(id, after, _)| *id == PLUGIN_TIMER && after.as_millis() == 5000));
+        host.now_ms += 5000;
+        sup.handle(&mut host, Event::TimerFired { id: PLUGIN_TIMER });
+        assert_eq!(sup.plugins()[0].state["n"].as_f64(), Some(1.0));
+        assert_eq!(
+            host.timers
+                .iter()
+                .filter(|(id, ..)| *id == PLUGIN_TIMER)
+                .count(),
+            2,
+            "armed again for the next one"
+        );
+    }
+
+    #[test]
+    fn hotkeys_are_registered_and_pressed() {
+        let mut host = host();
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "k",
+                "return { start = function(cx) cx:hotkey('ctrl+alt+k', function(cx) cx:type('x') end) end }",
+            )],
+        );
+        sup.start(&mut host);
+        assert_eq!(host.hotkeys.len(), 1);
+        let id = host.hotkeys[0].id;
+        sup.handle(&mut host, Event::Hotkey { id });
+        assert_eq!(host.desktop, vec!["type x".to_owned()]);
+        sup.shutdown(&mut host);
+        assert!(host.hotkeys.is_empty());
+    }
+
+    #[test]
+    fn shutting_down_restores_at_once() {
+        let mut host = host();
+        let mut sup = supervisor(&host, vec![plugin("game", GAME)]);
+        sup.start(&mut host);
+        sup.handle(&mut host, focus("game.exe"));
+        sup.handle(&mut host, Event::Shutdown);
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
+        assert!(!host.active);
+    }
+
+    #[test]
+    fn a_preview_eases_back_to_what_was_there() {
+        let mut host = host();
+        let mut sup = supervisor(&host, Vec::new());
+        sup.start(&mut host);
+        let cap = CapabilityId::new(ids::DISPLAY_VIBRANCE);
+        sup.preview(&mut host, &cap, Value::Int(90)).unwrap();
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(90)));
+        sup.preview_end(&mut host, &cap).unwrap();
+        for _ in 0..60 {
+            host.now_ms += 40;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
+    }
+
+    #[test]
+    fn setting_what_the_machine_lacks_is_a_sentence() {
+        let mut host = host();
+        let mut sup = supervisor(&host, Vec::new());
+        let err = sup
+            .manual_set(&mut host, &CapabilityId::new("display.mode"), Value::Int(1))
+            .unwrap_err();
+        assert!(err.contains("display.mode"), "{err}");
+    }
+
+    #[test]
+    fn a_builtin_cannot_be_removed() {
+        let mut host = host();
+        let runtime = Runtime::new(cortisoff_runtime::builtin(), &Store::in_memory(), None);
+        let mut sup = Supervisor::new(
+            host.probe(),
+            MemJournal::new(Trace::default()),
+            Interference::clear(),
+            runtime,
+            Store::in_memory(),
+        );
+        sup.start(&mut host);
+        assert!(sup
+            .remove(&mut host, "night-light")
+            .unwrap_err()
+            .contains("built in"));
     }
 }

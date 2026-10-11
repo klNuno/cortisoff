@@ -1,13 +1,7 @@
-//! The state rules see, and the signal mask that keeps evaluation cheap.
-//!
-//! Rules are not written against events, they are written against a world. A
-//! rule is a predicate: while it holds, the rule owns its claims; the moment it
-//! stops holding, the claims are released. That is what makes "quit the game and
-//! everything goes back" fall out of the design instead of being a feature.
-//!
-//! The alternative, running a handler per event, forces every rule author to
-//! write the undo path by hand and to get it right on every exit path including
-//! a crash. Nobody does.
+//! What the platform has said so far, folded into one value: the focused
+//! application, idle, lock, power, sound and the clock. Plugins read it
+//! through `cx:world()`, the window shows it, and the signal mask says which
+//! part an event moved so only the plugins watching that part are woken.
 
 use cortisoff_host::{AppRef, Event};
 
@@ -15,7 +9,7 @@ use cortisoff_host::{AppRef, Event};
 ///
 /// `SetWinEventHook` fires on far more than an application switch, so an event
 /// that changes nothing must cost nothing, and an event that changes the focused
-/// application must not re-evaluate the rules that only watch the battery.
+/// application must not wake the plugins that only watch the battery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Signals(u16);
 
@@ -61,7 +55,7 @@ pub struct World {
     /// magnification backend.
     pub fullscreen: bool,
     /// The focused window fills its monitor: maximised, borderless or
-    /// exclusive fullscreen. The condition a rule means by "an app is
+    /// exclusive fullscreen. What a person means by "an app is
     /// fullscreen", while `fullscreen` above is the exclusive case only.
     pub maximized: bool,
     pub idle: bool,
@@ -148,6 +142,7 @@ impl World {
             Event::DisplayConfigChanged
             | Event::Reapply { .. }
             | Event::TimerFired { .. }
+            | Event::Hotkey { .. }
             | Event::Shutdown => None,
         }
     }

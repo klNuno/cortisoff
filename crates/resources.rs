@@ -14,7 +14,7 @@ fn embed(binary: &str, description: &str) {
     #[cfg(windows)]
     {
         let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        let icon = dir.join("../../app/src-tauri/icons/icon.ico");
+        let icon = dir.join("../../assets/icon.ico");
         println!("cargo:rerun-if-changed={}", icon.display());
         let version = std::env::var("CARGO_PKG_VERSION").unwrap();
         let mut parts = version

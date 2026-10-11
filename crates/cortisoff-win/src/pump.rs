@@ -9,13 +9,14 @@
 use std::time::Duration;
 
 use cortisoff_host::{
-    ids, Actuator, ActuatorError, CapabilityId, CapabilitySet, Event, Host, TimerId,
+    ids, Actuator, ActuatorError, CapabilityId, CapabilitySet, Chord, Event, Host, Hotkey, TimerId,
+    WindowAction, WindowInfo,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::HPOWERNOTIFY;
-use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount, GetTickCount64};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::Shell::{
@@ -29,8 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::Audio;
 use crate::colortemp::ColorTemp;
+use crate::hotkeys::Hotkeys;
 use crate::mode::DisplayMode;
 use crate::names::Names;
+use crate::notice::Notice;
 use crate::sources::{self, Raw};
 use crate::tray::{self, Tray};
 use crate::vibrance::Vibrance;
@@ -39,7 +42,7 @@ use crate::wallpaper::Wallpaper;
 /// The wall clock, local, as year, month, day, hour, minute, second and
 /// millisecond.
 ///
-/// The one reading in the project: the rule engine's clock events and the
+/// The one reading in the project: the plugins' clock events and the
 /// daemon's log both come through here, so they never disagree about the hour
 /// across a daylight-saving change.
 pub fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
@@ -59,6 +62,11 @@ pub fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
 const IDLE_TIMER: usize = 0x0100_0000;
 const AUDIO_TIMER: usize = 0x0100_0001;
 const DISPLAY_TIMER: usize = 0x0100_0002;
+const NOTICE_TIMER: usize = 0x0100_0003;
+
+/// How long the notification-only icon stays when Windows never says its
+/// balloon is done, which it does not for one shown during quiet hours.
+const NOTICE_LINGER: Duration = Duration::from_secs(30);
 
 /// When a display change is pushed again, counted from the message that
 /// announced it.
@@ -67,7 +75,7 @@ const DISPLAY_TIMER: usize = 0x0100_0002;
 /// written inside that window is accepted and then dropped when the driver
 /// finishes reprogramming the output, which is what made switching a monitor
 /// off and on look like cortisoff had quit: the ramp went back to neutral and
-/// nothing asked for it again until the rule's next edge, hours later. So the
+/// nothing asked for it again until the plugin's next claim, hours later. So the
 /// answer is pushed again as the configuration settles. Three extra applies
 /// per display change cost a few ramp writes and nothing else.
 const SETTLE: [Duration; 3] = [
@@ -83,7 +91,7 @@ const ENGINE_TIMER_BASE: usize = 1;
 /// so this is a poll, one of the two in the whole daemon.
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// How often `audio.active` is read while a rule reads it. A meter has no
+/// How often `audio.active` is read while a plugin watches it. A meter has no
 /// event, and a film starting is not a frame deadline.
 const AUDIO_EVERY: Duration = Duration::from_secs(30);
 
@@ -107,11 +115,14 @@ pub struct WinHost {
     names: Names,
     audio: Audio,
     tray: Option<Tray>,
+    hotkeys: Hotkeys,
+    /// The icon a notification comes from when there is no tray icon.
+    notice: Option<Notice>,
     color_temp: Option<ColorTemp>,
     vibrance: Option<Vibrance>,
     display_mode: Option<DisplayMode>,
     wallpaper: Option<Wallpaper>,
-    /// The first poll answers with a snapshot: rules are predicates over a
+    /// The first poll answers with a snapshot: plugins decide from the
     /// world, so they need the world before they can mean anything.
     snapshot_sent: bool,
     /// How far through [`SETTLE`] the current display change is. `None`
@@ -174,6 +185,8 @@ impl WinHost {
             names: Names::default(),
             audio: Audio::new(),
             tray: None,
+            hotkeys: Hotkeys::new(window),
+            notice: None,
             color_temp: ColorTemp::new(),
             vibrance: Vibrance::new(),
             display_mode: DisplayMode::new(),
@@ -201,22 +214,22 @@ impl WinHost {
                     .to_owned(),
             );
         }
-        // Only when it would surprise someone writing a rule. Every NVIDIA
+        // Only when it would surprise someone writing a plugin. Every NVIDIA
         // driver seen so far reports 0 to 100 with 50 as neutral, and saying
         // so every time would be noise.
         if let Some((min, max, default)) = self.vibrance.as_ref().and_then(Vibrance::range) {
             if (min, max, default) != (0, 100, 50) {
                 out.push(format!(
-                    "this driver reports vibrance from {min} to {max}, neutral at {default}, not the usual 0 to 100. a rule's value is clamped to that range"
+                    "this driver reports vibrance from {min} to {max}, neutral at {default}, not the usual 0 to 100. a claimed value is clamped to that range"
                 ));
             }
         }
         out
     }
 
-    /// How long without input counts as away. The rule format says `idle =
-    /// true`, not a duration, so the threshold is the host's and it is the
-    /// same for every rule.
+    /// How long without input sets the world's `idle` flag. A plugin wanting
+    /// its own delay passes `after` to `cx:watch("user.idle")`, which reaches
+    /// `set_idle_thresholds`; this is the default for every other plugin.
     pub fn idle_after(mut self, after: Duration) -> Self {
         self.idle_after = after;
         self
@@ -314,8 +327,8 @@ impl WinHost {
         Some(Event::Maximized { maximized })
     }
 
-    /// Everything a rule could already be true about, pushed before the first
-    /// real event so no rule fires on a half-known world.
+    /// Everything a plugin could already be told about, pushed before the first
+    /// real event so no plugin acts on a half-known world.
     fn snapshot(&mut self) -> Vec<Event> {
         self.fullscreen = self.fullscreen_now();
         let idle_event = self.sample_idle();
@@ -416,6 +429,10 @@ impl WinHost {
                 self.audio_active = active;
                 vec![Event::AudioActive { active }]
             }
+            Raw::Timer(NOTICE_TIMER) => {
+                self.drop_notice();
+                Vec::new()
+            }
             // The engine's own timer. It asked for a schedule edge or a fade
             // step. Send the time for schedules and the id for previews. It asked
             // once, and a Win32 timer repeats until killed: left alone, the
@@ -447,7 +464,47 @@ impl WinHost {
                 }
                 Vec::new()
             }
+            Raw::Hotkey(id) => self
+                .hotkeys
+                .pressed(id)
+                .map(|id| Event::Hotkey { id })
+                .into_iter()
+                .collect(),
+            Raw::NoticeDone => {
+                if self.notice.as_mut().is_some_and(Notice::finished) {
+                    self.drop_notice();
+                }
+                Vec::new()
+            }
         }
+    }
+
+    /// A balloon from the tray icon when there is one, from an icon added
+    /// for the purpose otherwise.
+    fn show_notice(&mut self, title: &str, body: &str) -> Result<(), String> {
+        if let Some(tray) = &self.tray {
+            return tray.notify(title, body);
+        }
+        let mut notice = match self.notice.take() {
+            Some(notice) => notice,
+            None => Notice::add(self.window)?,
+        };
+        let shown = notice.show(title, body);
+        if shown.is_err() && notice.idle() {
+            drop(notice);
+            self.drop_notice();
+            return shown;
+        }
+        self.notice = Some(notice);
+        // Rearmed by every balloon, so the icon outlives the last one.
+        let ms = NOTICE_LINGER.as_millis() as u32;
+        unsafe { SetCoalescableTimer(self.window, NOTICE_TIMER, ms, None, ms / 10) };
+        shown
+    }
+
+    fn drop_notice(&mut self) {
+        self.notice = None;
+        let _ = unsafe { KillTimer(self.window, NOTICE_TIMER) };
     }
 
     fn tray_menu(&self, x: i32, y: i32) {
@@ -480,6 +537,15 @@ impl WinHost {
 }
 
 impl Host for WinHost {
+    fn monotonic_ms(&self) -> u64 {
+        // SAFETY: no argument, no failure mode.
+        unsafe { GetTickCount64() }
+    }
+
+    fn waker(&self) -> Option<cortisoff_host::Waker> {
+        Some(std::sync::Arc::new(crate::pipe::wake))
+    }
+
     fn set_idle_thresholds(&mut self, seconds: &[u32]) {
         self.idle_thresholds = seconds.to_vec();
         self.idle_thresholds
@@ -560,13 +626,13 @@ impl Host for WinHost {
         }
     }
 
-    /// Only what some rule reads. An installed hook costs on every system-wide
-    /// event, so a rule set that never mentions the focused application must
+    /// Only what some plugin watches. An installed hook costs on every system-wide
+    /// event, so a plugin set that never watches the focused application must
     /// not install the foreground hook at all.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {
         let asked = |id: &str| wanted.iter().any(|c| c.as_str() == id);
 
-        // A rule reading only whether something is maximised still needs to
+        // A plugin reading only whether something is maximised still needs to
         // know when the focus moves to a window that is, so the foreground
         // hook serves both.
         let foreground = asked(ids::APP_FOCUS) || asked(ids::APP_MAXIMIZED);
@@ -682,6 +748,38 @@ impl Host for WinHost {
         Some(self.clock())
     }
 
+    fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        self.hotkeys.set(wanted)
+    }
+
+    fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {
+        crate::input::send_chord(chord)
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), String> {
+        crate::input::type_text(text)
+    }
+
+    fn notify(&mut self, title: &str, body: &str) -> Result<(), String> {
+        self.show_notice(title, body)
+    }
+
+    fn clipboard(&self) -> Result<String, String> {
+        crate::clipboard::read(self.window)
+    }
+
+    fn set_clipboard(&mut self, text: &str) -> Result<(), String> {
+        crate::clipboard::write(self.window, text)
+    }
+
+    fn windows(&self) -> Vec<WindowInfo> {
+        crate::toplevel::list()
+    }
+
+    fn window_action(&mut self, id: u64, action: WindowAction) -> Result<(), String> {
+        crate::toplevel::act(id, action)
+    }
+
     fn poll(&mut self, timeout: Duration) -> Vec<Event> {
         if !self.snapshot_sent {
             self.snapshot_sent = true;
@@ -717,6 +815,9 @@ impl Drop for WinHost {
         // Before the window goes, or the icon lingers until a mouse passes
         // over it.
         self.tray = None;
+        self.drop_notice();
+        // Also tied to the window, and unregistered while it still exists.
+        self.hotkeys.clear();
         if let Some(hook) = self.foreground_hook.take() {
             sources::unhook_foreground(hook);
         }

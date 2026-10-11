@@ -1,7 +1,7 @@
 //! The Windows implementation of [`cortisoff_host::Host`].
 //!
 //! Everything Windows-specific in the project lives under here, and nothing
-//! here knows what a rule is. The crate compiles to nothing on other
+//! here knows what a plugin is. The crate compiles to nothing on other
 //! platforms, so `cargo check --workspace --target x86_64-unknown-linux-gnu`
 //! stays the proof that the core is portable.
 
@@ -9,13 +9,18 @@
 
 mod audio;
 pub mod autostart;
+mod clipboard;
 mod color;
 mod colortemp;
 mod console;
 mod ddc;
+mod hotkeys;
+mod input;
+mod keymap;
 mod maximized;
 mod mode;
 mod names;
+mod notice;
 mod nvapi;
 mod pipe;
 mod power;
@@ -24,6 +29,7 @@ mod pump;
 mod screen;
 mod sources;
 mod startup;
+mod toplevel;
 mod tray;
 mod vibrance;
 mod wallpaper;

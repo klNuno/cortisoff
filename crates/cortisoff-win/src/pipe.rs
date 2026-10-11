@@ -47,7 +47,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
-/// Room for a doctor report on a machine with many rules, and small enough
+/// Room for a doctor report on a machine with many plugins, and small enough
 /// that a client cannot make the daemon allocate anything interesting.
 const BUFFER: u32 = 64 * 1024;
 
@@ -63,6 +63,13 @@ pub(crate) fn arrived() -> Option<HANDLE> {
         unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_or(0, |h| h.0 as usize)
     });
     (address != 0).then_some(HANDLE(address as *mut c_void))
+}
+
+/// Wake the daemon's pump from any thread, the same way a pipe handover does.
+pub(crate) fn wake() {
+    if let Some(event) = arrived() {
+        let _ = unsafe { SetEvent(event) };
+    }
 }
 
 /// Hand one item to the daemon's loop and wake it.
@@ -576,7 +583,7 @@ pub fn ask(
     request: cortisoff_ipc::Request,
 ) -> Result<cortisoff_ipc::Response, String> {
     connect(session)
-        .ok_or_else(|| "no daemon is listening on this session. start cortisoffd first".to_owned())?
+        .ok_or_else(|| "cortisoff is not running in this session".to_owned())?
         .ask(request)
 }
 

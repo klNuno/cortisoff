@@ -13,124 +13,137 @@
 //! when the apply fails. `show` stops after the capture: HDR per output and
 //! the panel gains DDC/CI answered with, and nothing written anywhere.
 
-use std::time::Duration;
-
-use cortisoff_host::{ids, CapabilityId, Host, Value};
-use cortisoff_win::WinHost;
-
+#[cfg(not(windows))]
 fn main() {
-    let first = std::env::args().nth(1);
-    let show = first.as_deref() == Some("show");
-    let kelvin: i64 = first.and_then(|s| s.parse().ok()).unwrap_or(3400);
-    let hold = Duration::from_secs(
-        std::env::args()
-            .nth(2)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6),
-    );
+    eprintln!("this example drives Windows APIs and runs on Windows only");
+}
 
-    let host = match WinHost::new() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("no host: {e}");
-            std::process::exit(1);
-        }
-    };
-    for warning in host.warnings() {
-        println!("warning: {warning}");
-    }
+#[cfg(windows)]
+fn main() {
+    imp::main();
+}
 
-    let cap = CapabilityId::new(ids::DISPLAY_COLOR_TEMP);
-    let Some(actuator) = host.actuator(&cap) else {
-        eprintln!("display.color_temp is not available on this machine");
-        std::process::exit(1);
-    };
+#[cfg(windows)]
+mod imp {
+    use std::time::Duration;
 
-    let baseline = match actuator.capture() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("capture failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    let encoded = match &baseline {
-        Value::Text(s) => s.clone(),
-        other => {
-            eprintln!("the baseline should be text, got {other:?}");
-            std::process::exit(1);
-        }
-    };
-    println!("baseline captured, {} bytes", encoded.len());
-    if show {
-        for output in cortisoff_win::hdr_outputs() {
-            let hdr = match (output.supported, output.enabled) {
-                (_, true) => "HDR on",
-                (true, false) => "HDR supported, off",
-                (false, false) => "no HDR",
-            };
-            println!("  {}: {hdr}", output.device);
-        }
-        let panels: Vec<&str> = encoded
-            .split(';')
-            .filter_map(|entry| entry.strip_prefix("ddc:"))
-            .collect();
-        if panels.is_empty() {
-            println!("  no panel answered DDC/CI, or no output can turn HDR on");
-        }
-        for panel in panels {
-            println!("  panel {panel}, min/current/max for red, green, blue");
-        }
-        return;
-    }
+    use cortisoff_host::{ids, CapabilityId, Host, Value};
+    use cortisoff_win::WinHost;
 
-    match actuator.apply(&Value::Int(kelvin)) {
-        Ok(()) => println!("applied {kelvin} K, holding {} s", hold.as_secs()),
-        Err(e) => eprintln!("apply failed: {e}"),
-    }
-    std::thread::sleep(hold);
+    pub fn main() {
+        let first = std::env::args().nth(1);
+        let show = first.as_deref() == Some("show");
+        let kelvin: i64 = first.and_then(|s| s.parse().ok()).unwrap_or(3400);
+        let hold = Duration::from_secs(
+            std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6),
+        );
 
-    match actuator.apply(&baseline) {
-        Ok(()) => println!("baseline restored"),
-        Err(e) => eprintln!("restore failed: {e}"),
-    }
-
-    match actuator.capture() {
-        Ok(Value::Text(after)) if after == encoded => println!("round trip exact"),
-        Ok(Value::Text(after)) => {
-            println!("RAMP DID NOT COME BACK: {} bytes now", after.len());
-            for (device, before, now) in diff(&encoded, &after) {
-                println!("  {device}: {before} -> {now}");
+        let host = match WinHost::new() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("no host: {e}");
+                std::process::exit(1);
             }
+        };
+        for warning in host.warnings() {
+            println!("warning: {warning}");
         }
-        Ok(other) => println!("unexpected recapture: {other:?}"),
-        Err(e) => println!("recapture failed: {e}"),
+
+        let cap = CapabilityId::new(ids::DISPLAY_COLOR_TEMP);
+        let Some(actuator) = host.actuator(&cap) else {
+            eprintln!("display.color_temp is not available on this machine");
+            std::process::exit(1);
+        };
+
+        let baseline = match actuator.capture() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("capture failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let encoded = match &baseline {
+            Value::Text(s) => s.clone(),
+            other => {
+                eprintln!("the baseline should be text, got {other:?}");
+                std::process::exit(1);
+            }
+        };
+        println!("baseline captured, {} bytes", encoded.len());
+        if show {
+            for output in cortisoff_win::hdr_outputs() {
+                let hdr = match (output.supported, output.enabled) {
+                    (_, true) => "HDR on",
+                    (true, false) => "HDR supported, off",
+                    (false, false) => "no HDR",
+                };
+                println!("  {}: {hdr}", output.device);
+            }
+            let panels: Vec<&str> = encoded
+                .split(';')
+                .filter_map(|entry| entry.strip_prefix("ddc:"))
+                .collect();
+            if panels.is_empty() {
+                println!("  no panel answered DDC/CI, or no output can turn HDR on");
+            }
+            for panel in panels {
+                println!("  panel {panel}, min/current/max for red, green, blue");
+            }
+            return;
+        }
+
+        match actuator.apply(&Value::Int(kelvin)) {
+            Ok(()) => println!("applied {kelvin} K, holding {} s", hold.as_secs()),
+            Err(e) => eprintln!("apply failed: {e}"),
+        }
+        std::thread::sleep(hold);
+
+        match actuator.apply(&baseline) {
+            Ok(()) => println!("baseline restored"),
+            Err(e) => eprintln!("restore failed: {e}"),
+        }
+
+        match actuator.capture() {
+            Ok(Value::Text(after)) if after == encoded => println!("round trip exact"),
+            Ok(Value::Text(after)) => {
+                println!("RAMP DID NOT COME BACK: {} bytes now", after.len());
+                for (device, before, now) in diff(&encoded, &after) {
+                    println!("  {device}: {before} -> {now}");
+                }
+            }
+            Ok(other) => println!("unexpected recapture: {other:?}"),
+            Err(e) => println!("recapture failed: {e}"),
+        }
     }
-}
 
-/// First differing entry per device, so a mismatch says which monitor and
-/// where in the ramp rather than dumping 768 numbers.
-fn diff(before: &str, after: &str) -> Vec<(String, String, String)> {
-    let now: Vec<(String, String)> = split(after);
-    split(before)
-        .into_iter()
-        .filter_map(|(device, was)| {
-            let is = now.iter().find(|(d, _)| *d == device)?;
-            (is.1 != was).then(|| (device, short(&was), short(&is.1)))
-        })
-        .collect()
-}
+    /// First differing entry per device, so a mismatch says which monitor and
+    /// where in the ramp rather than dumping 768 numbers.
+    fn diff(before: &str, after: &str) -> Vec<(String, String, String)> {
+        let now: Vec<(String, String)> = split(after);
+        split(before)
+            .into_iter()
+            .filter_map(|(device, was)| {
+                let is = now.iter().find(|(d, _)| *d == device)?;
+                (is.1 != was).then(|| (device, short(&was), short(&is.1)))
+            })
+            .collect()
+    }
 
-fn split(encoded: &str) -> Vec<(String, String)> {
-    encoded
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .filter_map(|entry| {
-            let (name, hex) = entry.split_once('=')?;
-            Some((name.to_string(), hex.to_string()))
-        })
-        .collect()
-}
+    fn split(encoded: &str) -> Vec<(String, String)> {
+        encoded
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .filter_map(|entry| {
+                let (name, hex) = entry.split_once('=')?;
+                Some((name.to_string(), hex.to_string()))
+            })
+            .collect()
+    }
 
-fn short(hex: &str) -> String {
-    hex.chars().take(16).collect()
+    fn short(hex: &str) -> String {
+        hex.chars().take(16).collect()
+    }
 }

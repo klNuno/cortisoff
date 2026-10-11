@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cortisoff"
+name = "cortisoff-cli"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,6 +19,9 @@ serde_json = { workspace = true }
 # The client half of the transport. Everything above the bytes is shared.
 [target.'cfg(windows)'.dependencies]
 cortisoff-win = { path = "../cortisoff-win" }
+
+[target.'cfg(unix)'.dependencies]
+cortisoff-unix = { path = "../cortisoff-unix" }
 
 # Names the executable in the taskbar and Task Manager, see ../resources.rs.
 [target.'cfg(windows)'.build-dependencies]

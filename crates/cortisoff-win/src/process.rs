@@ -40,19 +40,16 @@ pub fn claim_session() -> Option<InstanceLock> {
 ///
 /// The dashboard is a window on the daemon and two of them would both be
 /// right, so the second launch is never what the person clicking wanted.
-/// `tauri-plugin-single-instance` was meant to do this and fell through on
-/// the installed build: its mutex was held but its hidden window was never
-/// found, and the plugin then carries on as a second instance. A mutex taken
-/// before Tauri starts cannot fall through.
 pub fn claim_dashboard() -> Option<InstanceLock> {
     claim("cortisoff-dashboard")
 }
 
 /// Bring the open dashboard to the front, for the launch that lost the claim.
 /// The person double-clicked the icon, so the window they asked for is the
-/// one that comes up. `false` when no dashboard window is found.
+/// one that comes up. `false` when no dashboard window is found. The class
+/// is winit's default, and the title is the one the app sets.
 pub fn raise_dashboard() -> bool {
-    let Ok(hwnd) = (unsafe { FindWindowW(w!("Tauri Window"), w!("cortisoff")) }) else {
+    let Ok(hwnd) = (unsafe { FindWindowW(w!("Window Class"), w!("cortisoff")) }) else {
         return false;
     };
     if hwnd.is_invalid() {

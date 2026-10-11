@@ -1,6 +1,6 @@
 //! `audio.active`: is something audible playing on the default output.
 //!
-//! Polled, and only on a slow beat while a rule reads it. Windows does offer
+//! Polled, and only on a slow beat while a plugin watches it. Windows does offer
 //! per-session state callbacks, but a session being "active" is not the same
 //! thing as sound: Discord and Steam hold an active session all day in
 //! silence. What answers the real question is the session's peak meter, and a

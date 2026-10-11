@@ -1,0 +1,31 @@
+[package]
+name = "cortisoff-linux"
+description = "The Linux half: an X11 host, its event sources, the RandR actuators and the desktop services."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortisoff-host = { path = "../cortisoff-host" }
+
+# Only on Linux, so the crate compiles to nothing on Windows and the
+# workspace check there never pulls an X11 stack. No C library is linked at
+# build time: x11rb speaks the protocol over the socket itself and rustix
+# makes its system calls directly.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", default-features = false, features = [
+    "randr",
+    "screensaver",
+    "xinput",
+    "xtest",
+] }
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "event",
+    "param",
+    "pipe",
+    "time",
+] }
+# `localtime_r` only. rustix has no time zone database access.
+libc = "0.2"

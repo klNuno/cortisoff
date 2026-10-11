@@ -1,0 +1,6 @@
+id = "shortcuts"
+name = "Shortcuts"
+version = "0.1.0"
+description = "Global key chords that run programs, type text, press keys or move windows."
+icon = "bolt"
+platforms = ["windows", "linux", "macos"]

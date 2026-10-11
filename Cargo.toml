@@ -4,9 +4,16 @@ members = [
     "crates/cortisoff-host",
     "crates/cortisoff-core",
     "crates/cortisoff-ipc",
+    "crates/cortisoff-runtime",
     "crates/cortisoff-daemon",
     "crates/cortisoff-win",
+    "crates/cortisoff-unix",
+    "crates/cortisoff-mac",
     "crates/cortisoff-cli",
+    "crates/cortisoff-ui",
+    "crates/cortisoff-app",
+    "crates/cortisoff-update",
+    "crates/cortisoff-linux",
 ]
 # probe/ is the T0 throwaway. It links Win32 directly and must never become a
 # workspace member, or `cargo test` stops running on non-Windows machines.
@@ -20,7 +27,7 @@ repository = "https://github.com/klNuno/cortisoff"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-# Rule files only. Pure Rust, no OS call, so the core stays portable.
+# Plugin manifests (`plugin.toml`) only. Pure Rust, no OS call, so the core stays portable.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 

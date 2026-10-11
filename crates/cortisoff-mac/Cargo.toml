@@ -1,0 +1,86 @@
+[package]
+name = "cortisoff-mac"
+description = "The macOS half: the CFRunLoop host, its event sources and its actuators."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cortisoff-host = { path = "../cortisoff-host" }
+
+# Only on macOS, so the crate compiles to nothing anywhere else and
+# `cargo check --workspace` stays clean on Windows and Linux. Features are
+# picked one by one: the defaults pull in every framework header and triple
+# the check time of a crate that uses a dozen calls.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "block2",
+    "NSArray",
+    "NSDate",
+    "NSDistributedNotificationCenter",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSOperation",
+    "NSString",
+    "NSTimeZone",
+    "NSURL",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "libc",
+    "NSPasteboard",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSWorkspace",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-core-foundation]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "CFArray",
+    "CFCGTypes",
+    "CFDate",
+    "CFDictionary",
+    "CFNumber",
+    "CFRunLoop",
+    "CFString",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-core-graphics]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGGeometry",
+    "CGRemoteOperation",
+    "CGSession",
+    "CGWindow",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-io-kit]
+version = "0.3"
+default-features = false
+features = ["std", "ps"]

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cortisoff_host::{CapabilityId, CapabilitySet, Event, Host, JournalStore};
+use cortisoff_host::{CapabilityId, Host, JournalStore};
 use cortisoff_ipc::{Frame, Request, RequestId, Response};
 
 use crate::supervisor::Supervisor;
@@ -68,7 +68,7 @@ impl<J: JournalStore> Server<J> {
 
     /// Everything that has happened since the last call, for the daemon's own
     /// log. Independent of the subscriber list on purpose: a user watching
-    /// `cortisoffd` in a terminal and a user running `cortisoff trace` are
+    /// `cortisoff --daemon` in a terminal and a user running `cortisoff-cli trace` are
     /// both entitled to the whole stream.
     pub fn drain_log(&mut self) -> Vec<cortisoff_ipc::Notification> {
         std::mem::take(&mut self.log)
@@ -95,7 +95,6 @@ impl<J: JournalStore> Server<J> {
         client: ClientId,
         frame: Frame,
         host: &mut dyn Host,
-        probed: &CapabilitySet,
     ) -> Vec<Outbound> {
         let (id, request) = match frame {
             Frame::Request { id, request } => (id, request),
@@ -117,20 +116,25 @@ impl<J: JournalStore> Server<J> {
             }
         };
 
-        let response = self.answer(client, request, host, probed);
+        let response = self.answer(client, request, host);
         let mut out = vec![self.reply(client, id, response)];
         out.extend(self.fan_out());
         out
     }
 
     /// One turn of the daemon's loop: wait on the platform, feed whatever
-    /// arrived to the rules, and hand back what subscribers should see.
+    /// arrived to the plugins, and hand back what subscribers should see.
     ///
     /// The platform's binary calls this and writes the result to its
     /// transport. That is the whole loop, which is the point: everything
     /// deciding anything is above this line and is tested without an OS.
     pub fn pump(&mut self, host: &mut dyn Host, timeout: std::time::Duration) -> Vec<Outbound> {
-        for event in host.poll(timeout) {
+        let events = host.poll(timeout);
+        if events.is_empty() {
+            // Woken with nothing to say: an HTTP answer a plugin waits for.
+            self.supervisor.idle_turn(host);
+        }
+        for event in events {
             self.supervisor.handle(host, event);
         }
         self.fan_out()
@@ -161,16 +165,15 @@ impl<J: JournalStore> Server<J> {
         out
     }
 
-    fn answer(
-        &mut self,
-        client: ClientId,
-        request: Request,
-        host: &mut dyn Host,
-        probed: &CapabilitySet,
-    ) -> Response {
+    fn answer(&mut self, client: ClientId, request: Request, host: &mut dyn Host) -> Response {
+        let s = &mut self.supervisor;
+        let done = |r: Result<(), String>| match r {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::error(message),
+        };
         match request {
-            Request::Doctor => Response::Doctor(Box::new(self.supervisor.doctor(&*host, probed))),
-            Request::State => Response::State(Box::new(self.supervisor.state())),
+            Request::Doctor => Response::Doctor(Box::new(s.doctor(&*host))),
+            Request::State => Response::State(Box::new(s.state())),
             Request::Subscribe => {
                 self.subscribers.insert(client);
                 Response::Ok
@@ -179,15 +182,9 @@ impl<J: JournalStore> Server<J> {
                 self.subscribers.remove(&client);
                 Response::Ok
             }
-            Request::Set { cap, value } => match self.supervisor.manual_set(host, &cap, value) {
-                Ok(()) => Response::Ok,
-                Err(message) => Response::error(message),
-            },
-            Request::Clear { cap } => match self.supervisor.manual_clear(host, &cap) {
-                Ok(()) => Response::Ok,
-                Err(message) => Response::error(message),
-            },
-            Request::Preview { cap, value } => match self.supervisor.preview(host, &cap, value) {
+            Request::Set { cap, value } => done(s.manual_set(host, &cap, value)),
+            Request::Clear { cap } => done(s.manual_clear(host, &cap)),
+            Request::Preview { cap, value } => match s.preview(host, &cap, value) {
                 Ok(()) => {
                     self.previews.entry(client).or_default().insert(cap);
                     Response::Ok
@@ -198,32 +195,27 @@ impl<J: JournalStore> Server<J> {
                 if let Some(caps) = self.previews.get_mut(&client) {
                     caps.remove(&cap);
                 }
-                match self.supervisor.preview_end(host, &cap) {
-                    Ok(()) => Response::Ok,
-                    Err(message) => Response::error(message),
-                }
+                done(s.preview_end(host, &cap))
             }
-            Request::Rules => Response::Rules {
-                rules: self.supervisor.authored().to_vec(),
+            Request::Plugins => Response::Plugins {
+                plugins: s.plugins(),
             },
-            Request::SaveRules { rules } => match self.supervisor.save_rules(host, rules) {
-                Ok(()) => Response::Ok,
-                Err(message) => Response::error(message),
-            },
-            Request::Reload => match self.supervisor.reload(host) {
-                Ok(()) => Response::Ok,
-                // A rule file with a typo in it leaves the running rules
-                // exactly as they were. Losing your working configuration
-                // because of a missing bracket is not acceptable.
-                Err(message) => Response::error(message),
+            Request::Enable { id, enabled } => done(s.set_enabled(host, &id, enabled)),
+            Request::Settings { id, settings } => done(s.set_settings(host, &id, settings)),
+            Request::Message { id, name, data } => done(s.message(host, &id, &name, &data)),
+            Request::Rescan => done(s.rescan(host)),
+            Request::Link { path } => done(s.link(host, &path).map(|_| ())),
+            Request::Remove { id } => done(s.remove(host, &id)),
+            Request::Windows => Response::Windows {
+                windows: host.windows(),
             },
             Request::Shutdown => {
                 // Baselines go back here, not in the platform's exit path,
                 // because the platform's exit path is the one that does not
                 // run when something goes wrong.
-                self.supervisor.handle(host, Event::Shutdown);
+                s.shutdown(host);
+                s.note_closing();
                 self.stopping = true;
-                self.supervisor.note_closing();
                 Response::Ok
             }
         }
@@ -240,31 +232,34 @@ impl<J: JournalStore> Server<J> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::startup::Interference;
-    use cortisoff_core::{parse_rules, CapTable, Engine};
-    use cortisoff_host::mock::{MemJournal, MockHost, Trace};
-    use cortisoff_host::{ids, CapabilityId, Value};
+    use crate::supervisor::testing::{plugin, supervisor};
+    use cortisoff_core::FADE_TIMER;
+    use cortisoff_host::mock::{MemJournal, MockHost};
+    use cortisoff_host::{ids, AppRef, CapabilityId, Event, Value};
     use cortisoff_ipc::Notification;
 
-    const RULES: &str = r#"
-[[rule]]
-name = "vibrance in game"
-when.app = "game.exe"
-set.display.vibrance = 100
-"#;
+    const GAME: &str = "return {
+        start = function(cx) cx:watch('app.focus') end,
+        on = function(cx, s, ev)
+          if ev.kind ~= 'app.focus' then return end
+          if ev.exe == 'game.exe' then cx:claim('display.vibrance', 100, { priority = 100 })
+          else cx:release('display.vibrance') end
+        end,
+    }";
 
     fn setup() -> (Server<MemJournal>, MockHost) {
         let host = MockHost::new().with_actuator(ids::DISPLAY_VIBRANCE, Value::Int(50), false);
-        let engine = Engine::new(
-            CapTable::from_set(&host.probe()),
-            parse_rules(RULES).unwrap(),
-        );
-        let supervisor = Supervisor::new(
-            engine,
-            MemJournal::new(Trace::default()),
-            Interference::clear(),
-        );
-        (Server::new(supervisor), host)
+        let sup = supervisor(&host, vec![plugin("game", GAME)]);
+        (Server::new(sup), host)
+    }
+
+    fn focus(exe: &str) -> Event {
+        Event::AppFocus(AppRef {
+            exe: exe.to_owned(),
+            title: None,
+            pid: 1,
+            started_at_ms: 0,
+        })
     }
 
     fn request(id: u64, request: Request) -> Frame {
@@ -286,8 +281,7 @@ set.display.vibrance = 100
     #[test]
     fn a_response_carries_the_id_of_the_request_it_answers() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
-        let out = server.on_frame(ClientId(1), request(7, Request::State), &mut host, &probed);
+        let out = server.on_frame(ClientId(1), request(7, Request::State), &mut host);
         assert!(matches!(
             out[0].frame,
             Frame::Response {
@@ -298,60 +292,67 @@ set.display.vibrance = 100
     }
 
     #[test]
-    fn a_manual_override_beats_the_rule_underneath_and_gives_it_back_on_clear() {
+    fn a_manual_override_beats_the_plugin_and_gives_it_back_on_clear() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         let cap = CapabilityId::new(ids::DISPLAY_VIBRANCE);
-
         server.supervisor_mut().start(&mut host);
-        server.supervisor_mut().handle(
-            &mut host,
-            Event::AppFocus(cortisoff_host::AppRef {
-                exe: "game.exe".to_owned(),
-                title: None,
-                pid: 1,
-                started_at_ms: 0,
-            }),
-        );
+        server.supervisor_mut().handle(&mut host, focus("game.exe"));
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
 
         let set = Request::Set {
             cap: cap.clone(),
             value: Value::Int(10),
         };
-        let out = server.on_frame(ClientId(1), request(1, set), &mut host, &probed);
+        let out = server.on_frame(ClientId(1), request(1, set), &mut host);
         assert_eq!(responses(&out), vec![&Response::Ok]);
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(10)));
 
-        // The rule never stopped holding, so it takes the capability back
-        // rather than the screen falling all the way to its baseline.
-        let clear = Request::Clear { cap };
-        server.on_frame(ClientId(1), request(2, clear), &mut host, &probed);
+        server.on_frame(ClientId(1), request(2, Request::Clear { cap }), &mut host);
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
     }
 
     #[test]
     fn setting_a_capability_this_machine_lacks_is_a_sentence_not_a_panic() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         let set = Request::Set {
-            cap: CapabilityId::new("display.color_temp"),
+            cap: CapabilityId::new(ids::DISPLAY_COLOR_TEMP),
             value: Value::Int(3400),
         };
-        let out = server.on_frame(ClientId(1), request(1, set), &mut host, &probed);
+        let out = server.on_frame(ClientId(1), request(1, set), &mut host);
+        assert!(matches!(responses(&out)[0], Response::Error { .. }));
+    }
+
+    #[test]
+    fn plugins_are_listed_and_switched_over_the_wire() {
+        let (mut server, mut host) = setup();
+        server.supervisor_mut().start(&mut host);
+        let out = server.on_frame(ClientId(1), request(1, Request::Plugins), &mut host);
+        let Response::Plugins { plugins } = responses(&out)[0] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].running);
+
+        let off = Request::Enable {
+            id: "game".into(),
+            enabled: false,
+        };
+        let out = server.on_frame(ClientId(1), request(2, off), &mut host);
+        assert_eq!(responses(&out), vec![&Response::Ok]);
+        assert!(!server.supervisor().plugins()[0].running);
+
+        let wrong = Request::Enable {
+            id: "nope".into(),
+            enabled: true,
+        };
+        let out = server.on_frame(ClientId(1), request(3, wrong), &mut host);
         assert!(matches!(responses(&out)[0], Response::Error { .. }));
     }
 
     #[test]
     fn only_subscribers_are_sent_notifications() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Subscribe),
-            &mut host,
-            &probed,
-        );
+        server.on_frame(ClientId(1), request(1, Request::Subscribe), &mut host);
         server.supervisor_mut().drain();
 
         server.supervisor_mut().handle(
@@ -365,12 +366,7 @@ set.display.vibrance = 100
         assert!(!out.is_empty());
         assert!(out.iter().all(|o| o.to == ClientId(1)));
 
-        server.on_frame(
-            ClientId(1),
-            request(2, Request::Unsubscribe),
-            &mut host,
-            &probed,
-        );
+        server.on_frame(ClientId(1), request(2, Request::Unsubscribe), &mut host);
         server.supervisor_mut().handle(
             &mut host,
             Event::Idle {
@@ -381,17 +377,11 @@ set.display.vibrance = 100
         assert!(server.fan_out().is_empty());
     }
 
-    /// A closed terminal is how `cortisoff trace` normally ends.
+    /// A closed terminal is how `cortisoff-cli trace` normally ends.
     #[test]
     fn a_disconnected_subscriber_stops_being_written_to() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Subscribe),
-            &mut host,
-            &probed,
-        );
+        server.on_frame(ClientId(1), request(1, Request::Subscribe), &mut host);
         server.disconnect(ClientId(1), &mut host);
         server.supervisor_mut().handle(
             &mut host,
@@ -404,46 +394,15 @@ set.display.vibrance = 100
     }
 
     #[test]
-    fn shutting_down_restores_the_screen_before_the_loop_stops() {
+    fn shutting_down_restores_the_screen_and_says_so() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         server.supervisor_mut().start(&mut host);
-        server.supervisor_mut().handle(
-            &mut host,
-            Event::AppFocus(cortisoff_host::AppRef {
-                exe: "game.exe".to_owned(),
-                title: None,
-                pid: 1,
-                started_at_ms: 0,
-            }),
-        );
+        server.supervisor_mut().handle(&mut host, focus("game.exe"));
+        server.on_frame(ClientId(1), request(1, Request::Subscribe), &mut host);
 
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Shutdown),
-            &mut host,
-            &probed,
-        );
+        let out = server.on_frame(ClientId(1), request(2, Request::Shutdown), &mut host);
         assert!(server.stopping());
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
-    }
-
-    #[test]
-    fn a_subscriber_is_told_the_daemon_is_closing() {
-        let (mut server, mut host) = setup();
-        let probed = host.probe();
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Subscribe),
-            &mut host,
-            &probed,
-        );
-        let out = server.on_frame(
-            ClientId(1),
-            request(2, Request::Shutdown),
-            &mut host,
-            &probed,
-        );
         assert!(out.iter().any(|o| matches!(
             &o.frame,
             Frame::Notification {
@@ -454,30 +413,19 @@ set.display.vibrance = 100
 
     /// The daemon's whole loop, driven the way a platform drives it.
     #[test]
-    fn pumping_feeds_the_platform_queue_to_the_rules_and_the_subscribers() {
+    fn pumping_feeds_the_platform_queue_to_the_plugins_and_the_subscribers() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         server.supervisor_mut().start(&mut host);
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Subscribe),
-            &mut host,
-            &probed,
-        );
+        server.on_frame(ClientId(1), request(1, Request::Subscribe), &mut host);
+        server.fan_out();
 
-        host.queue(Event::AppFocus(cortisoff_host::AppRef {
-            exe: "game.exe".to_owned(),
-            title: None,
-            pid: 1,
-            started_at_ms: 0,
-        }));
+        host.queue(focus("game.exe"));
         let out = server.pump(&mut host, std::time::Duration::from_millis(0));
-
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
         assert!(out.iter().any(|o| matches!(
             &o.frame,
             Frame::Notification {
-                notification: Notification::RuleEdge { holding: true, .. }
+                notification: Notification::Action(_)
             }
         )));
     }
@@ -486,193 +434,52 @@ set.display.vibrance = 100
     #[test]
     fn pumping_with_nothing_to_report_produces_nothing() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         server.supervisor_mut().start(&mut host);
-        server.on_frame(
-            ClientId(1),
-            request(1, Request::Subscribe),
-            &mut host,
-            &probed,
-        );
+        server.on_frame(ClientId(1), request(1, Request::Subscribe), &mut host);
         server.fan_out();
         assert!(server
             .pump(&mut host, std::time::Duration::from_millis(0))
             .is_empty());
     }
 
-    /// A rule deleted from the file must not leave its value on the screen
-    /// with nothing owning it any more.
-    #[test]
-    fn reloading_drops_the_claims_of_a_rule_that_is_gone() {
-        let dir = std::env::temp_dir().join("cortisoff-reload-ok");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        std::fs::write(&file, RULES).unwrap();
-
-        let host = MockHost::new().with_actuator(ids::DISPLAY_VIBRANCE, Value::Int(50), false);
-        let probed = host.probe();
-        let engine = Engine::new(CapTable::from_set(&probed), parse_rules(RULES).unwrap());
-        let supervisor = Supervisor::new(
-            engine,
-            MemJournal::new(Trace::default()),
-            Interference::clear(),
-        )
-        .with_rules_path(&file);
-        let mut server = Server::new(supervisor);
-        let mut host = host;
-
-        server.supervisor_mut().start(&mut host);
-        server.supervisor_mut().handle(
-            &mut host,
-            Event::AppFocus(cortisoff_host::AppRef {
-                exe: "game.exe".to_owned(),
-                title: None,
-                pid: 1,
-                started_at_ms: 0,
-            }),
-        );
-        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
-
-        std::fs::write(&file, "").unwrap();
-        let out = server.on_frame(ClientId(1), request(1, Request::Reload), &mut host, &probed);
-        assert_eq!(responses(&out), vec![&Response::Ok]);
-        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Losing a working configuration to a missing bracket is not acceptable,
-    /// so a file that does not parse changes nothing.
-    #[test]
-    fn a_rule_file_that_does_not_parse_leaves_the_running_rules_alone() {
-        let dir = std::env::temp_dir().join("cortisoff-reload-broken");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rules.toml");
-        std::fs::write(&file, RULES).unwrap();
-
-        let host = MockHost::new().with_actuator(ids::DISPLAY_VIBRANCE, Value::Int(50), false);
-        let probed = host.probe();
-        let engine = Engine::new(CapTable::from_set(&probed), parse_rules(RULES).unwrap());
-        let supervisor = Supervisor::new(
-            engine,
-            MemJournal::new(Trace::default()),
-            Interference::clear(),
-        )
-        .with_rules_path(&file);
-        let mut server = Server::new(supervisor);
-        let mut host = host;
-
-        server.supervisor_mut().start(&mut host);
-        server.supervisor_mut().handle(
-            &mut host,
-            Event::AppFocus(cortisoff_host::AppRef {
-                exe: "game.exe".to_owned(),
-                title: None,
-                pid: 1,
-                started_at_ms: 0,
-            }),
-        );
-
-        std::fs::write(&file, "[[rule]]\nname = \"broken\"\nwhen.nonsense = true\n").unwrap();
-        let out = server.on_frame(ClientId(1), request(1, Request::Reload), &mut host, &probed);
-        assert!(matches!(responses(&out)[0], Response::Error { .. }));
-        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn a_client_sending_a_response_is_told_rather_than_dropped() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
         let frame = Frame::Response {
             id: RequestId(1),
             response: Response::Ok,
         };
-        let out = server.on_frame(ClientId(1), frame, &mut host, &probed);
+        let out = server.on_frame(ClientId(1), frame, &mut host);
         assert!(matches!(responses(&out)[0], Response::Error { .. }));
     }
 
-    /// A dashboard that dies mid-drag must not leave its preview on the
-    /// screen: the disconnect ends it, and the fade back starts.
+    /// A window that dies mid-drag must not leave its preview on the screen:
+    /// the disconnect ends it and the fade back runs to the end.
     #[test]
     fn a_client_that_disconnects_mid_drag_has_its_preview_ended() {
         let (mut server, mut host) = setup();
-        let probed = host.probe();
+        server.supervisor_mut().start(&mut host);
         let cap = CapabilityId::new(ids::DISPLAY_VIBRANCE);
-        server.on_frame(
-            ClientId(1),
-            request(
-                1,
-                Request::Preview {
-                    cap: cap.clone(),
-                    value: Value::Int(90),
-                },
-            ),
-            &mut host,
-            &probed,
-        );
+        let preview = Request::Preview {
+            cap,
+            value: Value::Int(90),
+        };
+        server.on_frame(ClientId(1), request(1, preview), &mut host);
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(90)));
 
         server.disconnect(ClientId(1), &mut host);
-        assert!(
-            host.timers
-                .iter()
-                .any(|(id, ..)| *id == cortisoff_core::PREVIEW_TIMER),
-            "the fade back asked for its first step"
-        );
-    }
-
-    /// The whole thing through the wire: drag, release, and a mock actuator
-    /// that ends up where it started once every step has run.
-    #[test]
-    fn a_preview_fades_back_to_the_actuator_rest_over_the_wire() {
-        let (mut server, mut host) = setup();
-        let probed = host.probe();
-        let cap = CapabilityId::new(ids::DISPLAY_VIBRANCE);
-        server.on_frame(
-            ClientId(1),
-            request(
-                1,
-                Request::Preview {
-                    cap: cap.clone(),
-                    value: Value::Int(100),
-                },
-            ),
-            &mut host,
-            &probed,
-        );
-        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
-        let out = server.on_frame(
-            ClientId(1),
-            request(2, Request::PreviewEnd { cap: cap.clone() }),
-            &mut host,
-            &probed,
-        );
-        assert_eq!(responses(&out)[0], &Response::Ok);
-
-        // The rest was read before the drag, when the driver still showed 50.
         let mut values = Vec::new();
         for _ in 0..40 {
-            server.supervisor_mut().handle(
-                &mut host,
-                cortisoff_host::Event::TimerFired {
-                    id: cortisoff_core::PREVIEW_TIMER,
-                },
-            );
+            host.now_ms += 40;
+            server
+                .supervisor_mut()
+                .handle(&mut host, Event::TimerFired { id: FADE_TIMER });
             values.push(host.value(ids::DISPLAY_VIBRANCE).unwrap());
         }
         assert_eq!(values.last(), Some(&Value::Int(50)));
         assert!(
-            values.iter().filter(|v| **v != Value::Int(50)).count() >= 10,
+            values.iter().filter(|v| **v != Value::Int(50)).count() >= 5,
             "{values:?}"
-        );
-        assert_eq!(
-            host.cancelled,
-            vec![cortisoff_core::PREVIEW_TIMER],
-            "the last step told the host to stop the fade timer, once"
         );
     }
 }

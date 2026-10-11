@@ -20,6 +20,7 @@ mod dispatcher;
 mod event;
 mod interference;
 mod journal;
+mod keys;
 mod value;
 
 /// Test doubles, for this crate's own tests and for dependents enabling the
@@ -35,13 +36,14 @@ pub use interference::{
     identify_running, identity_ramp, inspect, GammaRamp, RampVerdict, KNOWN_COLOUR_APPS,
 };
 pub use journal::{JournalEntry, JournalStore};
+pub use keys::{Chord, Hotkey, Key, Mods, Named, WindowAction, WindowInfo};
 pub use value::Value;
 
 use std::time::Duration;
 
 /// One operating system's implementation.
 ///
-/// The daemon drives it: probe, install what the rules read, then call
+/// The daemon drives it: probe, install what the plugins watch, then call
 /// [`Host::poll`] in a loop and feed what comes back to the supervisor.
 pub trait Host {
     /// Probe what this machine can actually do, right now. Never a `#[cfg]`
@@ -49,7 +51,7 @@ pub trait Host {
     /// NVIDIA machine and on an Intel laptop.
     fn probe(&self) -> CapabilitySet;
 
-    /// Configure the inactivity thresholds read by enabled rules.
+    /// Configure the inactivity thresholds watched by running plugins.
     fn set_idle_thresholds(&mut self, _seconds: &[u32]) {}
 
     /// Update the activity indicator when a plugin is enabled or a manual claim is held.
@@ -90,7 +92,70 @@ pub trait Host {
     /// Returning an empty vector is normal and costs nothing: it means the
     /// timeout elapsed with nothing to report.
     fn poll(&mut self, timeout: Duration) -> Vec<Event>;
+
+    /// Milliseconds on a clock that never goes backwards and keeps counting
+    /// through a change of time zone. The runtime schedules plugin timers on
+    /// it; the wall clock is [`Host::time_of_day`].
+    fn monotonic_ms(&self) -> u64;
+
+    /// Something any thread can call to make a blocked [`Host::poll`] return
+    /// now rather than at its timeout: a socket transport handing over a
+    /// frame, an HTTP request a plugin started finishing. `None` on a host
+    /// whose poll only ever waits for its timeout.
+    fn waker(&self) -> Option<Waker> {
+        None
+    }
+
+    /// Register exactly these global hotkeys, replacing every earlier set.
+    /// Each one pressed comes back as [`Event::Hotkey`] with its id. Returns
+    /// the ones the system refused, with a sentence: another application
+    /// already owns the chord, or this system has no global hotkeys.
+    fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        wanted
+            .iter()
+            .map(|h| (h.id, UNSUPPORTED.to_owned()))
+            .collect()
+    }
+
+    /// Press and release a chord in whatever window has the focus.
+    fn send_keys(&mut self, _chord: &Chord) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// Type text into whatever window has the focus, as if typed.
+    fn type_text(&mut self, _text: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// A notification the user sees even with no cortisoff window open.
+    fn notify(&mut self, _title: &str, _body: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    fn clipboard(&self) -> Result<String, String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    fn set_clipboard(&mut self, _text: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
+
+    /// Every visible top-level window, front to back.
+    fn windows(&self) -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    fn window_action(&mut self, _id: u64, _action: WindowAction) -> Result<(), String> {
+        Err(UNSUPPORTED.to_owned())
+    }
 }
+
+/// Wakes a blocked [`Host::poll`]. Cheap, callable from any thread, and
+/// harmless when nothing is waiting.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// What a host answers for a service its system does not offer.
+pub const UNSUPPORTED: &str = "this system does not offer that to cortisoff yet";
 
 /// Wall clock, injected so the core never reads one.
 ///

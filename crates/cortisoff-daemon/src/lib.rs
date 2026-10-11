@@ -1,15 +1,16 @@
-//! The half of the daemon that no operating system is needed to test.
+//! The daemon: the process that runs the plugins and owns the hardware.
 //!
-//! Paths, the file-backed journal, the startup gate and the supervisor. What
-//! is missing from here is deliberate: the event loop, the hooks and the
-//! actuators are the platform's, and the transport is the platform's too.
-//! A `main` arrives with the first real [`cortisoff_host::Host`].
+//! Everything a test can reach without an operating system lives in the
+//! modules below [`run`]: paths, the file-backed journal, the startup gate,
+//! the supervisor and the server. [`run`] is the one place that picks a
+//! platform, and the app binary calls it for `cortisoff --daemon`.
 
 #![forbid(unsafe_code)]
 
 mod journal;
 mod log;
 mod paths;
+mod run;
 mod server;
 mod startup;
 mod supervisor;
@@ -17,6 +18,7 @@ mod supervisor;
 pub use journal::FileJournal;
 pub use log::{append, DaemonLog, Mark, Previous, Stamp};
 pub use paths::{Layout, PathError, Paths};
+pub use run::{autostart, run, spawn_detached, start_at_logon, starts_at_logon, Options, USAGE};
 pub use server::{ClientId, Outbound, Server};
 pub use startup::Interference;
-pub use supervisor::{resting, Supervisor};
+pub use supervisor::{Supervisor, PLUGIN_TIMER, WATCH_TIMER};

@@ -1,0 +1,7 @@
+id = "wallpaper-pause"
+name = "Wallpaper pause"
+version = "0.1.0"
+description = "Stops an animated wallpaper while nobody can see it."
+icon = "picture"
+# Wallpaper Engine and Lively are Windows programs.
+platforms = ["windows"]

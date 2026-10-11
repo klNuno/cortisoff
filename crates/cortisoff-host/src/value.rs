@@ -37,8 +37,7 @@ impl Value {
         }
     }
 
-    /// Two values of different shapes on the same capability is a rule authoring
-    /// error, and it is caught at load rather than at apply time.
+    /// Two values of different shapes on the same capability is a plugin bug.
     pub fn same_shape(&self, other: &Value) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }

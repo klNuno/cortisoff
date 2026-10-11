@@ -1,0 +1,43 @@
+[package]
+name = "cortisoff-app"
+description = "The cortisoff app: the window, the daemon mode, the installer and the updater, in one binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cortisoff"
+path = "src/main.rs"
+
+[dependencies]
+cortisoff-daemon = { path = "../cortisoff-daemon" }
+cortisoff-host = { path = "../cortisoff-host" }
+cortisoff-ipc = { path = "../cortisoff-ipc" }
+cortisoff-runtime = { path = "../cortisoff-runtime" }
+cortisoff-ui = { path = "../cortisoff-ui" }
+cortisoff-update = { path = "../cortisoff-update" }
+eframe = { version = "0.36", default-features = false, features = ["glow", "accesskit", "wayland", "x11"] }
+mlua = { version = "0.12", features = ["luajit", "vendored", "serialize"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The client half of the transport. Everything above the bytes is shared.
+[target.'cfg(windows)'.dependencies]
+cortisoff-win = { path = "../cortisoff-win" }
+
+[target.'cfg(unix)'.dependencies]
+cortisoff-unix = { path = "../cortisoff-unix" }
+
+# egui ships no font at all without `default_fonts`. Windows has Segoe UI and
+# Segoe Fluent Icons on every install, so the Windows build ships none; other
+# systems get egui's bundled fonts until a font lookup exists there.
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts"] }
+
+# Names the executable in the taskbar and Task Manager, see ../resources.rs.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

@@ -58,7 +58,7 @@ type GetDvcInfoEx = unsafe extern "C" fn(*mut c_void, u32, *mut DvcInfoEx) -> i3
 type SetDvcLevelEx = unsafe extern "C" fn(*mut c_void, u32, *mut DvcInfoEx) -> i32;
 
 /// One NVIDIA output, already resolved to the device name Windows uses, so a
-/// rule and the journal can key on the same string the gamma actuator does.
+/// plugin and the journal can key on the same string the gamma actuator does.
 pub struct Output {
     handle: *mut c_void,
     pub device: String,
@@ -117,7 +117,7 @@ impl Nvapi {
 
     /// What one output reports today: the level, and the range it lives in.
     /// The range is read rather than assumed, because it is what the doctor
-    /// shows the user and what a rule's value is clamped to.
+    /// shows the user and what a claimed value is clamped to.
     pub fn info(&self, output: &Output) -> Option<DvcInfoEx> {
         let mut info = DvcInfoEx {
             version: nv_version(std::mem::size_of::<DvcInfoEx>(), 1),
