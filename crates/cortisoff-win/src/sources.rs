@@ -13,12 +13,13 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Shell::NIN_SELECT;
+use windows::Win32::UI::Shell::{NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetForegroundWindow, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
     PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION,
-    WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK,
 };
 
 /// The keyboard twin of `NIN_SELECT`, Enter on a focused tray icon.
@@ -46,6 +47,10 @@ pub enum Raw {
     TrayMenu(i32, i32),
     /// Explorer restarted and every tray icon is gone.
     TaskbarCreated,
+    /// A registered hotkey was pressed, with its Win32 id.
+    Hotkey(i32),
+    /// A balloon on the notification-only icon timed out or was clicked.
+    NoticeDone,
 }
 
 thread_local! {
@@ -218,15 +223,25 @@ pub unsafe extern "system" fn wndproc(
             LRESULT(1)
         }
         WM_ENDSESSION => LRESULT(0),
+        WM_HOTKEY => {
+            push(Raw::Hotkey(wparam.0 as i32));
+            LRESULT(0)
+        }
         m if m == crate::tray::TRAY_MESSAGE => {
-            // Version 4: the event in the low word of lparam, the anchor
-            // point in wparam.
+            // Version 4: the event in the low word of lparam, the icon id in
+            // the high word, the anchor point in wparam.
             let event = (lparam.0 as u32) & 0xFFFF;
+            let icon = ((lparam.0 as u32) >> 16) & 0xFFFF;
             let x = (wparam.0 & 0xFFFF) as u16 as i16 as i32;
             let y = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             match event {
                 NIN_SELECT | NIN_KEYSELECT => push(Raw::TrayOpen),
                 WM_CONTEXTMENU => push(Raw::TrayMenu(x, y)),
+                // Not NIN_BALLOONHIDE: it also arrives for the deletion of
+                // the icon, possibly after a new one has been added.
+                NIN_BALLOONTIMEOUT | NIN_BALLOONUSERCLICK if icon == crate::notice::ICON_ID => {
+                    push(Raw::NoticeDone)
+                }
                 _ => {}
             }
             LRESULT(0)
