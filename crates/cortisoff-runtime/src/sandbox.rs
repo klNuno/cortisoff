@@ -51,7 +51,14 @@ impl Sandbox {
         lua.load("jit.off(); jit = nil").exec()?;
 
         let g = lua.globals();
-        for name in ["dofile", "loadfile", "load", "loadstring", "module", "require"] {
+        for name in [
+            "dofile",
+            "loadfile",
+            "load",
+            "loadstring",
+            "module",
+            "require",
+        ] {
             g.raw_set(name, Value::Nil)?;
         }
         if let Ok(string) = g.get::<Table>("string") {
@@ -200,7 +207,7 @@ pub fn from_json(lua: &Lua, j: &serde_json::Value) -> mlua::Result<Value> {
 pub fn to_host(v: &Value) -> Result<HostValue, String> {
     match v {
         Value::Boolean(b) => Ok(HostValue::Bool(*b)),
-        Value::Integer(i) => Ok(HostValue::Int(*i as i64)),
+        Value::Integer(i) => Ok(HostValue::Int(*i)),
         Value::Number(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => Ok(HostValue::Int(*n as i64)),
         Value::Number(n) => Ok(HostValue::Float(*n)),
         Value::String(s) => Ok(HostValue::Text(s.to_string_lossy())),
@@ -216,7 +223,10 @@ pub fn to_host(v: &Value) -> Result<HostValue, String> {
                 refresh_mhz: (refresh.unwrap_or(0.0) * 1000.0).round() as u32,
             })
         }
-        other => Err(format!("{} cannot be a capability value", other.type_name())),
+        other => Err(format!(
+            "{} cannot be a capability value",
+            other.type_name()
+        )),
     }
 }
 
@@ -248,7 +258,10 @@ mod tests {
     fn files(script: &'static str) -> Files {
         let leaked: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
             ("init.lua", script),
-            ("lib/util.lua", "return { twice = function(x) return x * 2 end }"),
+            (
+                "lib/util.lua",
+                "return { twice = function(x) return x * 2 end }",
+            ),
         ]));
         Files::Builtin(leaked)
     }
@@ -277,7 +290,10 @@ mod tests {
             .exec()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not part of this plugin") || err.contains("outside"), "{err}");
+        assert!(
+            err.contains("not part of this plugin") || err.contains("outside"),
+            "{err}"
+        );
     }
 
     #[test]

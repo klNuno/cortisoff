@@ -10,9 +10,7 @@ pub fn blend(from: &Value, to: &Value, s: f64) -> Value {
         }
         (Value::Float(a), Value::Float(b)) => Value::Float(a + (b - a) * s),
         (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + (b - *a as f64) * s),
-        (Value::Float(a), Value::Int(b)) => {
-            Value::Int((a + (*b as f64 - a) * s).round() as i64)
-        }
+        (Value::Float(a), Value::Int(b)) => Value::Int((a + (*b as f64 - a) * s).round() as i64),
         _ => to.clone(),
     }
 }
@@ -21,7 +19,10 @@ pub fn blend(from: &Value, to: &Value, s: f64) -> Value {
 pub fn fadeable(from: &Value, to: &Value) -> bool {
     matches!(
         (from, to),
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_))
+        (
+            Value::Int(_) | Value::Float(_),
+            Value::Int(_) | Value::Float(_)
+        )
     )
 }
 

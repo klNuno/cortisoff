@@ -339,7 +339,10 @@ mod tests {
         let (mut a, vib, _) = arbiter();
         a.claim(vib, OwnerId::Plugin(1), 5, Value::Int(80));
         a.claim(vib, OwnerId::Plugin(2), 5, Value::Int(30));
-        assert_eq!(a.release(vib, OwnerId::Plugin(2)), Some(apply(VIBRANCE, 80)));
+        assert_eq!(
+            a.release(vib, OwnerId::Plugin(2)),
+            Some(apply(VIBRANCE, 80))
+        );
     }
 
     /// Batch order is the capability table's order, which is alphabetical

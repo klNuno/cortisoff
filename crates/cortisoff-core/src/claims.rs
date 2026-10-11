@@ -126,7 +126,11 @@ impl Claims {
         // Asked again for where it is already heading: a plugin that claims
         // its target on every tick must not restart its own fade each time.
         if self.fades.iter().any(|f| {
-            f.cap == cap && f.owner == owner && !f.release && f.to == value && f.priority == priority
+            f.cap == cap
+                && f.owner == owner
+                && !f.release
+                && f.to == value
+                && f.priority == priority
         }) {
             return Vec::new();
         }
@@ -230,10 +234,7 @@ impl Claims {
                 if f.release {
                     out.extend(self.arbiter.release(f.cap, f.owner));
                 } else {
-                    out.extend(
-                        self.arbiter
-                            .claim(f.cap, f.owner, f.priority, f.to.clone()),
-                    );
+                    out.extend(self.arbiter.claim(f.cap, f.owner, f.priority, f.to.clone()));
                 }
             } else {
                 let value = blend(&f.from, &f.to, s);
@@ -377,7 +378,15 @@ mod tests {
     fn a_preview_eases_back_to_the_claim_underneath() {
         let (mut c, i) = claims();
         c.claim(i, P, 0, Value::Int(4000), 0, 0, None);
-        c.claim(i, OwnerId::Preview, priority::PREVIEW, Value::Int(2000), 0, 0, None);
+        c.claim(
+            i,
+            OwnerId::Preview,
+            priority::PREVIEW,
+            Value::Int(2000),
+            0,
+            0,
+            None,
+        );
         c.release(i, OwnerId::Preview, PREVIEW_FADE_MS, 0, None);
         assert_eq!(applied(&c.tick(400)), vec![Value::Int(3000)]);
         assert_eq!(applied(&c.tick(800)), vec![Value::Int(4000)]);
@@ -388,7 +397,15 @@ mod tests {
     fn a_hidden_owner_lets_go_at_once() {
         let (mut c, i) = claims();
         c.claim(i, P, 0, Value::Int(4000), 0, 0, None);
-        c.claim(i, OwnerId::Manual, priority::MANUAL, Value::Int(5000), 0, 0, None);
+        c.claim(
+            i,
+            OwnerId::Manual,
+            priority::MANUAL,
+            Value::Int(5000),
+            0,
+            0,
+            None,
+        );
         let out = c.release(i, P, 1000, 0, None);
         assert!(out.is_empty(), "{out:?}");
         assert!(c.arbiter().held(i, P).is_none());

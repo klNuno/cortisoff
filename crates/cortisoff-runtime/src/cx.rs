@@ -11,7 +11,9 @@ use cortisoff_core::priority;
 use cortisoff_host::{CapabilityId, Chord, LogLevel, WindowAction};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value, Variadic};
 
-use crate::runtime::{until, wall_ms, Binding, Command, Env, HttpDone, HttpWait, Shared, Timer, Watch, KINDS};
+use crate::runtime::{
+    until, wall_ms, Binding, Command, Env, HttpDone, HttpWait, Shared, Timer, Watch, KINDS,
+};
 use crate::sandbox;
 
 /// Shortest repeat for `cx:every`. A plugin polling faster than this is a
@@ -83,8 +85,14 @@ fn minute_of(v: &Value) -> Result<u64, String> {
             let (h, m) = s
                 .split_once(':')
                 .ok_or_else(|| format!("{s:?} is not HH:MM"))?;
-            let h: u64 = h.trim().parse().map_err(|_| format!("{s:?} is not HH:MM"))?;
-            let m: u64 = m.trim().parse().map_err(|_| format!("{s:?} is not HH:MM"))?;
+            let h: u64 = h
+                .trim()
+                .parse()
+                .map_err(|_| format!("{s:?} is not HH:MM"))?;
+            let m: u64 = m
+                .trim()
+                .parse()
+                .map_err(|_| format!("{s:?} is not HH:MM"))?;
             if h > 23 || m > 59 {
                 return Err(format!("{s:?} is not a time of day"));
             }
@@ -95,7 +103,13 @@ fn minute_of(v: &Value) -> Result<u64, String> {
 }
 
 impl Cx<'_, '_> {
-    fn timer(&mut self, due: u64, every: Option<u64>, wall: Option<u64>, callback: Function) -> u64 {
+    fn timer(
+        &mut self,
+        due: u64,
+        every: Option<u64>,
+        wall: Option<u64>,
+        callback: Function,
+    ) -> u64 {
         let id = self.shared.next_timer;
         self.shared.next_timer += 1;
         self.shared.timers.push(Timer {
@@ -257,14 +271,17 @@ impl UserData for Cx<'_, '_> {
             },
         );
 
-        m.add_method_mut("release", |_, this, (cap, opts): (String, Option<Table>)| {
-            this.out.push(Command::Release {
-                owner: this.key,
-                cap: CapabilityId::new(cap),
-                fade_ms: fade_of(&opts)?,
-            });
-            Ok(())
-        });
+        m.add_method_mut(
+            "release",
+            |_, this, (cap, opts): (String, Option<Table>)| {
+                this.out.push(Command::Release {
+                    owner: this.key,
+                    cap: CapabilityId::new(cap),
+                    fade_ms: fade_of(&opts)?,
+                });
+                Ok(())
+            },
+        );
 
         m.add_method_mut("release_all", |_, this, opts: Option<Table>| {
             this.out.push(Command::ReleaseAll {
@@ -319,43 +336,54 @@ impl UserData for Cx<'_, '_> {
 
         // ---- the desktop, AutoHotkey style -----------------------------------
 
-        m.add_method_mut("run", |_, this, (program, args): (String, Variadic<String>)| {
-            if program.trim().is_empty() {
-                return Err(mlua::Error::runtime("cx:run: no program"));
-            }
-            this.out.push(Command::Run {
-                program,
-                args: args.into_iter().collect(),
-            });
-            Ok(())
-        });
-
-        m.add_method_mut("hotkey", |_, this, (chord, f): (String, Option<Function>)| {
-            let chord: Chord = match chord.parse() {
-                Ok(c) => c,
-                Err(e) => return Ok((Value::Nil, Some(e))),
-            };
-            if let Some(b) = this.shared.hotkeys.iter().find(|b| b.chord == chord) {
-                if b.key != this.key {
-                    return Ok((Value::Nil, Some(format!("{chord} is taken by another plugin"))));
+        m.add_method_mut(
+            "run",
+            |_, this, (program, args): (String, Variadic<String>)| {
+                if program.trim().is_empty() {
+                    return Err(mlua::Error::runtime("cx:run: no program"));
                 }
-            }
-            let id = this.shared.next_hotkey;
-            this.shared.next_hotkey += 1;
-            this.shared.hotkeys.push(Binding {
-                id,
-                key: this.key,
-                chord,
-                callback: f,
-            });
-            this.shared.hotkeys_dirty = true;
-            Ok((Value::Integer(i64::from(id) as _), None))
-        });
+                this.out.push(Command::Run {
+                    program,
+                    args: args.into_iter().collect(),
+                });
+                Ok(())
+            },
+        );
+
+        m.add_method_mut(
+            "hotkey",
+            |_, this, (chord, f): (String, Option<Function>)| {
+                let chord: Chord = match chord.parse() {
+                    Ok(c) => c,
+                    Err(e) => return Ok((Value::Nil, Some(e))),
+                };
+                if let Some(b) = this.shared.hotkeys.iter().find(|b| b.chord == chord) {
+                    if b.key != this.key {
+                        return Ok((
+                            Value::Nil,
+                            Some(format!("{chord} is taken by another plugin")),
+                        ));
+                    }
+                }
+                let id = this.shared.next_hotkey;
+                this.shared.next_hotkey += 1;
+                this.shared.hotkeys.push(Binding {
+                    id,
+                    key: this.key,
+                    chord,
+                    callback: f,
+                });
+                this.shared.hotkeys_dirty = true;
+                Ok((Value::Integer(i64::from(id) as _), None))
+            },
+        );
 
         m.add_method_mut("unhotkey", |_, this, id: u32| {
             let key = this.key;
             let before = this.shared.hotkeys.len();
-            this.shared.hotkeys.retain(|b| !(b.key == key && b.id == id));
+            this.shared
+                .hotkeys
+                .retain(|b| !(b.key == key && b.id == id));
             this.shared.hotkeys_dirty |= this.shared.hotkeys.len() != before;
             Ok(())
         });
@@ -371,9 +399,12 @@ impl UserData for Cx<'_, '_> {
             answer(this.env.host.type_text(&text))
         });
 
-        m.add_method_mut("notify", |_, this, (title, body): (String, Option<String>)| {
-            answer(this.env.host.notify(&title, body.as_deref().unwrap_or("")))
-        });
+        m.add_method_mut(
+            "notify",
+            |_, this, (title, body): (String, Option<String>)| {
+                answer(this.env.host.notify(&title, body.as_deref().unwrap_or("")))
+            },
+        );
 
         m.add_method("clipboard", |_, this, ()| match this.env.host.clipboard() {
             Ok(text) => Ok((Some(text), None)),
@@ -398,12 +429,13 @@ impl UserData for Cx<'_, '_> {
             Ok(list)
         });
 
-        m.add_method_mut("window", |_, this, (id, action): (u64, String)| {
-            match action.parse::<WindowAction>() {
+        m.add_method_mut(
+            "window",
+            |_, this, (id, action): (u64, String)| match action.parse::<WindowAction>() {
                 Ok(a) => answer(this.env.host.window_action(id, a)),
                 Err(e) => refuse(e),
-            }
-        });
+            },
+        );
 
         // ---- the network -----------------------------------------------------
 
@@ -423,13 +455,17 @@ impl UserData for Cx<'_, '_> {
                     }
                 };
                 if !(url.starts_with("https://") || url.starts_with("http://")) {
-                    return Err(mlua::Error::runtime(format!("cx:http: {url:?} is not a web address")));
+                    return Err(mlua::Error::runtime(format!(
+                        "cx:http: {url:?} is not a web address"
+                    )));
                 }
                 let method = opt::<String>(&opts, "method")?
                     .unwrap_or_else(|| "GET".into())
                     .to_ascii_uppercase();
                 let body = opt::<mlua::LuaString>(&opts, "body")?.map(|s| s.as_bytes().to_vec());
-                let timeout = opt::<f64>(&opts, "timeout")?.unwrap_or(15_000.0).clamp(500.0, 120_000.0);
+                let timeout = opt::<f64>(&opts, "timeout")?
+                    .unwrap_or(15_000.0)
+                    .clamp(500.0, 120_000.0);
                 let mut headers = Vec::new();
                 if let Some(h) = opt::<Table>(&opts, "headers")? {
                     for pair in h.pairs::<String, String>() {

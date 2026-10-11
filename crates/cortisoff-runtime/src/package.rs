@@ -31,8 +31,9 @@ impl Files {
                 .find(|(path, _)| *path == clean)
                 .map(|(_, text)| (*text).to_owned())
                 .ok_or_else(|| format!("{clean} is not part of this plugin")),
-            Files::Dir(dir) => std::fs::read_to_string(dir.join(&clean))
-                .map_err(|e| format!("{clean}: {e}")),
+            Files::Dir(dir) => {
+                std::fs::read_to_string(dir.join(&clean)).map_err(|e| format!("{clean}: {e}"))
+            }
         }
     }
 
@@ -228,10 +229,19 @@ mod tests {
         .unwrap();
         let (found, problems) = discover(&dir.join("none"), std::slice::from_ref(&dir));
         assert!(problems.is_empty(), "{problems:?}");
-        let night = found.iter().find(|p| p.manifest.id == "night-light").unwrap();
+        let night = found
+            .iter()
+            .find(|p| p.manifest.id == "night-light")
+            .unwrap();
         assert_eq!(night.manifest.name, "Mine");
         assert_eq!(night.origin, Origin::Linked);
-        assert_eq!(found.iter().filter(|p| p.manifest.id == "night-light").count(), 1);
+        assert_eq!(
+            found
+                .iter()
+                .filter(|p| p.manifest.id == "night-light")
+                .count(),
+            1
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

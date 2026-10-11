@@ -4,15 +4,18 @@
 use cortisoff_core::World;
 use cortisoff_host::mock::MockHost;
 use cortisoff_host::{CapabilityId, Event, Host, Value as HostValue};
-use cortisoff_runtime::{Command, Env, Files, Manifest, Package, Runtime, Store};
 use cortisoff_ipc::Origin;
+use cortisoff_runtime::{Command, Env, Files, Manifest, Package, Runtime, Store};
 
 fn plugin(id: &str, script: &str) -> Package {
     let manifest = format!(
         "id = \"{id}\"\nname = \"{id}\"\nversion = \"1\"\nplatforms = [\"windows\", \"linux\", \"macos\"]\n"
     );
     let files: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
-        ("plugin.toml", &*Box::leak(manifest.clone().into_boxed_str())),
+        (
+            "plugin.toml",
+            &*Box::leak(manifest.clone().into_boxed_str()),
+        ),
         ("init.lua", &*Box::leak(script.to_owned().into_boxed_str())),
     ]));
     Package {
@@ -97,10 +100,14 @@ fn a_claim_on_start_becomes_a_command_and_stopping_releases_it() {
         vec![("display.color_temp".to_owned(), HostValue::Int(3200))]
     );
     let key = rt.key_of("warm").unwrap();
-    assert!(out.iter().any(|c| matches!(c, Command::Claim { owner, fade_ms: 500, .. } if *owner == key)));
+    assert!(out
+        .iter()
+        .any(|c| matches!(c, Command::Claim { owner, fade_ms: 500, .. } if *owner == key)));
 
     let out = rig.with(|env| rt.set_enabled(env, "warm", false)).unwrap();
-    assert!(out.iter().any(|c| matches!(c, Command::ReleaseAll { owner, .. } if *owner == key)));
+    assert!(out
+        .iter()
+        .any(|c| matches!(c, Command::ReleaseAll { owner, .. } if *owner == key)));
     assert!(out.contains(&Command::Save));
     assert!(!rt.active());
 }
@@ -116,7 +123,10 @@ fn a_capability_the_machine_lacks_is_refused_with_a_reason() {
     rig.with(|env| rt.start_all(env));
     let report = rt.report("x").unwrap();
     assert_eq!(report.state["ok"], serde_json::Value::Null);
-    assert!(report.state["err"].as_str().unwrap().contains("display.hue"));
+    assert!(report.state["err"]
+        .as_str()
+        .unwrap()
+        .contains("display.hue"));
 }
 
 #[test]
@@ -164,7 +174,11 @@ fn a_hotkey_types_text() {
     assert_eq!(rig.host.desktop, vec!["type hi there".to_owned()]);
 
     rig.with(|env| rt.set_enabled(env, "keys", false)).unwrap();
-    assert_eq!(rt.take_hotkeys().unwrap().len(), 0, "stopping drops its hotkeys");
+    assert_eq!(
+        rt.take_hotkeys().unwrap().len(),
+        0,
+        "stopping drops its hotkeys"
+    );
 }
 
 #[test]
@@ -193,7 +207,10 @@ fn watched_sources_reach_the_host_and_events_reach_the_plugin() {
             },
         )
     });
-    assert_eq!(rt.report("idle").unwrap().state["idle"], serde_json::json!(true));
+    assert_eq!(
+        rt.report("idle").unwrap().state["idle"],
+        serde_json::json!(true)
+    );
 
     rig.with(|env| {
         rt.on_event(
@@ -221,7 +238,10 @@ fn settings_from_the_window_are_stored_as_a_difference_and_heard() {
     let mut rig = Rig::new();
     let mut rt = Runtime::new(vec![p], &on(&["s"]), None);
     rig.with(|env| rt.start_all(env));
-    assert_eq!(rt.report("s").unwrap().settings["night"].as_f64(), Some(3200.0));
+    assert_eq!(
+        rt.report("s").unwrap().settings["night"].as_f64(),
+        Some(3200.0)
+    );
 
     let out = rig
         .with(|env| rt.set_settings(env, "s", serde_json::json!({ "night": 2700, "fade": 30 })))
@@ -233,12 +253,18 @@ fn settings_from_the_window_are_stored_as_a_difference_and_heard() {
 
     let mut store = Store::in_memory();
     rt.store_into(&mut store);
-    assert_eq!(store.entry("s").settings, serde_json::json!({ "night": 2700 }));
+    assert_eq!(
+        store.entry("s").settings,
+        serde_json::json!({ "night": 2700 })
+    );
 }
 
 #[test]
 fn a_plugin_that_fails_fails_alone() {
-    let bad = plugin("bad", "return { start = function(cx, s) error('boom') end }");
+    let bad = plugin(
+        "bad",
+        "return { start = function(cx, s) error('boom') end }",
+    );
     let good = plugin(
         "good",
         "return { start = function(cx, s) cx:claim('display.vibrance', 80) end }",
@@ -270,7 +296,10 @@ fn messages_from_the_page_reach_on() {
 #[test]
 fn a_plugin_for_another_system_does_not_start() {
     let manifest = "id = \"w\"\nname = \"W\"\nversion = \"1\"\nplatforms = [\"macos\"]\n";
-    let mut p = plugin("w", "return { start = function(cx) cx:claim('display.vibrance', 1) end }");
+    let mut p = plugin(
+        "w",
+        "return { start = function(cx) cx:claim('display.vibrance', 1) end }",
+    );
     p.manifest = Manifest::parse(manifest).unwrap();
     let mut rig = Rig::new();
     let mut rt = Runtime::new(vec![p], &on(&["w"]), None).with_os("windows");
@@ -302,15 +331,26 @@ fn the_builtin_plugins_run() {
     assert!(
         claims(&out)
             .iter()
-            .any(|(cap, v)| cap == "display.color_temp" && matches!(v, HostValue::Int(k) if *k < 6500)),
+            .any(|(cap, v)| cap == "display.color_temp"
+                && matches!(v, HostValue::Int(k) if *k < 6500)),
         "{out:?}"
     );
-    assert!(!rt.take_hotkeys().unwrap().is_empty(), "shortcuts registered its defaults");
+    assert!(
+        !rt.take_hotkeys().unwrap().is_empty(),
+        "shortcuts registered its defaults"
+    );
 
     rig.world.absorb(&Event::Maximized { maximized: true });
     rig.with(|env| rt.on_event(env, &Event::Maximized { maximized: true }));
-    rig.with(|env| rt.message(env, "night-light", "pause", &serde_json::json!({ "minutes": 1 })))
-        .unwrap();
+    rig.with(|env| {
+        rt.message(
+            env,
+            "night-light",
+            "pause",
+            &serde_json::json!({ "minutes": 1 }),
+        )
+    })
+    .unwrap();
     rig.host.now_ms += 31_000;
     rig.with(|env| rt.on_timer(env));
     // The daemon folds every event into the world before plugins hear it.

@@ -62,7 +62,11 @@ impl Manifest {
         if self.platforms.is_empty() {
             return Err("platforms is empty: name at least one of windows, linux, macos".into());
         }
-        if let Some(p) = self.platforms.iter().find(|p| !PLATFORMS.contains(&p.as_str())) {
+        if let Some(p) = self
+            .platforms
+            .iter()
+            .find(|p| !PLATFORMS.contains(&p.as_str()))
+        {
             return Err(format!(
                 "platform {p:?} is not one of windows, linux, macos"
             ));
@@ -92,10 +96,14 @@ mod tests {
     #[test]
     fn a_bad_manifest_says_what_is_wrong() {
         let bad = |s: &str| Manifest::parse(s).unwrap_err();
-        assert!(bad("id = \"A b\"\nname = \"x\"\nversion = \"1\"\nplatforms = [\"linux\"]")
-            .contains("lowercase"));
-        assert!(bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\nplatforms = [\"beos\"]")
-            .contains("beos"));
+        assert!(
+            bad("id = \"A b\"\nname = \"x\"\nversion = \"1\"\nplatforms = [\"linux\"]")
+                .contains("lowercase")
+        );
+        assert!(
+            bad("id = \"a\"\nname = \"x\"\nversion = \"1\"\nplatforms = [\"beos\"]")
+                .contains("beos")
+        );
         assert!(bad(
             "id = \"a\"\nname = \"x\"\nversion = \"1\"\nplatforms = [\"linux\"]\nentry = \"../x.lua\""
         )

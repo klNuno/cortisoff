@@ -38,7 +38,9 @@ impl Source {
             return Err("paste a GitHub repository or a link to a zip".into());
         }
         let lower = t.to_ascii_lowercase();
-        if lower.ends_with(".zip") && (lower.starts_with("https://") || lower.starts_with("http://")) {
+        if lower.ends_with(".zip")
+            && (lower.starts_with("https://") || lower.starts_with("http://"))
+        {
             return Ok(Source::Zip(t.to_owned()));
         }
         let rest = ["https://github.com/", "http://github.com/", "github.com/"]
@@ -46,7 +48,9 @@ impl Source {
             .find_map(|p| lower.starts_with(p).then(|| &t[p.len()..]))
             .unwrap_or(t);
         if rest.contains("://") {
-            return Err(format!("{t:?} is neither a GitHub repository nor a link to a zip"));
+            return Err(format!(
+                "{t:?} is neither a GitHub repository nor a link to a zip"
+            ));
         }
         let mut parts = rest.split('/');
         let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
@@ -88,7 +92,10 @@ fn agent() -> ureq::Agent {
 fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<(u16, Vec<u8>), String> {
     let mut resp = agent
         .get(url)
-        .header("Accept", "application/vnd.github+json, application/zip, */*")
+        .header(
+            "Accept",
+            "application/vnd.github+json, application/zip, */*",
+        )
         .call()
         .map_err(|e| format!("{url}: {e}"))?;
     let status = resp.status().as_u16();
@@ -161,7 +168,8 @@ pub fn install_zip(bytes: &[u8], url: &str, plugins: &Path) -> Result<Installed,
 }
 
 fn unpack(bytes: &[u8], into: &Path) -> Result<(), String> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("not a zip: {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("not a zip: {e}"))?;
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).map_err(|e| e.to_string())?;
@@ -181,7 +189,8 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let mut out = std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut out =
+            std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -211,11 +220,16 @@ fn find_root(dir: &Path, depth: u8) -> Option<PathBuf> {
 }
 
 fn settle(incoming: &Path, url: &str, plugins: &Path) -> Result<Installed, String> {
-    let root = find_root(incoming, 3).ok_or("no plugin.toml in the archive: this is not a cortisoff plugin")?;
+    let root = find_root(incoming, 3)
+        .ok_or("no plugin.toml in the archive: this is not a cortisoff plugin")?;
     let text = std::fs::read_to_string(root.join("plugin.toml")).map_err(|e| e.to_string())?;
     let manifest = Manifest::parse(&text).map_err(|e| format!("plugin.toml: {e}"))?;
-    std::fs::read_to_string(root.join(&manifest.entry))
-        .map_err(|_| format!("plugin.toml names {} but the archive has no such file", manifest.entry))?;
+    std::fs::read_to_string(root.join(&manifest.entry)).map_err(|_| {
+        format!(
+            "plugin.toml names {} but the archive has no such file",
+            manifest.entry
+        )
+    })?;
     let source = serde_json::json!({ "url": url, "version": manifest.version });
     std::fs::write(root.join(SOURCE_FILE), source.to_string()).map_err(|e| e.to_string())?;
 
@@ -262,9 +276,18 @@ mod tests {
             owner: o.into(),
             repo: r.into(),
         };
-        assert_eq!(Source::parse("klNuno/night").unwrap(), gh("klNuno", "night"));
-        assert_eq!(Source::parse("https://github.com/a/b.git").unwrap(), gh("a", "b"));
-        assert_eq!(Source::parse(" github.com/a/b/tree/main ").unwrap(), gh("a", "b"));
+        assert_eq!(
+            Source::parse("klNuno/night").unwrap(),
+            gh("klNuno", "night")
+        );
+        assert_eq!(
+            Source::parse("https://github.com/a/b.git").unwrap(),
+            gh("a", "b")
+        );
+        assert_eq!(
+            Source::parse(" github.com/a/b/tree/main ").unwrap(),
+            gh("a", "b")
+        );
         assert_eq!(
             Source::parse("https://x.dev/p.zip").unwrap(),
             Source::Zip("https://x.dev/p.zip".into())
@@ -285,9 +308,11 @@ mod tests {
 
     #[test]
     fn a_github_archive_installs_under_its_id() {
-        let plugins = std::env::temp_dir().join(format!("cortisoff-install-{}", std::process::id()));
+        let plugins =
+            std::env::temp_dir().join(format!("cortisoff-install-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&plugins);
-        let manifest = "id = \"clock\"\nname = \"Clock\"\nversion = \"1.0.0\"\nplatforms = [\"windows\"]\n";
+        let manifest =
+            "id = \"clock\"\nname = \"Clock\"\nversion = \"1.0.0\"\nplatforms = [\"windows\"]\n";
         let bytes = zip_of(&[
             ("me-clock-abc123/README.md", "hi"),
             ("me-clock-abc123/plugin.toml", manifest),

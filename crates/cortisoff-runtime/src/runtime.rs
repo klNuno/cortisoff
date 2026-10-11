@@ -412,7 +412,7 @@ impl Runtime {
                     key: *key,
                     id: &pkg.manifest.id,
                     name: &pkg.manifest.name,
-                    os: *os,
+                    os,
                     env: &mut *env,
                     shared: &mut *shared,
                     watches: &mut *watches,
@@ -625,7 +625,10 @@ impl Runtime {
                 t.set("kind", "http")?;
                 t.set("id", done.id)?;
                 t.set("status", done.status)?;
-                t.set("ok", done.error.is_none() && (200..300).contains(&done.status))?;
+                t.set(
+                    "ok",
+                    done.error.is_none() && (200..300).contains(&done.status),
+                )?;
                 t.set("body", lua.create_string(&done.body)?)?;
                 t.set("error", done.error.clone())?;
                 Ok(t)
@@ -777,7 +780,12 @@ impl Runtime {
 
     /// The plugin folders were read again. New ones are added, missing ones
     /// stopped and dropped, and one whose files or version moved restarts.
-    pub fn replace(&mut self, env: &mut Env, packages: Vec<Package>, store: &Store) -> Vec<Command> {
+    pub fn replace(
+        &mut self,
+        env: &mut Env,
+        packages: Vec<Package>,
+        store: &Store,
+    ) -> Vec<Command> {
         let mut out = vec![Command::ListChanged];
         let mut i = 0;
         while i < self.slots.len() {
@@ -832,7 +840,9 @@ impl Runtime {
     }
 
     pub fn report(&self, id: &str) -> Option<PluginReport> {
-        self.index(id).ok().map(|i| self.report_slot(&self.slots[i]))
+        self.index(id)
+            .ok()
+            .map(|i| self.report_slot(&self.slots[i]))
     }
 
     /// The owner key behind each report, in the same order as [`Self::reports`].
@@ -922,9 +932,7 @@ pub(crate) fn wall_ms(host: &dyn Host) -> Option<u64> {
             minute,
             second,
             millisecond,
-        } => Some(
-            u64::from(minute) * 60_000 + u64::from(second) * 1000 + u64::from(millisecond),
-        ),
+        } => Some(u64::from(minute) * 60_000 + u64::from(second) * 1000 + u64::from(millisecond)),
         _ => None,
     }
 }
@@ -958,7 +966,13 @@ fn kind_of(e: &Event) -> Option<&'static str> {
 
 fn idle_matches(w: &Watch, e: &Event) -> bool {
     match (w.idle_after, e) {
-        (Some(after), Event::Idle { idle: true, seconds }) => *seconds == after,
+        (
+            Some(after),
+            Event::Idle {
+                idle: true,
+                seconds,
+            },
+        ) => *seconds == after,
         _ => true,
     }
 }

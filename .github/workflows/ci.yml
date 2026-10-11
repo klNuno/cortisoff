@@ -69,9 +69,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
-      # capture_every_page renders the window through wgpu, and hosted
-      # runners have no GPU to give it. It runs on a developer machine with
-      # `cargo test -p cortisoff-app --test capture`.
+      # The capture tests render through wgpu and hosted runners have no GPU,
+      # so they are #[ignore]d and run on a developer machine with
+      # `cargo test -p cortisoff-app --test capture -- --ignored`.
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --no-fail-fast -- --skip capture_every_page
+        run: cargo test --workspace --no-fail-fast
