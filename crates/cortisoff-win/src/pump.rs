@@ -485,6 +485,10 @@ impl Host for WinHost {
         unsafe { GetTickCount64() }
     }
 
+    fn waker(&self) -> Option<cortisoff_host::Waker> {
+        Some(std::sync::Arc::new(crate::pipe::wake))
+    }
+
     fn set_idle_thresholds(&mut self, seconds: &[u32]) {
         self.idle_thresholds = seconds.to_vec();
         self.idle_thresholds

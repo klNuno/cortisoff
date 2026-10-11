@@ -98,6 +98,14 @@ pub trait Host {
     /// it; the wall clock is [`Host::time_of_day`].
     fn monotonic_ms(&self) -> u64;
 
+    /// Something any thread can call to make a blocked [`Host::poll`] return
+    /// now rather than at its timeout: a socket transport handing over a
+    /// frame, an HTTP request a plugin started finishing. `None` on a host
+    /// whose poll only ever waits for its timeout.
+    fn waker(&self) -> Option<Waker> {
+        None
+    }
+
     /// Register exactly these global hotkeys, replacing every earlier set.
     /// Each one pressed comes back as [`Event::Hotkey`] with its id. Returns
     /// the ones the system refused, with a sentence: another application
@@ -141,6 +149,10 @@ pub trait Host {
         Err(UNSUPPORTED.to_owned())
     }
 }
+
+/// Wakes a blocked [`Host::poll`]. Cheap, callable from any thread, and
+/// harmless when nothing is waiting.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// What a host answers for a service its system does not offer.
 pub const UNSUPPORTED: &str = "this system does not offer that to cortisoff yet";

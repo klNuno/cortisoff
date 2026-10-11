@@ -65,6 +65,13 @@ pub(crate) fn arrived() -> Option<HANDLE> {
     (address != 0).then_some(HANDLE(address as *mut c_void))
 }
 
+/// Wake the daemon's pump from any thread, the same way a pipe handover does.
+pub(crate) fn wake() {
+    if let Some(event) = arrived() {
+        let _ = unsafe { SetEvent(event) };
+    }
+}
+
 /// Hand one item to the daemon's loop and wake it.
 fn deliver(outbox: &Sender<Wire>, item: Wire) -> bool {
     let sent = outbox.send(item).is_ok();
