@@ -193,8 +193,8 @@ jobs:
           fi
           cat RELEASE_NOTES.md
 
-      # The shape the Tauri updater reads. Each signature is base64 of its
-      # .sig file, as Tauri spells it.
+      # The feed cortisoff-update reads, in the Tauri updater's shape: each
+      # signature is the base64 of its .sig file.
       - name: Write latest.json
         env:
           TAG: ${{ github.ref_name }}

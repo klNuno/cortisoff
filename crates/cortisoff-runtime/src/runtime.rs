@@ -977,12 +977,26 @@ fn idle_matches(w: &Watch, e: &Event) -> bool {
     }
 }
 
+/// What a plugin matches an application on: the file name, lowercased on
+/// Windows where file names ignore case. Every host reports the full path
+/// (`C:\Games\cs2.exe`, `/usr/lib/firefox/firefox`), which plugins get as
+/// `path`; a plugin comparing `exe` with `cs2.exe` would never match it.
+pub(crate) fn exe_name(path: &str) -> String {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    if cfg!(windows) {
+        name.to_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
+
 fn event_table(lua: &Lua, kind: &str, e: &Event) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set("kind", kind)?;
     match e {
         Event::AppFocus(app) => {
-            t.set("exe", app.exe.as_str())?;
+            t.set("exe", exe_name(&app.exe))?;
+            t.set("path", app.exe.as_str())?;
             t.set("title", app.title.clone())?;
             t.set("pid", app.pid)?;
         }
@@ -1007,4 +1021,22 @@ fn event_table(lua: &Lua, kind: &str, e: &Event) -> mlua::Result<Table> {
         _ => {}
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exe_name;
+
+    #[test]
+    fn an_application_is_named_by_its_file_name() {
+        let firefox = exe_name(r"C:\Program Files\Mozilla Firefox\Firefox.EXE");
+        assert_eq!(firefox.to_lowercase(), "firefox.exe");
+        if cfg!(windows) {
+            assert_eq!(firefox, "firefox.exe");
+        }
+        assert_eq!(exe_name("/usr/lib/firefox/firefox"), "firefox");
+        assert_eq!(exe_name("C:/tools/code.exe"), "code.exe");
+        assert_eq!(exe_name("notepad.exe"), "notepad.exe");
+        assert_eq!(exe_name(""), "");
+    }
 }

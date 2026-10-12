@@ -71,10 +71,7 @@ pub fn window(launch: Launch) -> Result<(), String> {
             // what this one no longer wants: the five minute repetition that
             // undid every stop. The daemon is already stopped by now.
             Launch::Updated => {
-                let _ = install::install(&exe);
-                if cortisoff_daemon::starts_at_logon() {
-                    let _ = cortisoff_daemon::start_at_logon(true);
-                }
+                let _ = register();
             }
             Launch::Normal => {}
         }
@@ -121,6 +118,23 @@ pub fn window(launch: Launch) -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+
+/// `--register`: what a new build writes about itself once it is in place,
+/// the shortcut, the version Settings > Apps shows and the logon task. The
+/// window's update runs it on `--updated`; a daemon that updated itself
+/// starts the new build with it, since only the new build knows its version.
+/// Does nothing outside an installed release build.
+pub fn register() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if cfg!(debug_assertions) || !cortisoff_update::install::is_installed(&exe) {
+        return Ok(());
+    }
+    cortisoff_update::install::install(&exe)?;
+    if cortisoff_daemon::starts_at_logon() {
+        cortisoff_daemon::start_at_logon(true)?;
+    }
+    Ok(())
 }
 
 /// `--uninstall`, and the button on the settings page: stop the daemon, stop

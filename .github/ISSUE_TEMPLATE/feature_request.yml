@@ -1,0 +1,26 @@
+name: Feature request
+description: A new capability, a plugin idea or a change to an existing one.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you want to do
+      description: The situation and what you would like cortisoff to do in it.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How you do it today
+      description: Another program, a script, by hand, or not at all.
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where it belongs
+      options:
+        - A built-in plugin
+        - A new plugin
+        - The window or the command line
+        - The plugin API
+        - Not sure

@@ -11,6 +11,7 @@ cortisoff-core = { path = "../cortisoff-core" }
 cortisoff-host = { path = "../cortisoff-host" }
 cortisoff-ipc = { path = "../cortisoff-ipc" }
 cortisoff-runtime = { path = "../cortisoff-runtime" }
+cortisoff-update = { path = "../cortisoff-update" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -11,12 +11,13 @@
 //! cortisoff-cli link ~/my-plugin     # load a folder, reload it on save
 //! cortisoff-cli trace                # everything the daemon sees and does
 //! cortisoff-cli set display.color_temp 3400
+//! cortisoff-cli update auto off      # leave new versions for the window
 //! ```
 
 use std::path::Path;
 
 use cortisoff_host::CapabilityId;
-use cortisoff_ipc::{Notification, PluginReport, Request, Response};
+use cortisoff_ipc::{Notification, PluginReport, Request, Response, UpdateCheck, UpdateReport};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,6 +70,7 @@ fn main() {
                 cap: CapabilityId::new(cap),
             })
         }),
+        "update" => update(&args),
         "trace" => trace(),
         "start" => start(),
         "stop" => ask(Request::Shutdown),
@@ -96,6 +98,7 @@ fn ask(request: Request) -> Result<(), String> {
         Response::State(report) => print(&*report),
         Response::Plugins { plugins } => print(&plugins),
         Response::Windows { windows } => print(&windows),
+        Response::Updates(report) => print(&*report),
         // The daemon refusing is not the CLI failing. It answered, in a
         // sentence written to be shown to a person.
         Response::Error { message } => return Err(message),
@@ -189,8 +192,53 @@ fn line(notification: &Notification) {
                 .unwrap_or_default()
         ),
         Notification::Plugins => println!("plugins the list changed"),
+        Notification::Updates(report) => println!("updates {}", describe(report)),
         Notification::Closing => println!("the daemon is going down"),
     }
+}
+
+/// `update` says what the daemon's last check found; `update auto on|off`
+/// switches automatic installs.
+fn update(args: &[String]) -> Result<(), String> {
+    let auto = match (
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) {
+        (None, _) => None,
+        (Some("auto"), Some("on")) => Some(true),
+        (Some("auto"), Some("off")) => Some(false),
+        _ => return Err("update takes nothing, or `auto on` or `auto off`".to_owned()),
+    };
+    match transport::ask(Request::Updates { auto })? {
+        Response::Updates(report) => {
+            println!("{}", describe(&report));
+            Ok(())
+        }
+        Response::Error { message } => Err(message),
+        _ => Err("the daemon did not answer with its updates".to_owned()),
+    }
+}
+
+/// One line for a person.
+fn describe(report: &UpdateReport) -> String {
+    let found = match (&report.last, report.checks) {
+        (_, false) => "this copy does not update itself: only an installed release does".to_owned(),
+        (None, true) => "not checked yet: the daemon checks two minutes after it starts,                          then every six hours"
+            .to_owned(),
+        (Some(UpdateCheck::Current), true) => "up to date".to_owned(),
+        (Some(UpdateCheck::Available { version }), true) => {
+            format!("version {version} is out. Open the window to install it")
+        }
+        (Some(UpdateCheck::Staged { version }), true) => format!(
+            "version {version} is downloaded. It goes in the next moment nothing is              applied to a screen"
+        ),
+        (Some(UpdateCheck::Failed { message }), true) => format!("the last check failed: {message}"),
+    };
+    format!(
+        "cortisoff {}, {found}. Automatic updates {}",
+        report.version,
+        if report.auto { "on" } else { "off" }
+    )
 }
 
 /// `cortisoff-cli set display.color_temp 3400`. The shape comes from
@@ -274,6 +322,8 @@ const USAGE: &str = "cortisoff-cli, the command line client for cortisoff
     trace                     everything the daemon sees and does, live
     set <cap> <value>         a manual override, outranking every plugin
     clear <cap>               drop the override
+    update                    whether a new version is out
+    update auto <on|off>      install new versions without asking, or not
     start                     start the daemon
     stop                      exit cleanly, restoring every baseline";
 

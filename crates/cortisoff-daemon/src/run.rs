@@ -12,14 +12,21 @@
 //! Ctrl-C hands every screen back before exiting. Killing it does not, which
 //! is what the journal is for: the next start restores before any plugin
 //! claims anything.
+//!
+//! An installed release build also checks for updates (`updates.rs`) and,
+//! once a new build is in place, exits with [`RESTART`] for the guard to
+//! start it.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use cortisoff_host::{CapabilitySet, LogLevel};
 use cortisoff_ipc::Notification;
 use cortisoff_runtime::{Runtime, Store};
 
+use crate::guard::RESTART;
+use crate::updates::{self, Found};
 use crate::{ClientId, DaemonLog, FileJournal, Mark, Paths, Previous, Server, Supervisor};
 
 /// How long the loop waits for something to happen: as long as it takes.
@@ -98,7 +105,7 @@ impl Options {
 /// one already answers. Returns once the process is started, not once it
 /// listens.
 pub fn spawn_detached(exe: &Path) -> Result<(), String> {
-    platform::spawn_detached(exe)
+    platform::spawn_detached(exe, "--daemon")
 }
 
 /// `--autostart on|off|status`: starting the daemon at logon, from this
@@ -261,12 +268,18 @@ pub fn run(args: Options) -> Result<(), String> {
 
     let mut server = Server::new(supervisor);
     server.supervisor_mut().start(host.as_mut());
+    // A verbose run has no guard to start a new build.
+    let found = (!args.verbose && updates::should_check())
+        .then(|| watch_for_updates(&mut server, host.waker()))
+        .flatten();
     flush(&mut server, &mut transport, args.verbose, &mut log);
 
     if !platform::watch_for_stop() {
         eprintln!("warning: Ctrl-C will not restore the screen on the way out");
     }
 
+    let mut updated = None;
+    let mut exe = None;
     while !server.stopping() && !platform::stop_requested() {
         let outbound = server.pump(host.as_mut(), FOREVER);
         transport.write(outbound);
@@ -294,7 +307,58 @@ pub fn run(args: Options) -> Result<(), String> {
                 }
             }
         }
+        if let Some(found) = &found {
+            for result in found.try_iter() {
+                server.found(result);
+            }
+        }
+        // Looked at after every turn: any wake, a claim let go included,
+        // may be the quiet moment a staged build waits for.
+        if let Some(staged) = server.take_update() {
+            // Put in place before anything stops, so a swap that fails
+            // leaves this build running as if nothing had happened.
+            exe = std::env::current_exe().ok();
+            match cortisoff_update::apply(&staged.path) {
+                Ok(()) => updated = Some(staged),
+                Err(e) => server.update_failed(format!(
+                    "version {} could not be put in place: {e}",
+                    staged.version
+                )),
+            }
+        }
         flush(&mut server, &mut transport, args.verbose, &mut log);
+        if updated.is_some() {
+            break;
+        }
+    }
+
+    if let Some(staged) = updated {
+        // What a stop request does: plugins stopped, every baseline back.
+        server.supervisor_mut().shutdown(host.as_mut());
+        server.supervisor_mut().note_closing();
+        flush(&mut server, &mut transport, args.verbose, &mut log);
+        let _ = std::fs::remove_file(&staged.path);
+        log.line(
+            platform::now(),
+            Mark::Exit,
+            &format!(
+                "updated from {} to {}, every screen handed back. Starting the new build",
+                env!("CARGO_PKG_VERSION"),
+                staged.version
+            ),
+        );
+        // Only the new build knows its own version: it rewrites the
+        // shortcut and the entry in Settings > Apps, as an update from the
+        // window does.
+        if let Some(exe) = &exe {
+            let _ = platform::spawn_detached(exe, "--register");
+        }
+        // The new build takes the session lock and the pipe as it starts.
+        drop(transport);
+        drop(server);
+        drop(host);
+        drop(_session);
+        std::process::exit(RESTART);
     }
 
     // A client asking to stop has already been served: `Request::Shutdown`
@@ -320,6 +384,30 @@ pub fn run(args: Options) -> Result<(), String> {
         },
     );
     Ok(())
+}
+
+/// Start the thread that checks for updates. It wakes the loop through the
+/// host's waker when it has something, and the loop reads it from the
+/// returned channel.
+fn watch_for_updates(
+    server: &mut Server<FileJournal>,
+    wake: Option<cortisoff_host::Waker>,
+) -> Option<Receiver<Found>> {
+    let (found, results) = std::sync::mpsc::channel();
+    let (poke, pokes) = std::sync::mpsc::channel();
+    let auto = server.updates_mut().auto_flag();
+    match updates::spawn(auto, pokes, found, wake) {
+        Ok(()) => {
+            server.updates_mut().checking(poke);
+            Some(results)
+        }
+        Err(e) => {
+            server
+                .supervisor_mut()
+                .warn(format!("updates are not checked: {e}"));
+            None
+        }
+    }
 }
 
 /// Run the daemon as a second process and start it again if it crashes. See
@@ -492,12 +580,12 @@ mod platform {
         cortisoff_win::autostart::enabled()
     }
 
-    pub fn spawn_detached(exe: &Path) -> Result<(), String> {
+    pub fn spawn_detached(exe: &Path, arg: &str) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         std::process::Command::new(exe)
-            .arg("--daemon")
+            .arg(arg)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -651,10 +739,10 @@ mod platform {
         false
     }
 
-    pub fn spawn_detached(exe: &Path) -> Result<(), String> {
+    pub fn spawn_detached(exe: &Path, arg: &str) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         std::process::Command::new(exe)
-            .arg("--daemon")
+            .arg(arg)
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

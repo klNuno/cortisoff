@@ -120,7 +120,7 @@ pub(crate) fn pick(
 mod tests {
     use super::*;
 
-    // What tauri-action and accshift's release job write, keys and all.
+    // What tauri-action writes, keys and all.
     const TAURI_SHAPED: &str = r#"{
       "version": "v1.4.0",
       "notes": "Faster fades.",

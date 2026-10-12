@@ -214,6 +214,8 @@ mod tests {
                 cap: CapabilityId::new("display.color_temp"),
             },
             Request::Shutdown,
+            Request::Updates { auto: None },
+            Request::Updates { auto: Some(false) },
         ];
         for request in requests {
             let frame = Frame::request(1, request);
@@ -287,6 +289,50 @@ mod tests {
             let frame = Frame::response(RequestId(1), response);
             assert_eq!(decode(encode(&frame).trim_end()).unwrap(), frame);
         }
+    }
+
+    /// The update setting and every check result, both ways, as an answer
+    /// and as a notification.
+    #[test]
+    fn the_update_report_round_trips() {
+        use crate::{UpdateCheck, UpdateReport};
+        let checks = [
+            None,
+            Some(UpdateCheck::Current),
+            Some(UpdateCheck::Available {
+                version: "1.2.0".to_owned(),
+            }),
+            Some(UpdateCheck::Staged {
+                version: "1.2.0".to_owned(),
+            }),
+            Some(UpdateCheck::Failed {
+                message: "cannot reach the update feed".to_owned(),
+            }),
+        ];
+        for last in checks {
+            let report = UpdateReport {
+                auto: last.is_none(),
+                version: "1.1.0".to_owned(),
+                checks: true,
+                last,
+            };
+            let answer = Frame::response(RequestId(3), Response::Updates(Box::new(report.clone())));
+            assert_eq!(decode(encode(&answer).trim_end()).unwrap(), answer);
+            let pushed = Frame::notify(Notification::Updates(Box::new(report)));
+            assert_eq!(decode(encode(&pushed).trim_end()).unwrap(), pushed);
+        }
+        // A client that leaves `auto` out only reads.
+        let read = decode(r#"{"frame":"request","id":1,"request":{"request":"updates"}}"#);
+        assert!(
+            matches!(
+                read,
+                Ok(Frame::Request {
+                    request: Request::Updates { auto: None },
+                    ..
+                })
+            ),
+            "{read:?}"
+        );
     }
 
     #[test]

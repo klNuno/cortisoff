@@ -17,6 +17,8 @@ pub enum Ask {
     State,
     Plugins,
     Doctor,
+    /// The update setting and the daemon's last check.
+    Updates,
     /// Anything whose answer only matters when it is an error: say so.
     Do(String),
 }

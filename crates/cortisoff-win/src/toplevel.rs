@@ -40,11 +40,7 @@ pub fn list() -> Vec<WindowInfo> {
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let exe = exes
             .entry(pid)
-            .or_insert_with(|| {
-                crate::names::image_path(pid)
-                    .map(|path| exe_name(&path))
-                    .unwrap_or_default()
-            })
+            .or_insert_with(|| crate::names::image_path(pid).unwrap_or_default())
             .clone();
         out.push(WindowInfo {
             id: hwnd.0 as usize as u64,
@@ -134,14 +130,6 @@ fn listed(shape: Shape) -> bool {
     shape.visible && !shape.owned && !shape.tool && !shape.cloaked && shape.titled
 }
 
-/// `C:\Program Files\App\App.EXE` to `app.exe`, the form plugins match on.
-fn exe_name(path: &str) -> String {
-    path.rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(path)
-        .to_lowercase()
-}
-
 /// Every top-level window, in z-order from the top. Collected first and
 /// looked at afterwards, so the callback does nothing that could block.
 fn top_level() -> Vec<HWND> {
@@ -224,17 +212,6 @@ mod tests {
         ] {
             assert!(!listed(shape), "{shape:?}");
         }
-    }
-
-    #[test]
-    fn an_executable_is_its_lowercase_file_name() {
-        assert_eq!(
-            exe_name(r"C:\Program Files\Mozilla Firefox\Firefox.EXE"),
-            "firefox.exe"
-        );
-        assert_eq!(exe_name("C:/tools/Code.exe"), "code.exe");
-        assert_eq!(exe_name("notepad.exe"), "notepad.exe");
-        assert_eq!(exe_name(""), "");
     }
 
     /// Read-only: enumerates the desktop of whoever runs the tests.

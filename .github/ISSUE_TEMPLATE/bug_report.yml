@@ -1,0 +1,58 @@
+name: Bug report
+description: Something cortisoff or one of its plugins does wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A report with the doctor output and the log is usually enough to find the cause without a back and forth.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Settings > Updates in the window, or the file properties of `cortisoff.exe`.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (X11)
+        - Linux (Wayland)
+        - macOS (Apple silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin
+      description: The plugin involved, if any.
+      placeholder: night-light
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: The output of `cortisoff-cli doctor` (or `cortisoff --daemon --doctor` when the daemon does not start). It lists what this machine can do and touches nothing.
+      render: json
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        The last lines of `cortisoffd.log`:
+        - Windows: `%LOCALAPPDATA%\cortisoff\cortisoffd.log`
+        - Linux: `$XDG_STATE_HOME/cortisoff/cortisoffd.log` (`~/.local/state` by default)
+        - macOS: `~/Library/Application Support/cortisoff/cortisoffd.log`
+      render: text

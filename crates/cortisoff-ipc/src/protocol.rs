@@ -82,6 +82,12 @@ pub enum Request {
     Windows,
     /// Exit cleanly, restoring every baseline on the way out.
     Shutdown,
+    /// What the daemon knows about updates, after switching automatic
+    /// installs on or off when `auto` is given.
+    Updates {
+        #[serde(default)]
+        auto: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +105,7 @@ pub enum Response {
     Windows {
         windows: Vec<WindowInfo>,
     },
+    Updates(Box<UpdateReport>),
     /// Never a panic and never a dropped connection. A client that asks for
     /// something impossible gets a sentence it can print.
     Error {
@@ -131,8 +138,43 @@ pub enum Notification {
     Plugin(Box<PluginReport>),
     /// Plugins appeared or went away. Ask for [`Request::Plugins`] again.
     Plugins,
+    /// The update setting changed, or a check found something.
+    Updates(Box<UpdateReport>),
     /// The daemon is going down. No further notification follows.
     Closing,
+}
+
+/// The daemon's side of updates: the setting and the last check.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UpdateReport {
+    /// Install a newer release without asking. On unless the user said no.
+    pub auto: bool,
+    /// The daemon's own version.
+    #[serde(default)]
+    pub version: String,
+    /// Whether this daemon checks at all: only an installed release build
+    /// does.
+    #[serde(default)]
+    pub checks: bool,
+    /// What the last check found. `None` before the first one, which runs
+    /// two minutes after the daemon starts.
+    #[serde(default)]
+    pub last: Option<UpdateCheck>,
+}
+
+/// What one check of the release feed found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "found", rename_all = "snake_case")]
+pub enum UpdateCheck {
+    /// Nothing newer than the running version.
+    Current,
+    /// A newer version exists and automatic installs are off.
+    Available { version: String },
+    /// A newer version is downloaded and verified. It goes in place the next
+    /// moment nothing is applied to a screen.
+    Staged { version: String },
+    /// The feed or the download failed, in a sentence.
+    Failed { message: String },
 }
 
 /// Where a plugin's files come from.

@@ -9,9 +9,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cortisoff_host::{CapabilityId, Host, JournalStore};
-use cortisoff_ipc::{Frame, Request, RequestId, Response};
+use cortisoff_ipc::{Frame, Notification, Request, RequestId, Response};
 
 use crate::supervisor::Supervisor;
+use crate::updates::{Found, Staged, Updates};
 
 /// One connected client, assigned by the transport. Reused ids are the
 /// transport's problem: a disconnect drops every trace of the old one first.
@@ -38,17 +39,52 @@ pub struct Server<J> {
     previews: BTreeMap<ClientId, BTreeSet<CapabilityId>>,
     stopping: bool,
     log: Vec<cortisoff_ipc::Notification>,
+    updates: Updates,
 }
 
 impl<J: JournalStore> Server<J> {
     pub fn new(supervisor: Supervisor<J>) -> Self {
+        let updates = Updates::new(supervisor.auto_update());
         Self {
             supervisor,
             subscribers: BTreeSet::new(),
             previews: BTreeMap::new(),
             stopping: false,
             log: Vec::new(),
+            updates,
         }
+    }
+
+    pub fn updates_mut(&mut self) -> &mut Updates {
+        &mut self.updates
+    }
+
+    /// What the update thread found, told to every subscriber.
+    pub fn found(&mut self, found: Found) {
+        self.updates.found(found);
+        self.announce_updates();
+    }
+
+    /// A staged build, once nothing is applied to any screen. The loop asks
+    /// after every turn, so a build that waits is looked at again whenever
+    /// claims change or anything else wakes the loop; nothing polls for it.
+    pub fn take_update(&mut self) -> Option<Staged> {
+        if !self.updates.waiting() {
+            return None;
+        }
+        let quiet = self.supervisor.quiet();
+        self.updates.take(quiet)
+    }
+
+    /// The staged build could not be put in place. This one keeps running.
+    pub fn update_failed(&mut self, message: String) {
+        self.updates.failed(message);
+        self.announce_updates();
+    }
+
+    fn announce_updates(&mut self) {
+        let report = Box::new(self.updates.report());
+        self.supervisor.notify(Notification::Updates(report));
     }
 
     pub fn supervisor(&self) -> &Supervisor<J> {
@@ -209,6 +245,15 @@ impl<J: JournalStore> Server<J> {
             Request::Windows => Response::Windows {
                 windows: host.windows(),
             },
+            Request::Updates { auto } => {
+                if let Some(on) = auto {
+                    s.set_auto_update(on);
+                    self.updates.set_auto(on);
+                    let report = Box::new(self.updates.report());
+                    s.notify(Notification::Updates(report));
+                }
+                Response::Updates(Box::new(self.updates.report()))
+            }
             Request::Shutdown => {
                 // Baselines go back here, not in the platform's exit path,
                 // because the platform's exit path is the one that does not
@@ -236,7 +281,6 @@ mod tests {
     use cortisoff_core::FADE_TIMER;
     use cortisoff_host::mock::{MemJournal, MockHost};
     use cortisoff_host::{ids, AppRef, CapabilityId, Event, Value};
-    use cortisoff_ipc::Notification;
 
     const GAME: &str = "return {
         start = function(cx) cx:watch('app.focus') end,
@@ -451,6 +495,92 @@ mod tests {
         };
         let out = server.on_frame(ClientId(1), frame, &mut host);
         assert!(matches!(responses(&out)[0], Response::Error { .. }));
+    }
+
+    fn staged(version: &str) -> Found {
+        Found::Staged {
+            path: std::env::temp_dir().join(format!("cortisoff-server-test-{version}")),
+            version: version.to_owned(),
+        }
+    }
+
+    /// An update staged while a plugin holds a capability waits, and goes the
+    /// first turn after the claim is let go and has faded out.
+    #[test]
+    fn a_staged_update_waits_until_nothing_is_held() {
+        let (mut server, mut host) = setup();
+        server.supervisor_mut().start(&mut host);
+        server.supervisor_mut().handle(&mut host, focus("game.exe"));
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
+
+        server.found(staged("9.0.0"));
+        assert_eq!(server.take_update(), None, "applied while a claim is held");
+
+        host.queue(focus("notepad.exe"));
+        server.pump(&mut host, std::time::Duration::from_millis(0));
+        for _ in 0..100 {
+            if server.supervisor().quiet() {
+                break;
+            }
+            assert_eq!(server.take_update(), None, "applied mid-fade");
+            host.now_ms += 40;
+            server
+                .supervisor_mut()
+                .handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(50)));
+        let update = server.take_update().expect("applied once nothing is held");
+        assert_eq!(update.version, "9.0.0");
+        assert_eq!(server.take_update(), None, "handed over once");
+    }
+
+    #[test]
+    fn a_staged_update_is_not_applied_with_automatic_installs_off() {
+        let (mut server, mut host) = setup();
+        server.supervisor_mut().start(&mut host);
+        server.found(staged("9.0.0"));
+        let off = Request::Updates { auto: Some(false) };
+        server.on_frame(ClientId(1), request(1, off), &mut host);
+        assert_eq!(server.take_update(), None);
+    }
+
+    /// The setting goes through the wire both ways, is stored, and every
+    /// subscriber hears it changed.
+    #[test]
+    fn the_update_setting_round_trips_through_the_protocol() {
+        let (mut server, mut host) = setup();
+        server.supervisor_mut().start(&mut host);
+        server.on_frame(ClientId(2), request(1, Request::Subscribe), &mut host);
+        server.fan_out();
+
+        let read = Request::Updates { auto: None };
+        let out = server.on_frame(ClientId(1), request(2, read.clone()), &mut host);
+        let Response::Updates(report) = responses(&out)[0] else {
+            panic!("{out:?}");
+        };
+        assert!(report.auto, "on by default");
+        assert!(
+            !out.iter().any(|o| o.to == ClientId(2)),
+            "a read says nothing"
+        );
+
+        let off = Request::Updates { auto: Some(false) };
+        let out = server.on_frame(ClientId(1), request(3, off), &mut host);
+        let Response::Updates(report) = responses(&out)[0] else {
+            panic!("{out:?}");
+        };
+        assert!(!report.auto);
+        assert!(!server.supervisor().auto_update(), "stored");
+        assert!(out.iter().any(|o| o.to == ClientId(2)
+            && matches!(
+                &o.frame,
+                Frame::Notification {
+                    notification: Notification::Updates(r)
+                } if !r.auto
+            )));
+
+        let out = server.on_frame(ClientId(1), request(4, read), &mut host);
+        assert!(matches!(responses(&out)[0], Response::Updates(r) if !r.auto));
     }
 
     /// A window that dies mid-drag must not leave its preview on the screen:

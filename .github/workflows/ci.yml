@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - main
-      - "boite/**"
   workflow_dispatch:
 
 permissions:
@@ -67,11 +66,11 @@ jobs:
       # check rather than the first one that failed.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
       # The capture tests render through wgpu and hosted runners have no GPU,
       # so they are #[ignore]d and run on a developer machine with
       # `cargo test -p cortisoff-app --test capture -- --ignored`.
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast
