@@ -129,13 +129,22 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
   # The release profile (fat LTO, abort on panic) builds nothing a pull request
-  # does, and a release is the wrong place to learn it breaks. Built from main
-  # only, and kept a week as a build to try.
+  # does, and a release is the wrong place to learn it breaks. Windows is built
+  # from main. A manual run builds every release target of any branch, to try
+  # it on Linux or macOS before it ships:
+  # `gh workflow run ci.yml --ref <branch>`. Kept a week.
   release-build:
-    name: release build (windows)
+    name: release build (${{ matrix.key }})
     needs: changes
     if: needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request'
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch'
+          && '[{"key":"windows-x86_64","os":"windows-2025","ext":".exe"},{"key":"linux-x86_64","os":"ubuntu-24.04","ext":""},{"key":"darwin-aarch64","os":"macos-26","ext":""},{"key":"darwin-x86_64","os":"macos-26-intel","ext":""}]'
+          || '[{"key":"windows-x86_64","os":"windows-2025","ext":".exe"}]') }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
     steps:
@@ -143,6 +152,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libssl-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -161,10 +188,10 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cortisoff-windows-x86_64
+          name: cortisoff-${{ matrix.key }}
           path: |
-            target/release/cortisoff.exe
-            target/release/cortisoff-cli.exe
+            target/release/cortisoff${{ matrix.ext }}
+            target/release/cortisoff-cli${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 7
 
