@@ -29,6 +29,7 @@ pub fn stop_requested() -> bool {
 /// Windows asking whether the session may end.
 pub fn request_stop() {
     STOP.store(true, Ordering::Relaxed);
+    crate::pipe::wake();
 }
 
 /// Borrow the terminal this process was started from, if any.
@@ -44,8 +45,10 @@ pub fn attach_parent_console() -> bool {
 /// Windows gives a console close roughly five seconds before killing the
 /// process, and the handler runs on its own thread. Setting a flag and
 /// returning immediately keeps the shutdown on the main thread, where the host
-/// and its actuators live.
+/// and its actuators live. The loop waits with no timeout, so the handler
+/// wakes it the way a pipe client does.
 unsafe extern "system" fn handler(_kind: u32) -> BOOL {
     STOP.store(true, Ordering::Relaxed);
+    crate::pipe::wake();
     true.into()
 }

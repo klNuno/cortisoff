@@ -88,17 +88,30 @@ const SETTLE: [Duration; 3] = [
 const ENGINE_TIMER_BASE: usize = 1;
 
 /// How long without input counts as away. Windows emits no idle event at all,
-/// so this is a poll, one of the two in the whole daemon.
+/// so reaching it is a timer set for that moment; coming back is raw input.
 const DEFAULT_IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// How often idle is looked at again while a film or a fullscreen game holds
+/// the user present, the one idle case with no event to wait for.
+const HELD_RECHECK: Duration = Duration::from_secs(15);
 
 /// How often `audio.active` is read while a plugin watches it. A meter has no
 /// event, and a film starting is not a frame deadline.
 const AUDIO_EVERY: Duration = Duration::from_secs(30);
 
+/// The longest wait when the kernel refused the wake event, the only case
+/// where the pump has to look again on its own.
+const FALLBACK_TICK_MS: u32 = 500;
+
 pub struct WinHost {
     window: HWND,
     foreground_hook: Option<HWINEVENTHOOK>,
     location_hook: Option<HWINEVENTHOOK>,
+    /// Some plugin watches `app.maximized`, so the location hook follows the
+    /// foreground window's process.
+    location_wanted: bool,
+    /// Raw input is registered, which it is only while the user is away.
+    input_sunk: bool,
     session_watched: bool,
     power_watch: Option<HPOWERNOTIFY>,
     audio_watched: bool,
@@ -170,6 +183,8 @@ impl WinHost {
             window,
             foreground_hook: None,
             location_hook: None,
+            location_wanted: false,
+            input_sunk: false,
             session_watched: false,
             power_watch: None,
             audio_watched: false,
@@ -254,28 +269,31 @@ impl WinHost {
         }
     }
 
-    fn away_seconds(&self) -> u32 {
+    /// Seconds since the last keyboard or mouse input, and whether a
+    /// fullscreen application or sound playing holds the user present
+    /// whatever the input says.
+    fn away(&self) -> (u32, bool) {
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,
         };
         if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-            return 0;
+            return (0, false);
         }
         let seconds = unsafe { GetTickCount() }.wrapping_sub(info.dwTime) / 1000;
-        if seconds == 0 || self.fullscreen_now() || self.audio.playing() {
-            0
-        } else {
-            seconds
+        if seconds == 0 {
+            return (0, false);
         }
+        (seconds, self.fullscreen_now() || self.audio.playing())
     }
 
     fn sample_idle(&mut self) -> Event {
-        let seconds = self.away_seconds();
+        let (seconds, held) = self.away();
+        let seconds = if held { 0 } else { seconds };
         self.idle = u64::from(seconds) >= self.idle_after.as_secs();
         self.idle_seconds = idle_bucket(seconds, &self.idle_thresholds);
         if self.idle_watched {
-            self.arm_idle_timer_at(seconds);
+            self.arm_idle(seconds, held);
         }
         Event::Idle {
             idle: self.idle,
@@ -283,15 +301,59 @@ impl WinHost {
         }
     }
 
-    /// Check near the next threshold, and once per second while away so
-    /// keyboard or mouse input resumes playback without a long polling delay.
-    fn arm_idle_timer(&self) {
-        self.arm_idle_timer_at(self.away_seconds());
+    fn arm_idle_timer(&mut self) {
+        let (seconds, held) = self.away();
+        self.arm_idle(if held { 0 } else { seconds }, held);
     }
 
-    fn arm_idle_timer_at(&self, seconds: u32) {
-        let ms = idle_poll_after(seconds, &self.idle_thresholds) * 1000;
-        unsafe { SetCoalescableTimer(self.window, IDLE_TIMER, ms, None, 100) };
+    /// Wake at the next threshold, and hear the user come back.
+    ///
+    /// Reaching a threshold is a timer set for exactly then: no input for N
+    /// seconds has no event. Coming back is raw input, registered only while
+    /// away. A film or a fullscreen game holds the user present, and its end
+    /// has no event here when no plugin watches sound, so that one case is
+    /// looked at again every [`HELD_RECHECK`].
+    fn arm_idle(&mut self, seconds: u32, held: bool) {
+        let away = idle_bucket(seconds, &self.idle_thresholds) > 0;
+        let sunk = self.sink_input(away);
+        let wait = if held {
+            Some(HELD_RECHECK.as_secs() as u32)
+        } else if away && !sunk {
+            // Raw input refused: the old way, one look a second.
+            Some(1)
+        } else {
+            next_threshold_in(seconds, &self.idle_thresholds)
+        };
+        match wait {
+            Some(s) => unsafe {
+                SetCoalescableTimer(self.window, IDLE_TIMER, s.max(1) * 1000, None, 100);
+            },
+            None => {
+                let _ = unsafe { KillTimer(self.window, IDLE_TIMER) };
+            }
+        }
+    }
+
+    /// Register or drop raw input; true when the wanted state holds.
+    fn sink_input(&mut self, on: bool) -> bool {
+        if on != self.input_sunk && sources::sink_input(self.window, on) {
+            self.input_sunk = on;
+        }
+        self.input_sunk == on
+    }
+
+    /// Scope the location hook to the process owning `hwnd`, the new
+    /// foreground window. False only when Windows refused the hook for a real
+    /// window.
+    fn follow_foreground(&mut self, hwnd: HWND) -> bool {
+        if let Some(hook) = self.location_hook.take() {
+            sources::unhook_foreground(hook);
+        }
+        if !self.location_wanted || hwnd.is_invalid() {
+            return true;
+        }
+        self.location_hook = sources::hook_location(hwnd);
+        self.location_hook.is_some()
     }
 
     /// Arm the next push of a display change, or stop once the last one in
@@ -363,6 +425,7 @@ impl WinHost {
         match raw {
             Raw::Foreground(hwnd) => {
                 let hwnd = HWND(hwnd as *mut _);
+                self.follow_foreground(hwnd);
                 let mut out: Vec<Event> = self.foreground_event(hwnd).into_iter().collect();
                 out.extend(self.maximized_event(hwnd));
                 // Cheap one-shot read, and the moment it can change is exactly
@@ -403,7 +466,11 @@ impl WinHost {
                 self.on_battery = on_battery;
                 vec![Event::PowerSource { on_battery }]
             }
-            Raw::Timer(IDLE_TIMER) => {
+            Raw::Timer(IDLE_TIMER) | Raw::Input => {
+                if !self.idle_watched {
+                    self.sink_input(false);
+                    return Vec::new();
+                }
                 self.names.prune();
                 let before = (self.idle, self.idle_seconds);
                 let event = self.sample_idle();
@@ -652,20 +719,20 @@ impl Host for WinHost {
             _ => {}
         }
 
-        match (asked(ids::APP_MAXIMIZED), self.location_hook) {
-            (true, None) => {
-                self.location_hook = Some(sources::hook_location().ok_or_else(|| {
-                    ActuatorError::on(
-                        CapabilityId::new(ids::APP_MAXIMIZED),
-                        "SetWinEventHook refused the location hook",
-                    )
-                })?);
+        let maximized = asked(ids::APP_MAXIMIZED);
+        if maximized != self.location_wanted {
+            self.location_wanted = maximized;
+            let foreground = if maximized {
+                unsafe { GetForegroundWindow() }
+            } else {
+                HWND::default()
+            };
+            if !self.follow_foreground(foreground) {
+                return Err(ActuatorError::on(
+                    CapabilityId::new(ids::APP_MAXIMIZED),
+                    "SetWinEventHook refused the location hook",
+                ));
             }
-            (false, Some(hook)) => {
-                sources::unhook_foreground(hook);
-                self.location_hook = None;
-            }
-            _ => {}
         }
 
         match (asked(ids::SESSION_LOCK), self.session_watched) {
@@ -698,6 +765,7 @@ impl Host for WinHost {
             self.arm_idle_timer();
         } else {
             let _ = unsafe { KillTimer(self.window, IDLE_TIMER) };
+            self.sink_input(false);
         }
 
         match (asked(ids::AUDIO_ACTIVE), self.audio_watched) {
@@ -786,11 +854,16 @@ impl Host for WinHost {
             return self.snapshot();
         }
 
-        let ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        // Blocks until a message arrives, a pipe client sends something, or the
-        // timeout runs out. This is the whole cost of an idle daemon: one
-        // thread parked in the kernel.
+        // `u32::MAX` is INFINITE. Blocks until a message arrives, a pipe client
+        // sends something, or something calls `pipe::wake`. This is the whole
+        // cost of an idle daemon: one thread parked in the kernel.
+        let mut ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
         let arrived = crate::pipe::arrived();
+        if arrived.is_none() {
+            // Without the event nothing but a message can wake the wait, and
+            // a pipe client or a Ctrl-C would go unseen.
+            ms = ms.min(FALLBACK_TICK_MS);
+        }
         let handles = arrived.as_ref().map(std::slice::from_ref);
         unsafe {
             MsgWaitForMultipleObjectsEx(handles, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -832,6 +905,7 @@ impl Drop for WinHost {
         }
         let _ = unsafe { KillTimer(self.window, IDLE_TIMER) };
         let _ = unsafe { KillTimer(self.window, AUDIO_TIMER) };
+        self.sink_input(false);
         let _ = unsafe { DestroyWindow(self.window) };
     }
 }
@@ -850,16 +924,12 @@ fn idle_bucket(seconds: u32, thresholds: &[u32]) -> u32 {
         .unwrap_or(0)
 }
 
-fn idle_poll_after(seconds: u32, thresholds: &[u32]) -> u32 {
-    if idle_bucket(seconds, thresholds) > 0 {
-        return 1;
-    }
+/// Seconds until the next threshold above `seconds`, `None` past the last.
+fn next_threshold_in(seconds: u32, thresholds: &[u32]) -> Option<u32> {
     thresholds
         .iter()
-        .filter_map(|t| t.checked_sub(seconds))
+        .filter_map(|t| t.checked_sub(seconds).filter(|d| *d > 0))
         .min()
-        .unwrap_or(15)
-        .clamp(1, 15)
 }
 
 #[cfg(test)]
@@ -874,8 +944,18 @@ mod idle_tests {
         assert_eq!(idle_bucket(119, &thresholds), 60);
         assert_eq!(idle_bucket(120, &thresholds), 120);
         assert_eq!(idle_bucket(0, &thresholds), 0);
-        assert_eq!(idle_poll_after(59, &thresholds), 1);
-        assert_eq!(idle_poll_after(120, &thresholds), 1);
-        assert_eq!(idle_poll_after(0, &thresholds), 15);
+    }
+
+    /// The timer lands on the next crossing and nowhere before it: an active
+    /// user costs one wakeup per threshold, an absent one none past the last.
+    #[test]
+    fn the_idle_timer_waits_for_the_next_crossing_only() {
+        let thresholds = [60, 120, 300];
+        assert_eq!(next_threshold_in(0, &thresholds), Some(60));
+        assert_eq!(next_threshold_in(59, &thresholds), Some(1));
+        assert_eq!(next_threshold_in(60, &thresholds), Some(60));
+        assert_eq!(next_threshold_in(200, &thresholds), Some(100));
+        assert_eq!(next_threshold_in(300, &thresholds), None);
+        assert_eq!(next_threshold_in(4000, &thresholds), None);
     }
 }

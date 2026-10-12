@@ -85,18 +85,16 @@ fn current_user() -> Option<String> {
 /// user's token, no time limit, never a second copy, and nothing that stops it
 /// on battery.
 ///
-/// The second trigger is what makes a logon trigger enough on a machine that
-/// is never rebooted. A daemon that died at midday stayed dead until the next
-/// logon, which on a desktop left running for a week is a week without it.
-/// Every five minutes, forever, Task Scheduler tries to start it again;
-/// `MultipleInstancesPolicy IgnoreNew` means that costs nothing at all while
-/// the daemon it started is still alive, and the session mutex catches the one
-/// case it cannot see, a daemon someone started by hand.
+/// One trigger, the logon. A crash in between is the guard's to answer
+/// (`cortisoff-daemon`, `guard.rs`): `--daemon` waits on the process that
+/// runs the plugins and starts it again only when it crashed. The task used to
+/// carry a second trigger repeating every five minutes for that, which could
+/// not tell a crash from a stop and undid every stop within five minutes.
 ///
-/// `RestartOnFailure` is not that safety net, whatever its name suggests: on
+/// `RestartOnFailure` is no safety net, whatever its name suggests: on
 /// Windows 11 26200 neither a non-zero exit nor an action that cannot be
-/// launched at all arms it. It stays because it costs nothing, and the
-/// repetition is what is relied on. `TRAPS.md`, platform and process model.
+/// launched at all arms it. It stays because it costs nothing. `TRAPS.md`,
+/// platform and process model.
 pub fn task_xml(daemon: &Path, user: &str) -> String {
     let command = escape(&daemon.to_string_lossy());
     let user = escape(user);
@@ -112,14 +110,6 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
       <UserId>{user}</UserId>
       <Delay>PT10S</Delay>
     </LogonTrigger>
-    <TimeTrigger>
-      <Enabled>true</Enabled>
-      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
-      <Repetition>
-        <Interval>PT5M</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -182,18 +172,18 @@ mod tests {
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
     }
 
-    /// A logon trigger alone only covers a machine that is turned off at
-    /// night. The repetition is what covers the one that is not, and
-    /// `IgnoreNew` is what makes it free while the daemon is alive.
+    /// A stop asked by the user lasts until the next logon: nothing in the
+    /// task starts the daemon on a timer.
     #[test]
-    fn a_dead_daemon_is_started_again_without_waiting_for_the_next_logon() {
+    fn only_a_logon_starts_the_daemon() {
         let xml = task_xml(Path::new(r"C:\cortisoff.exe"), "tom");
-        assert!(xml.contains("<Repetition>"));
-        assert!(xml.contains("<Interval>PT5M</Interval>"));
-        assert!(
-            !xml.contains("<Duration>"),
-            "no duration means the repetition never ends"
+        assert_eq!(
+            xml.matches("Trigger>").count(),
+            2,
+            "one trigger, open and close"
         );
+        assert!(xml.contains("<LogonTrigger>"));
+        assert!(!xml.contains("<Repetition>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
     }
 

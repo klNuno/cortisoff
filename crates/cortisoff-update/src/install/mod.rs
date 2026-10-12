@@ -74,6 +74,10 @@ pub fn install(exe: &Path) -> Result<PathBuf, String> {
         let installed_cli = dir.join(CLI_EXE);
         if !same_path(&cli, &installed_cli) {
             replace::replace(&cli, &installed_cli)?;
+            // The app's own `.old` copy goes at its next start. Nothing
+            // starts the client that way, so its copy goes now, unless a
+            // `trace` still runs from it, and then at the next install.
+            let _ = replace::cleanup_previous_at(&installed_cli);
         }
     }
     register(&target)?;

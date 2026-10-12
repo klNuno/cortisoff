@@ -8,7 +8,9 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, FILETIME, HANDLE,
 };
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::ProcessStatus::{
+    GetProcessMemoryInfo, K32EmptyWorkingSet, PROCESS_MEMORY_COUNTERS,
+};
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenProcess, ProcessPowerThrottling,
     SetProcessInformation, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
@@ -134,4 +136,12 @@ pub fn efficiency_mode() -> bool {
         )
     }
     .is_ok()
+}
+
+/// Hand this process's resident pages back to Windows. For a process that is
+/// about to wait on one handle for hours, the guard, every page it touched
+/// while starting is memory it will not read again. A page it does need comes
+/// back on the next touch.
+pub fn shed_memory() {
+    let _ = unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
 }

@@ -43,7 +43,8 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent, WaitForSingleObject,
+    INFINITE,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
@@ -57,12 +58,62 @@ const BUFFER: u32 = 64 * 1024;
 static ARRIVED: OnceLock<usize> = OnceLock::new();
 
 /// The event the daemon's pump waits on beside its messages. `None` only if
-/// the kernel refused an event, and then the pump falls back to its tick.
+/// the kernel refused an event, and then the pump falls back to a tick.
 pub(crate) fn arrived() -> Option<HANDLE> {
     let address = *ARRIVED.get_or_init(|| {
         unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_or(0, |h| h.0 as usize)
     });
     (address != 0).then_some(HANDLE(address as *mut c_void))
+}
+
+/// Manual reset, named per session, set by a daemon once it listens. Kept
+/// open for the daemon's life, as an address for the same reason as
+/// [`ARRIVED`].
+static UP: OnceLock<usize> = OnceLock::new();
+
+/// The session's "a daemon listens" event, opened or created. Whoever comes
+/// first creates it: a window waiting for a daemon, or the daemon itself.
+fn up_event(session: u32) -> Option<HANDLE> {
+    let name = HSTRING::from(format!(r"Local\cortisoff.{session}.up"));
+    unsafe { CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }.ok()
+}
+
+/// Wait until a daemon may be listening in this session, with nothing
+/// looking on a timer: the daemon sets an event once it listens, and this
+/// waits on it. Returns at once when one already answers.
+///
+/// A daemon that crashed leaves the event set, so it is reset first, and the
+/// pipe is tried once more in case a daemon started between the caller's
+/// failed connect and the reset.
+pub fn wait_for_daemon(session: u32) {
+    let Some(event) = up_event(session) else {
+        // No event to wait on: look again in a moment instead.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        return;
+    };
+    unsafe {
+        let _ = ResetEvent(event);
+        if connect(session).is_none() {
+            WaitForSingleObject(event, INFINITE);
+        }
+        let _ = CloseHandle(event);
+    }
+}
+
+/// Say this daemon listens, to every window waiting for one.
+fn announce_up(session: u32) {
+    let address = *UP.get_or_init(|| up_event(session).map_or(0, |h| h.0 as usize));
+    if address != 0 {
+        let _ = unsafe { SetEvent(HANDLE(address as *mut c_void)) };
+    }
+}
+
+/// And that it no longer does. A crash skips this, which `wait_for_daemon`
+/// allows for.
+fn announce_down() {
+    if let Some(&address) = UP.get().filter(|a| **a != 0) {
+        let _ = unsafe { ResetEvent(HANDLE(address as *mut c_void)) };
+    }
 }
 
 /// Wake the daemon's pump from any thread, the same way a pipe handover does.
@@ -210,6 +261,7 @@ impl PipeServer {
                 accept_loop(accept_name, sddl, first.0, accept_sender)
             })
             .map_err(|e| format!("could not start the pipe thread: {e}"))?;
+        announce_up(session);
 
         Ok(Self {
             name,
@@ -264,6 +316,12 @@ impl PipeServer {
 
     pub fn disconnect(&mut self, id: u64) {
         self.clients.retain(|(known, _)| *known != id);
+    }
+}
+
+impl Drop for PipeServer {
+    fn drop(&mut self) {
+        announce_down();
     }
 }
 

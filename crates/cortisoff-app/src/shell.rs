@@ -221,12 +221,20 @@ impl Shell {
             });
         self.notice(ui.ctx());
 
-        // A status line reads the clock, and a pending edit has a deadline.
+        // Status lines read the clock to the minute, so the page is drawn again
+        // when the minute turns and not before. A pending edit has a deadline,
+        // and a start or a stop in transit falls back to the daemon's own
+        // state once it is no longer recent.
         if matches!(self.view, View::Plugin(_)) || self.view == View::Overview {
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            ui.ctx().request_repaint_after(until_next_minute());
         }
         if !self.pending.is_empty() {
             ui.ctx().request_repaint_after(SETTLE);
+        }
+        for asked in [self.starting, self.stopping].into_iter().flatten() {
+            if let Some(left) = IN_TRANSIT.checked_sub(asked.elapsed()) {
+                ui.ctx().request_repaint_after(left);
+            }
         }
     }
 
@@ -1507,6 +1515,14 @@ fn installed() -> bool {
 /// Whether a start or a stop asked at `t` is still on its way.
 fn recent(t: Option<Instant>) -> bool {
     t.is_some_and(|t| t.elapsed() < IN_TRANSIT)
+}
+
+/// Time left in the current minute of the local clock, plus a little so the
+/// frame lands after the turn rather than just before it.
+fn until_next_minute() -> Duration {
+    let (_, _, _, _, _, s, ms) = local_time();
+    let into = u64::from(s.min(59)) * 1000 + u64::from(ms.min(999));
+    Duration::from_millis(60_000 - into + 20)
 }
 
 /// The logo, which is also cortisoff's own switch: the gauge and the name,
