@@ -204,14 +204,14 @@ impl ColorTemp {
                 live.panel.remove(key);
                 live.refused.insert(key.clone());
                 let device = ddc::device_of(key).to_owned();
-                if push_ramp(&device, &ramp, &mut clamped) {
+                if push_ramp(&device, c, &ramp, &mut clamped) {
                     live.gamma.insert(device);
                     carried = true;
                 }
             }
         }
         for device in &plan.gamma {
-            if push_ramp(device, &ramp, &mut clamped) {
+            if push_ramp(device, c, &ramp, &mut clamped) {
                 live.gamma.insert(device.clone());
                 carried = true;
             }
@@ -449,12 +449,14 @@ impl Drop for ColorTemp {
 /// The ramp as wanted and, when Windows refuses it, the strongest one it
 /// accepts. The clamp is computed once per apply, and only once a write has
 /// been refused, so a machine with the range lifted never pays for it.
-fn push_ramp(device: &str, ramp: &Ramp, clamped: &mut Option<Option<Ramp>>) -> bool {
+fn push_ramp(device: &str, c: &Rgb, ramp: &Ramp, clamped: &mut Option<Option<Ramp>>) -> bool {
     if screen::write(device, ramp) {
         return true;
     }
     clamped
-        .get_or_insert_with(|| color::within_windows_range(ramp))
+        .get_or_insert_with(|| {
+            color::within_windows_range(c).map(|inside| color::ramp_for(&inside))
+        })
         .as_ref()
         .is_some_and(|inside| screen::write(device, inside))
 }

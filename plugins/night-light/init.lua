@@ -1,17 +1,16 @@
 -- Night light: the colour temperature over the day.
 --
--- The daemon half claims display.color_temp and moves it a little every
--- half minute while a fade runs, each step fading into the next, so the
--- evening comes in without a visible jump. Between fades nothing changes,
--- so it sleeps until the next one starts. The window half draws the day and
--- edits the settings; both read the same table.
+-- The daemon half asks for the night colour once at the evening edge and lets
+-- it go once at the morning edge. cortisoff runs the fade itself, frame by
+-- frame, so nothing here steps it; between the edges the plugin sleeps. The
+-- window half draws the day and edits the settings; both read the same table.
 
 local plugin = {}
 
 plugin.settings = {
   evening = 20 * 60,
   morning = 7 * 60,
-  fade = 30,
+  fade_seconds = 60,
   night = 3200,
   day = 6500,
   pause_when_filled = true,
@@ -19,7 +18,10 @@ plugin.settings = {
 }
 
 local CAP = "display.color_temp"
-local STEP_MS = 30000
+local MAX_FADE = 300
+-- A fullscreen game starting, an exception or a pause: the colour gets out of
+-- the way quickly whatever the evening fade is, and comes back as quickly.
+local QUICK_MS = 1000
 
 local function clock(minute)
   minute = math.floor(minute + 0.5) % 1440
@@ -30,34 +32,49 @@ local function round(x)
   return math.floor(x + 0.5)
 end
 
--- Kelvin at a minute of the day: night inside the window, day outside, a
--- cosine fade inside each edge.
-local function kelvin_at(s, minute)
-  local into = (minute - s.evening) % 1440
-  local window = (s.morning - s.evening) % 1440
-  local fade = math.max(s.fade, 1)
-  local strength = 0
-  if into < window then
-    local t = math.min(into / fade, (window - into) / fade, 1)
-    strength = 0.5 - 0.5 * math.cos(math.pi * t)
+-- Seconds each change takes, 0 for at once. Up to 0.2 the setting was
+-- `fade`, in minutes; a stored one is read once and replaced.
+local function fade_s(s)
+  if s.fade ~= nil then
+    return math.min(math.max(s.fade, 0) * 60, MAX_FADE)
   end
-  return s.day + (s.night - s.day) * strength
+  return math.min(math.max(s.fade_seconds or 0, 0), MAX_FADE)
 end
 
--- Minutes from `minute` until the kelvin next starts to move, or nil while a
--- fade is running. Outside the night window that is the evening; on the
--- plateau, the start of the morning fade.
-local function still_for(s, minute)
+-- Where `minute` sits: inside the night window or not, and how many minutes
+-- since the edge that started the current half.
+local function phase(s, minute)
   local into = (minute - s.evening) % 1440
   local window = (s.morning - s.evening) % 1440
-  local fade = math.max(s.fade, 1)
-  if into >= window then
-    return 1440 - into
+  if into < window then
+    return true, into
   end
-  if into < fade or window - into < fade then
-    return nil
+  return false, into - window
+end
+
+-- Kelvin at a minute of the day, for the drawing: each edge fades for
+-- `fade_s` seconds, then the colour holds.
+local function kelvin_at(s, minute)
+  local night, since = phase(s, minute)
+  local fade = fade_s(s) / 60
+  local from, to = s.night, s.day
+  if night then from, to = s.day, s.night end
+  if fade > 0 and since < fade then
+    local t = since / fade
+    t = t * t * (3 - 2 * t)
+    return from + (to - from) * t
   end
-  return window - fade - into
+  return to
+end
+
+-- Minutes until the next edge.
+local function next_edge(s, minute)
+  local into = (minute - s.evening) % 1440
+  local window = (s.morning - s.evening) % 1440
+  if into < window then
+    return window - into
+  end
+  return 1440 - into
 end
 
 local function excepted(s, app)
@@ -71,36 +88,22 @@ end
 
 -- ---- daemon ---------------------------------------------------------------
 
-local paused_until, resume_timer, step_timer, stepping
+local paused_until, resume_timer, edge_timer
+-- The next change is quick rather than a whole evening fade: the way back
+-- from a reason to stand aside, or a setting just edited.
+local quick_next = false
 
 local settle
-
--- The next look: a step while a fade runs, the start of the next fade
--- otherwise. A resume, a clock change or a new setting reaches `settle`
--- through an event and moves this along with it. A step already on its way
--- keeps its time: re-armed on every focus change, it slipped back each time
--- and the fade stood still while the user switched windows.
-local function schedule(cx, s, minute)
-  local still = minute and still_for(s, minute)
-  if step_timer and stepping and not still then return end
-  if step_timer then cx:cancel(step_timer) end
-  stepping = not still
-  -- Just past the edge, so the look lands inside the fade.
-  local wait = still and still * 60000 + 50 or STEP_MS
-  step_timer = cx:after(wait, function(cx, s)
-    step_timer = nil
-    settle(cx, s)
-  end)
-end
 
 function settle(cx, s)
   local minute, mono = cx:now()
   local world = cx:world()
-  local k = minute and kelvin_at(s, minute) or s.day
+  local night = minute and phase(s, minute)
+  local fade = fade_s(s) * 1000
   local reason
   if paused_until and mono < paused_until then
     reason = "paused"
-  elseif s.pause_when_filled and world.maximized then
+  elseif s.pause_when_filled and world.fullscreen then
     reason = "filled"
   elseif excepted(s, world.app) then
     reason = "except"
@@ -108,25 +111,39 @@ function settle(cx, s)
     reason = "no clock"
   end
 
-  if reason or k >= s.day - 1 then
-    cx:release(CAP, { fade = reason and 1500 or STEP_MS })
-  else
-    local ok, err = cx:claim(CAP, round(k), { fade = STEP_MS })
+  local quick = math.min(fade, QUICK_MS)
+  if reason then
+    cx:release(CAP, { fade = quick })
+  elseif night then
+    local ok, err = cx:claim(CAP, round(s.night), { fade = quick_next and quick or fade })
     if not ok then reason = err end
+  else
+    cx:release(CAP, { fade = quick_next and quick or fade })
   end
+  quick_next = reason ~= nil
+
   cx:publish({
-    kelvin = round(k),
-    holding = reason == nil and k < s.day - 1,
+    kelvin = round(minute and kelvin_at(s, minute) or s.day),
+    holding = reason == nil and night == true,
     reason = reason,
     paused_until = paused_until and minute and clock(minute + (paused_until - mono) / 60000),
   })
-  schedule(cx, s, minute)
+
+  if edge_timer then cx:cancel(edge_timer) end
+  edge_timer = nil
+  if minute then
+    -- Just past the edge, so the look lands on the new side of it.
+    edge_timer = cx:after(math.ceil(next_edge(s, minute) * 60000) + 50, function(cx, s)
+      edge_timer = nil
+      settle(cx, s)
+    end)
+  end
 end
 
 function plugin.start(cx, s)
-  step_timer = nil
+  edge_timer, quick_next = nil, false
   cx:watch("app.focus")
-  cx:watch("app.maximized")
+  cx:watch("app.fullscreen")
   cx:watch("clock")
   settle(cx, s)
 end
@@ -144,12 +161,14 @@ function plugin.on(cx, s, ev)
     paused_until = nil
     if resume_timer then cx:cancel(resume_timer) end
     resume_timer = nil
+  elseif ev.kind == "settings" then
+    quick_next = true
   end
   settle(cx, s)
 end
 
 function plugin.stop(cx)
-  cx:release(CAP, { fade = 1500 })
+  cx:release(CAP, { fade = QUICK_MS })
 end
 
 -- ---- window ---------------------------------------------------------------
@@ -170,16 +189,32 @@ local function timeline(ui, s, now)
       p:text(x, bottom + 8, string.format("%02d:00", hour), { size = 12, color = "subtle", align = align })
     end
 
-    local curve, floor, fill, fade = {}, {}, {}, {}
-    for m = 0, 1440, 4 do
+    -- The curve is sampled every 4 minutes, plus both edges and the end of
+    -- each fade, so a fade of a few seconds still draws as a clean step.
+    local marks = {}
+    for m = 0, 1440, 4 do marks[#marks + 1] = m end
+    local fade = fade_s(s) / 60
+    for _, edge in ipairs({ s.evening, s.morning }) do
+      marks[#marks + 1] = edge
+      marks[#marks + 1] = edge + math.max(fade, 0.01)
+      marks[#marks + 1] = edge - 0.01
+    end
+    local kept = {}
+    for _, m in ipairs(marks) do
+      if m >= 0 and m <= 1440 then kept[#kept + 1] = m end
+    end
+    table.sort(kept)
+
+    local curve, floor, fill, faded = {}, {}, {}, {}
+    for _, m in ipairs(kept) do
       local k = kelvin_at(s, m)
       local x = x_of(m)
       curve[#curve + 1], curve[#curve + 2] = x, y_of(k)
       floor[#floor + 1], floor[#floor + 2] = x, bottom
       fill[#fill + 1] = alpha(kelvin(k), 0.22)
-      fade[#fade + 1] = alpha(kelvin(k), 0.04)
+      faded[#faded + 1] = alpha(kelvin(k), 0.04)
     end
-    p:strip(curve, floor, fill, fade)
+    p:strip(curve, floor, fill, faded)
 
     local upper, lower, colours = {}, {}, {}
     for i = 0, 240 do
@@ -208,7 +243,7 @@ end
 
 local REASONS = {
   paused = "Paused",
-  filled = "An app fills the screen",
+  filled = "An app is fullscreen",
   except = "Not in this app",
   ["no clock"] = "No clock",
 }
@@ -229,6 +264,15 @@ function plugin.status(s, st)
     }
   end
   return { line = "Daylight", detail = "Warms at " .. clock(s.evening), state = "waiting" }
+end
+
+local function duration(v)
+  v = round(v)
+  if v == 0 then return "Instant" end
+  if v < 60 then return string.format("%d s", v) end
+  local m, sec = math.floor(v / 60), v % 60
+  if sec == 0 then return string.format("%d min", m) end
+  return string.format("%d min %02d", m, sec)
 end
 
 local new_app = ""
@@ -271,17 +315,18 @@ function plugin.page(ui, s, st)
       })
     end)
     ui:divider()
-    ui:row("Fade", "How long each change takes.", function(ui)
-      s.fade = ui:slider(s.fade, {
-        min = 0, max = 120, step = 1,
-        text = function(v) return string.format("%d min", round(v)) end,
-      })
+    ui:row("Fade", "How long the evening and the morning take.", function(ui)
+      local was = fade_s(s)
+      local v = ui:slider(was, { min = 0, max = MAX_FADE, step = 5, text = duration })
+      if v ~= was or s.fade ~= nil then
+        s.fade_seconds, s.fade = v, nil
+      end
     end)
   end)
   ui:space(12)
 
   ui:card("Exceptions", function(ui)
-    ui:row("Pause while an app fills the screen", "Games, films and maximised windows keep their colours.",
+    ui:row("Pause while an app is fullscreen", "Games and films keep their colours.",
       function(ui) s.pause_when_filled = ui:switch(s.pause_when_filled) end)
     ui:divider()
     ui:row("Never in these apps", nil, function(ui)
