@@ -45,7 +45,15 @@ It needs an X11 session. Under Wayland the night light and the idle time are mis
 
 ### macOS
 
-`cortisoff-darwin-aarch64` (Apple Silicon) and `cortisoff-darwin-x86_64` (Intel) are on the same release page. They are built and tested on every change but have not run on a real Mac yet, so please report what you find.
+macOS 11 or later:
+
+1. Download `cortisoff-darwin-aarch64.zip` (Apple Silicon) or `cortisoff-darwin-x86_64.zip` (Intel) from the same release page, and open it: it unpacks `Cortisoff.app`.
+2. Open `Cortisoff.app`. The app is not notarised, so macOS says it cannot check it: click Done, then in System Settings > Privacy & Security click Open Anyway next to Cortisoff.
+3. It copies itself to `~/Applications/Cortisoff.app` and starts with your session. The downloaded copy can go.
+
+Plugins that read window titles or send keys ask for Accessibility in System Settings > Privacy & Security, and macOS may ask again after an update. `cortisoff-cli` is inside the app, in `Cortisoff.app/Contents/MacOS`.
+
+The macOS build is built and tested on every change but has not run on a real Mac yet, so please report what you find.
 
 ### Updates
 
