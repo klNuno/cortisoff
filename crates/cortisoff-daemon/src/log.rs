@@ -247,11 +247,10 @@ impl DaemonLog {
     /// A line that would only repeat the one already at the end of the file is
     /// dropped.
     ///
-    /// The logon task also tries to start the daemon every five minutes, so on
-    /// a machine where someone started it by hand instead, a copy is refused
-    /// the session nearly three hundred times a day. Written out, that is the
-    /// only thing left in the file within a week, and the file exists to
-    /// answer a question that needs the lines around it.
+    /// Anything that starts the daemon again and again while one runs (a
+    /// script, a launcher, a task someone wrote) would otherwise fill the file
+    /// with refusals, and the file exists to answer a question that needs the
+    /// lines around it.
     pub fn line_once(&mut self, stamp: Stamp, mark: Mark, text: &str) {
         let text = text.replace(['\n', '\r'], " ");
         let rest = format!("{:<7} {text}", mark.word());
@@ -423,8 +422,8 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// The safety-net trigger starts a copy every five minutes. Each one is
-    /// refused, and none of them may push the useful history out of the file.
+    /// A copy started while one runs is refused, however often it comes, and
+    /// none of them may push the useful history out of the file.
     #[test]
     fn a_refusal_that_repeats_the_last_line_is_not_written_again() {
         let path = scratch("once");

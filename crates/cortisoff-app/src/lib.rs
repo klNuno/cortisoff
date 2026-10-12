@@ -66,9 +66,15 @@ pub fn window(launch: Launch) -> Result<(), String> {
                     problem = Some(format!("Start at login: {e}"));
                 }
             }
-            // Rewrites the shortcut and the version Settings > Apps shows.
+            // Rewrites the shortcut and the version Settings > Apps shows,
+            // and the logon task, so a task an older build registered loses
+            // what this one no longer wants: the five minute repetition that
+            // undid every stop. The daemon is already stopped by now.
             Launch::Updated => {
                 let _ = install::install(&exe);
+                if cortisoff_daemon::starts_at_logon() {
+                    let _ = cortisoff_daemon::start_at_logon(true);
+                }
             }
             Launch::Normal => {}
         }

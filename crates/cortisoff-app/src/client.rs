@@ -8,7 +8,6 @@
 //! Neither thread ever blocks the frame; both wake it when something arrives.
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::time::Duration;
 
 use cortisoff_ipc::{Frame, Notification, Request, Response};
 
@@ -38,9 +37,6 @@ pub struct Link {
     requests: Sender<(Ask, Request)>,
     inbound: Receiver<Inbound>,
 }
-
-/// How often a missing daemon is looked for again.
-const RETRY: Duration = Duration::from_millis(700);
 
 impl Link {
     /// Start both threads. `wake` is called after anything arrives, so the
@@ -82,18 +78,18 @@ impl Link {
 fn subscribe(out: Sender<Inbound>, wake: impl Fn()) {
     let mut announced_down = false;
     loop {
-        let Some(mut client) = platform::connect() else {
+        let subscribed = platform::connect().and_then(|mut client| {
+            client.send(&Frame::request(1, Request::Subscribe)).ok()?;
+            Some(client)
+        });
+        let Some(mut client) = subscribed else {
             if !announced_down {
                 announced_down = out.send(Inbound::Disconnected).is_ok();
                 wake();
             }
-            std::thread::sleep(RETRY);
+            platform::wait_for_daemon();
             continue;
         };
-        if client.send(&Frame::request(1, Request::Subscribe)).is_err() {
-            std::thread::sleep(RETRY);
-            continue;
-        }
         if out.send(Inbound::Connected).is_err() {
             return;
         }
@@ -110,7 +106,7 @@ fn subscribe(out: Sender<Inbound>, wake: impl Fn()) {
         }
         announced_down = out.send(Inbound::Disconnected).is_ok();
         wake();
-        std::thread::sleep(RETRY);
+        platform::wait_for_daemon();
     }
 }
 
@@ -168,13 +164,26 @@ mod platform {
     pub fn connect() -> Option<Client> {
         cortisoff_win::connect(cortisoff_win::session_id())
     }
+
+    /// Parked on the event a daemon sets once it listens.
+    pub fn wait_for_daemon() {
+        cortisoff_win::wait_for_daemon(cortisoff_win::session_id());
+    }
 }
 
 #[cfg(unix)]
 mod platform {
     pub use cortisoff_unix::Client;
 
+    /// How often a missing daemon is looked for again. The socket has no
+    /// "now listening" signal yet; Windows has one (`TODO.md`).
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(700);
+
     pub fn connect() -> Option<Client> {
         cortisoff_unix::connect()
+    }
+
+    pub fn wait_for_daemon() {
+        std::thread::sleep(RETRY);
     }
 }

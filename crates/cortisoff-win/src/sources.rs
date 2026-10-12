@@ -15,11 +15,11 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetForegroundWindow, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
-    PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    DefWindowProcW, GetForegroundWindow, GetWindowThreadProcessId, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_SYSTEM_FOREGROUND, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_INPUT,
+    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 /// The keyboard twin of `NIN_SELECT`, Enter on a focused tray icon.
@@ -51,6 +51,10 @@ pub enum Raw {
     Hotkey(i32),
     /// A balloon on the notification-only icon timed out or was clicked.
     NoticeDone,
+    /// Keyboard or mouse input while the user was away. Raw input is only
+    /// registered while away, so this is the one record that says they are
+    /// back, with no timer looking for them.
+    Input,
 }
 
 thread_local! {
@@ -124,22 +128,41 @@ unsafe extern "system" fn on_foreground(
 }
 
 /// The foreground window moved or changed size. `EVENT_OBJECT_LOCATIONCHANGE`
-/// fires for every window, every caret and the mouse cursor, so the callback
-/// keeps only a top-level record about the window that has the focus and
-/// coalesces the burst a drag produces.
-pub fn hook_location() -> Option<HWINEVENTHOOK> {
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            None,
-            Some(on_location),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
+/// fires for every window, every caret and the mouse cursor of whatever
+/// process it is scoped to, so it is scoped to the process that owns the
+/// foreground window and moved along with the focus. Hooked system-wide it
+/// woke the daemon for every window anything moved, up to forty times a second
+/// on an idle desktop. The callback still keeps only a top-level record about
+/// the focused window and coalesces the burst a drag produces.
+///
+/// Refused for that one process, the hook falls back to the whole desktop:
+/// more wakeups, but no maximise missed until the focus moves.
+///
+/// `None` for no window, or when Windows refuses both.
+pub fn hook_location(foreground: HWND) -> Option<HWINEVENTHOOK> {
+    if foreground.is_invalid() {
+        return None;
+    }
+    let mut process = 0u32;
+    unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+    if process == 0 {
+        return None;
+    }
+    let hook = |process: u32| {
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(on_location),
+                process,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        (!hook.is_invalid()).then_some(hook)
     };
-    (!hook.is_invalid()).then_some(hook)
+    hook(process).or_else(|| hook(0))
 }
 
 unsafe extern "system" fn on_location(
@@ -164,6 +187,33 @@ unsafe extern "system" fn on_location(
 
 pub fn watch_session(window: HWND) -> bool {
     unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) }.is_ok()
+}
+
+/// Hear keyboard and mouse input from every application, or stop hearing it.
+///
+/// Windows has no event for "the user came back", and asking
+/// `GetLastInputInfo` once a second while they are away is what the daemon
+/// used to do. Raw input with `RIDEV_INPUTSINK` delivers `WM_INPUT` to this
+/// hidden window whoever has the focus; it is registered only while away, and
+/// dropped on the first record, so a moving mouse costs one message.
+pub fn sink_input(window: HWND, on: bool) -> bool {
+    use windows::Win32::UI::Input::{
+        RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE,
+    };
+    // Usage page 1, generic desktop: 2 is the mouse, 6 the keyboard.
+    let (flags, target) = if on {
+        (RIDEV_INPUTSINK, window)
+    } else {
+        (RIDEV_REMOVE, HWND::default())
+    };
+    let devices = [2u16, 6].map(|usage| RAWINPUTDEVICE {
+        usUsagePage: 1,
+        usUsage: usage,
+        dwFlags: flags,
+        hwndTarget: target,
+    });
+    unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
+        .is_ok()
 }
 
 pub fn unwatch_session(window: HWND) {
@@ -226,6 +276,11 @@ pub unsafe extern "system" fn wndproc(
         WM_HOTKEY => {
             push(Raw::Hotkey(wparam.0 as i32));
             LRESULT(0)
+        }
+        // The default procedure frees the input buffer, so it still runs.
+        WM_INPUT => {
+            push_once(Raw::Input);
+            DefWindowProcW(window, message, wparam, lparam)
         }
         m if m == crate::tray::TRAY_MESSAGE => {
             // Version 4: the event in the low word of lparam, the icon id in

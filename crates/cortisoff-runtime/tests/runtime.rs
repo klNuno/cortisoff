@@ -310,6 +310,70 @@ fn a_plugin_for_another_system_does_not_start() {
     assert!(r.error.unwrap().contains("macos"));
 }
 
+/// Night light wakes only when the colour moves: at the start of the next fade
+/// while nothing changes, every 30 s inside one. It used to look every 30 s all
+/// day, to find the same daylight each time.
+#[test]
+fn night_light_sleeps_until_the_colour_has_to_move() {
+    let due_in = |minute: u16| {
+        let night: Vec<Package> = cortisoff_runtime::builtin()
+            .into_iter()
+            .filter(|p| p.manifest.id == "night-light")
+            .collect();
+        let mut rig = Rig::new();
+        rig.host.clock = Some(Event::TimeOfDay {
+            minute,
+            second: 0,
+            millisecond: 0,
+        });
+        let mut rt = Runtime::new(night, &on(&["night-light"]), None).with_os("windows");
+        rig.with(|env| rt.start_all(env));
+        assert!(rt.report("night-light").unwrap().error.is_none());
+        rt.next_due().unwrap() - rig.host.now_ms
+    };
+    // The defaults: warm from 20:00 to 07:00, half an hour of fade each way.
+    assert_eq!(due_in(12 * 60), 8 * 3_600_000 + 50, "noon waits for 20:00");
+    assert_eq!(due_in(20 * 60 + 10), 30_000, "inside the evening fade");
+    assert_eq!(
+        due_in(22 * 60),
+        510 * 60_000 + 50,
+        "the night waits for 06:30"
+    );
+    assert_eq!(due_in(6 * 60 + 40), 30_000, "inside the morning fade");
+}
+
+/// A fade steps every 30 s whatever else happens. Re-arming the step on every
+/// focus change pushed it back each time, so switching windows during a fade
+/// held the colour still and it jumped once the switching stopped.
+#[test]
+fn a_focus_change_does_not_hold_back_a_fade_step() {
+    let night: Vec<Package> = cortisoff_runtime::builtin()
+        .into_iter()
+        .filter(|p| p.manifest.id == "night-light")
+        .collect();
+    let mut rig = Rig::new();
+    rig.host.clock = Some(Event::TimeOfDay {
+        minute: 20 * 60 + 10,
+        second: 0,
+        millisecond: 0,
+    });
+    let mut rt = Runtime::new(night, &on(&["night-light"]), None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let step = rt.next_due().unwrap();
+
+    rig.host.now_ms += 20_000;
+    let focus = Event::AppFocus(cortisoff_host::AppRef {
+        exe: "code.exe".into(),
+        title: None,
+        pid: 2,
+        started_at_ms: 0,
+    });
+    rig.world.absorb(&focus);
+    rig.with(|env| rt.on_event(env, &focus));
+    assert!(rt.report("night-light").unwrap().error.is_none());
+    assert_eq!(rt.next_due(), Some(step), "the step keeps its time");
+}
+
 /// Every plugin shipped inside cortisoff starts, reacts and stops against a
 /// host offering everything, without a Lua error.
 #[test]

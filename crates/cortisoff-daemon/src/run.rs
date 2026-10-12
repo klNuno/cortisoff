@@ -22,10 +22,11 @@ use cortisoff_runtime::{Runtime, Store};
 
 use crate::{ClientId, DaemonLog, FileJournal, Mark, Paths, Previous, Server, Supervisor};
 
-/// Long enough that an idle machine costs nothing, short enough that Ctrl-C
-/// feels immediate. Every real wakeup comes from the platform or from a
-/// client, never from this expiring.
-const TICK: Duration = Duration::from_millis(500);
+/// How long the loop waits for something to happen: as long as it takes.
+/// Every wakeup comes from the platform, a timer a plugin asked for, a client,
+/// or a stop request, each of which wakes the wait itself. `u32::MAX`
+/// milliseconds is INFINITE to Windows and seven weeks elsewhere.
+const FOREVER: Duration = Duration::from_millis(u32::MAX as u64);
 
 pub const USAGE: &str = "cortisoff --daemon, the part that runs the plugins
 
@@ -39,7 +40,9 @@ pub const USAGE: &str = "cortisoff --daemon, the part that runs the plugins
     --autostart <on|off|status>
                       start the daemon when you log on, or stop doing so
     --no-tray         no icon in the notification area
-    --no-eco          do not ask the system to schedule it as background work";
+    --no-eco          do not ask the system to schedule it as background work
+    --no-guard        run in this process only, with no second process that
+                      starts it again after a crash";
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Options {
@@ -53,12 +56,17 @@ pub struct Options {
     pub autostart: Option<String>,
     pub no_tray: bool,
     pub no_eco: bool,
+    pub no_guard: bool,
+    /// What was parsed, as given, for the guard to hand on.
+    pub raw: Vec<String>,
 }
 
 impl Options {
     /// Everything after `--daemon`.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut out = Self::default();
+        let args: Vec<String> = args.into_iter().collect();
+        out.raw = args.clone();
         let mut args = args.into_iter();
         let path = |name: &str, next: Option<String>| {
             next.map(PathBuf::from)
@@ -78,6 +86,7 @@ impl Options {
                 }
                 "--no-tray" => out.no_tray = true,
                 "--no-eco" => out.no_eco = true,
+                "--no-guard" => out.no_guard = true,
                 other => return Err(format!("{other} is not a daemon option\n\n{USAGE}")),
             }
         }
@@ -143,6 +152,11 @@ pub fn run(args: Options) -> Result<(), String> {
     let plugins_dir = args.plugins.clone().unwrap_or(paths.plugins);
     let store_path = args.store.clone().unwrap_or(paths.store);
 
+    // A verbose run or a report needs no one to start it again.
+    if !args.no_guard && !args.doctor && !args.verbose {
+        return guard(&args, (!args.no_log).then_some(log_path.as_path()));
+    }
+
     // The doctor only reads: no lock, no line in the log, nothing that makes
     // a second run look like a daemon.
     let mut log = if args.doctor || args.no_log {
@@ -161,7 +175,7 @@ pub fn run(args: Options) -> Result<(), String> {
             None => {
                 let said = "another cortisoff daemon is already running in this session. \
                             `cortisoff-cli stop` ends it";
-                // Once, however often the safety-net trigger tries.
+                // Once, however often something tries.
                 log.line_once(platform::now(), Mark::Refused, said);
                 return Err(said.to_owned());
             }
@@ -254,7 +268,7 @@ pub fn run(args: Options) -> Result<(), String> {
     }
 
     while !server.stopping() && !platform::stop_requested() {
-        let outbound = server.pump(host.as_mut(), TICK);
+        let outbound = server.pump(host.as_mut(), FOREVER);
         transport.write(outbound);
         for incoming in transport.read() {
             match incoming {
@@ -306,6 +320,44 @@ pub fn run(args: Options) -> Result<(), String> {
         },
     );
     Ok(())
+}
+
+/// Run the daemon as a second process and start it again if it crashes. See
+/// `guard.rs`. The guard ends the way the daemon did, so a refusal or a
+/// failed start still reads as a failure to whoever launched it.
+fn guard(args: &Options, log: Option<&Path>) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
+    // Ctrl-C in a terminal reaches the worker too, which restores the screens
+    // and ends. Left to the default handler the guard would die first, hand
+    // the shell back early and lose the worker's exit code.
+    let _ = platform::watch_for_stop();
+    let status = crate::guard::supervise(
+        || {
+            std::process::Command::new(&exe)
+                .arg("--daemon")
+                .args(&args.raw)
+                .arg("--no-guard")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut daemon| {
+                    platform::shed_memory();
+                    daemon.wait()
+                })
+        },
+        |line| {
+            if let Some(path) = log {
+                crate::append(path, platform::now(), Mark::Error, line);
+            }
+        },
+        Duration::from_secs(2),
+    )?;
+    if status.success() {
+        Ok(())
+    } else {
+        // The daemon has already said why, on the same console and in the
+        // log; a second message here would only repeat it.
+        std::process::exit(status.code().unwrap_or(1))
+    }
 }
 
 /// A panic writes its own line before the process goes, so the file never
@@ -420,6 +472,10 @@ mod platform {
 
     pub fn efficiency_mode() {
         cortisoff_win::efficiency_mode();
+    }
+
+    pub fn shed_memory() {
+        cortisoff_win::shed_memory();
     }
 
     pub fn start_at_logon(on: bool) -> Result<(), String> {
@@ -561,6 +617,9 @@ mod platform {
     pub fn efficiency_mode() {
         cortisoff_unix::efficiency_mode();
     }
+
+    /// The kernel already takes back what a sleeping process does not touch.
+    pub fn shed_memory() {}
 
     #[cfg(target_os = "linux")]
     use cortisoff_linux::autostart;

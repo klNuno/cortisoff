@@ -35,10 +35,10 @@ mod vibrance;
 mod wallpaper;
 
 pub use console::{attach_parent_console, request_stop, stop_requested, watch_for_stop};
-pub use pipe::{ask, connect, session_id, Client, Incoming, PipeServer};
+pub use pipe::{ask, connect, session_id, wait_for_daemon, Client, Incoming, PipeServer};
 pub use process::{
-    claim_dashboard, claim_session, efficiency_mode, raise_dashboard, usage, InstanceLock,
-    ProcessUsage,
+    claim_dashboard, claim_session, efficiency_mode, raise_dashboard, shed_memory, usage,
+    InstanceLock, ProcessUsage,
 };
 pub use pump::{local_time, WinHost};
 pub use screen::{hdr_outputs, Hdr};

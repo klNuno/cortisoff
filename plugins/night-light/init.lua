@@ -1,9 +1,10 @@
 -- Night light: the colour temperature over the day.
 --
 -- The daemon half claims display.color_temp and moves it a little every
--- half minute, each step fading into the next, so the evening comes in
--- without a visible jump. The window half draws the day and edits the
--- settings; both read the same table.
+-- half minute while a fade runs, each step fading into the next, so the
+-- evening comes in without a visible jump. Between fades nothing changes,
+-- so it sleeps until the next one starts. The window half draws the day and
+-- edits the settings; both read the same table.
 
 local plugin = {}
 
@@ -43,6 +44,22 @@ local function kelvin_at(s, minute)
   return s.day + (s.night - s.day) * strength
 end
 
+-- Minutes from `minute` until the kelvin next starts to move, or nil while a
+-- fade is running. Outside the night window that is the evening; on the
+-- plateau, the start of the morning fade.
+local function still_for(s, minute)
+  local into = (minute - s.evening) % 1440
+  local window = (s.morning - s.evening) % 1440
+  local fade = math.max(s.fade, 1)
+  if into >= window then
+    return 1440 - into
+  end
+  if into < fade or window - into < fade then
+    return nil
+  end
+  return window - fade - into
+end
+
 local function excepted(s, app)
   if not app then return false end
   local exe = string.lower(app.exe)
@@ -54,9 +71,29 @@ end
 
 -- ---- daemon ---------------------------------------------------------------
 
-local paused_until, resume_timer
+local paused_until, resume_timer, step_timer, stepping
 
-local function settle(cx, s)
+local settle
+
+-- The next look: a step while a fade runs, the start of the next fade
+-- otherwise. A resume, a clock change or a new setting reaches `settle`
+-- through an event and moves this along with it. A step already on its way
+-- keeps its time: re-armed on every focus change, it slipped back each time
+-- and the fade stood still while the user switched windows.
+local function schedule(cx, s, minute)
+  local still = minute and still_for(s, minute)
+  if step_timer and stepping and not still then return end
+  if step_timer then cx:cancel(step_timer) end
+  stepping = not still
+  -- Just past the edge, so the look lands inside the fade.
+  local wait = still and still * 60000 + 50 or STEP_MS
+  step_timer = cx:after(wait, function(cx, s)
+    step_timer = nil
+    settle(cx, s)
+  end)
+end
+
+function settle(cx, s)
   local minute, mono = cx:now()
   local world = cx:world()
   local k = minute and kelvin_at(s, minute) or s.day
@@ -83,13 +120,14 @@ local function settle(cx, s)
     reason = reason,
     paused_until = paused_until and minute and clock(minute + (paused_until - mono) / 60000),
   })
+  schedule(cx, s, minute)
 end
 
 function plugin.start(cx, s)
+  step_timer = nil
   cx:watch("app.focus")
   cx:watch("app.maximized")
   cx:watch("clock")
-  cx:every(STEP_MS, settle)
   settle(cx, s)
 end
 

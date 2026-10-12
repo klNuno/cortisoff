@@ -43,7 +43,8 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, SetEvent, WaitForSingleObject,
+    INFINITE,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
@@ -57,12 +58,77 @@ const BUFFER: u32 = 64 * 1024;
 static ARRIVED: OnceLock<usize> = OnceLock::new();
 
 /// The event the daemon's pump waits on beside its messages. `None` only if
-/// the kernel refused an event, and then the pump falls back to its tick.
+/// the kernel refused an event, and then the pump falls back to a tick.
 pub(crate) fn arrived() -> Option<HANDLE> {
     let address = *ARRIVED.get_or_init(|| {
         unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_or(0, |h| h.0 as usize)
     });
     (address != 0).then_some(HANDLE(address as *mut c_void))
+}
+
+/// Manual reset, named per session, set by a daemon once it listens. Kept
+/// open for the daemon's life, as an address for the same reason as
+/// [`ARRIVED`].
+static UP: OnceLock<usize> = OnceLock::new();
+
+/// The session's "a daemon listens" event, opened or created. Whoever comes
+/// first creates it: a window waiting for a daemon, or the daemon itself. It
+/// carries the pipe's descriptor, so no other account can set or reset it.
+fn up_event(session: u32) -> Option<HANDLE> {
+    let name = HSTRING::from(format!(r"Local\cortisoff.{session}.up"));
+    let sddl = own_user_only().ok()?;
+    with_descriptor(&sddl, |attributes| unsafe {
+        CreateEventW(Some(attributes), true, false, PCWSTR(name.as_ptr()))
+    })
+    .ok()?
+    .ok()
+}
+
+/// Wait until a daemon may be listening in this session, with nothing
+/// looking on a timer: the daemon sets an event once it listens, and this
+/// waits on it. Returns at once when one already answers.
+///
+/// A daemon that crashed leaves the event set, so it is reset first, and the
+/// pipe is tried once more in case a daemon started between the caller's
+/// failed connect and the reset. A daemon whose every instance is taken is
+/// alive and will not announce itself again, so that case keeps trying the
+/// pipe rather than waiting on the event.
+pub fn wait_for_daemon(session: u32) {
+    let Some(event) = up_event(session) else {
+        // No event to wait on: look again in a moment instead.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        return;
+    };
+    unsafe {
+        let _ = ResetEvent(event);
+        loop {
+            match reach(session) {
+                Reach::Open(_) => break,
+                Reach::Busy => continue,
+                Reach::Absent => {
+                    WaitForSingleObject(event, INFINITE);
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(event);
+    }
+}
+
+/// Say this daemon listens, to every window waiting for one.
+fn announce_up(session: u32) {
+    let address = *UP.get_or_init(|| up_event(session).map_or(0, |h| h.0 as usize));
+    if address != 0 {
+        let _ = unsafe { SetEvent(HANDLE(address as *mut c_void)) };
+    }
+}
+
+/// And that it no longer does. A crash skips this, which `wait_for_daemon`
+/// allows for.
+fn announce_down() {
+    if let Some(&address) = UP.get().filter(|a| **a != 0) {
+        let _ = unsafe { ResetEvent(HANDLE(address as *mut c_void)) };
+    }
 }
 
 /// Wake the daemon's pump from any thread, the same way a pipe handover does.
@@ -210,6 +276,7 @@ impl PipeServer {
                 accept_loop(accept_name, sddl, first.0, accept_sender)
             })
             .map_err(|e| format!("could not start the pipe thread: {e}"))?;
+        announce_up(session);
 
         Ok(Self {
             name,
@@ -264,6 +331,12 @@ impl PipeServer {
 
     pub fn disconnect(&mut self, id: u64) {
         self.clients.retain(|(known, _)| *known != id);
+    }
+}
+
+impl Drop for PipeServer {
+    fn drop(&mut self) {
+        announce_down();
     }
 }
 
@@ -362,7 +435,12 @@ fn read_loop(id: u64, pipe: Arc<Pipe>, outbox: Sender<Wire>) {
     }
 }
 
-fn create_instance(name: &str, sddl: &str) -> Result<HANDLE, String> {
+/// Run `make` with security attributes built from `sddl`, and free the
+/// descriptor after: the kernel object keeps its own copy.
+fn with_descriptor<T>(
+    sddl: &str,
+    make: impl FnOnce(&SECURITY_ATTRIBUTES) -> T,
+) -> Result<T, String> {
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -372,16 +450,22 @@ fn create_instance(name: &str, sddl: &str) -> Result<HANDLE, String> {
             None,
         )
     }
-    .map_err(|e| format!("the pipe's security descriptor was refused: {e}"))?;
-
+    .map_err(|e| format!("the security descriptor was refused: {e}"))?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: false.into(),
     };
+    let made = make(&attributes);
+    unsafe {
+        windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+    }
+    Ok(made)
+}
 
+fn create_instance(name: &str, sddl: &str) -> Result<HANDLE, String> {
     let wide = HSTRING::from(name);
-    let handle = unsafe {
+    let handle = with_descriptor(sddl, |attributes| unsafe {
         CreateNamedPipeW(
             PCWSTR(wide.as_ptr()),
             PIPE_ACCESS_DUPLEX | FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_OVERLAPPED.0),
@@ -390,9 +474,10 @@ fn create_instance(name: &str, sddl: &str) -> Result<HANDLE, String> {
             BUFFER,
             BUFFER,
             0,
-            Some(&attributes),
+            Some(attributes),
         )
-    };
+    })
+    .map_err(|e| format!("{name}: {e}"))?;
     if handle == INVALID_HANDLE_VALUE {
         return Err(format!("could not create {name}"));
     }
@@ -464,6 +549,22 @@ pub fn session_id() -> u32 {
 /// which is microseconds away, so busy is retried and only a real absence is
 /// `None`.
 pub fn connect(session: u32) -> Option<Client> {
+    match reach(session) {
+        Reach::Open(client) => Some(client),
+        Reach::Busy | Reach::Absent => None,
+    }
+}
+
+/// What a connect attempt found.
+enum Reach {
+    Open(Client),
+    /// A daemon listens, but every instance stayed taken through the retries.
+    Busy,
+    /// No daemon listens in this session.
+    Absent,
+}
+
+fn reach(session: u32) -> Reach {
     use windows::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
@@ -490,21 +591,21 @@ pub fn connect(session: u32) -> Option<Client> {
         };
         match opened {
             Ok(handle) if handle != INVALID_HANDLE_VALUE => {
-                return Some(Client {
+                return Reach::Open(Client {
                     pipe: Handle(handle),
                     reader: FrameReader::new(),
                 })
             }
-            Ok(_) => return None,
+            Ok(_) => return Reach::Absent,
             Err(e) if e.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_BUSY.0) => {
                 // A timeout here means the daemon is alive but slow to re-arm;
                 // trying again is right either way.
                 let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), WAIT_MS) };
             }
-            Err(_) => return None,
+            Err(_) => return Reach::Absent,
         }
     }
-    None
+    Reach::Busy
 }
 
 /// The client half, synchronous on purpose: a CLI has nothing else to do while
