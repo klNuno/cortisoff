@@ -3,7 +3,7 @@ Segoe Fluent code point the UI already names, so one char works with either font
 
     pip install fonttools
     npm pack @phosphor-icons/web && tar xzf phosphor-icons-web-*.tgz
-    python make_icons.py package/src/regular/Phosphor.ttf         package/src/regular/style.css icons.ttf
+    cd package/src/regular && python make_icons.py Phosphor.ttf style.css icons.ttf
 
 A new icon is a line in SEGOE_TO_PHOSPHOR and a constant in theme.rs.
 """
