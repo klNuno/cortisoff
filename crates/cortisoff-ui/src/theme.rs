@@ -211,7 +211,7 @@ fn fonts() -> FontDefinitions {
 
 /// Phosphor Regular (MIT, `fonts/icons-LICENSE.txt`) cut down to the glyphs
 /// in [`glyph`], each moved to its Segoe Fluent code point, so one `char`
-/// draws with either font. 8 KB.
+/// draws with either font. 8 KB, made by `fonts/make_icons.py`.
 const BUNDLED_ICONS: &[u8] = include_bytes!("../fonts/icons.ttf");
 
 /// The faces the window draws with, taken from the system. A missing one
