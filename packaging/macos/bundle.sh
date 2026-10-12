@@ -62,7 +62,8 @@ printf '%s\n' "$requirement"
 if [ -n "$identity" ]; then
   printf '%s\n' "$requirement" | grep -q 'identifier "dev.mtsu.cortisoff"' ||
     { echo "::error::The designated requirement does not name dev.mtsu.cortisoff."; exit 1; }
-  printf '%s\n' "$requirement" | grep -q "certificate leaf = H\"$identity\"" ||
+  # codesign prints the hash in lower case.
+  printf '%s\n' "$requirement" | grep -qi "certificate leaf = H\"$identity\"" ||
     { echo "::error::The designated requirement does not name the signing certificate."; exit 1; }
   if printf '%s\n' "$requirement" | grep -q cdhash; then
     echo "::error::The designated requirement names a build hash."
