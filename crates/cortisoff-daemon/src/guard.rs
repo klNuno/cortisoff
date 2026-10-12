@@ -5,7 +5,8 @@
 //! for it to end: one handle parked in the kernel, no timer. A daemon that ends
 //! on its own (a stop from the window or the CLI, the tray's Quit, the session
 //! ending, another daemon already running) ends the guard with it. One that
-//! crashed is started again.
+//! crashed is started again, and so is one that ends with [`RESTART`]: it
+//! has just put a new build in place of the executable.
 //!
 //! The logon task used to cover crashes by trying to start the daemon every
 //! five minutes. It could not tell a crash from a stop, so every stop the user
@@ -21,9 +22,18 @@ const QUICK: Duration = Duration::from_secs(60);
 /// Quick crashes in a row before the guard stops starting it again.
 const GIVE_UP_AFTER: u32 = 3;
 
+/// The exit code of a daemon that installed an update and wants the new
+/// build started. 75 is `EX_TEMPFAIL`: nothing else in cortisoff exits with
+/// it, and it sits far from the NTSTATUS range a crash uses.
+pub const RESTART: i32 = 75;
+
 /// Run `start` until it ends without crashing, and hand back how it ended.
 /// `note` hears one line per crash, for the daemon's log. `pause` is the
 /// breath between a crash and the next start.
+///
+/// A daemon that ends with [`RESTART`] is started again at once: no note, no
+/// pause, and it does not count toward giving up. `start` runs the path it
+/// always ran, which now holds the new build.
 pub fn supervise(
     mut start: impl FnMut() -> std::io::Result<ExitStatus>,
     mut note: impl FnMut(&str),
@@ -33,6 +43,9 @@ pub fn supervise(
     loop {
         let began = Instant::now();
         let status = start().map_err(|e| format!("could not start the daemon: {e}"))?;
+        if status.code() == Some(RESTART) {
+            continue;
+        }
         let Some(how) = crash(&status) else {
             return Ok(status);
         };
@@ -182,6 +195,43 @@ mod tests {
             assert_eq!(runs, 1, "exit {code}");
             assert_eq!(status.success(), code == 0);
         }
+    }
+
+    /// An update ends the daemon with `RESTART`: started again at once, with
+    /// no note, and not counted toward giving up. Two quick crashes, an
+    /// update, then a clean end: counted, the update would have been the
+    /// third quick crash and the guard would have stopped there.
+    #[test]
+    fn an_update_restart_starts_it_again_without_counting() {
+        let mut runs = 0;
+        let mut notes = Vec::new();
+        let status = supervise(
+            || {
+                runs += 1;
+                match runs {
+                    1 | 2 => ending(CRASHED),
+                    3 => exiting(RESTART.into()),
+                    _ => exiting(0),
+                }
+            },
+            |line| notes.push(line.to_owned()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(runs, 4);
+        assert_eq!(notes.len(), 2, "one note per crash, none for the update");
+        assert!(
+            notes.iter().all(|n| n.contains("starting it again")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn restart_is_not_a_crash() {
+        let status = exiting(RESTART.into()).unwrap();
+        assert_eq!(status.code(), Some(RESTART));
+        assert_eq!(crash(&status), None);
     }
 
     #[cfg(windows)]

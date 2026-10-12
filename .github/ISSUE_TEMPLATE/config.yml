@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/klNuno/cortisoff/security/advisories/new
+    about: Report a vulnerability privately rather than in a public issue.
+  - name: Writing a plugin
+    url: https://github.com/klNuno/cortisoff/blob/main/docs/plugins.md
+    about: The plugin reference, for questions about the Lua API.

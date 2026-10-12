@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use cortisoff_host::{CapabilityId, LogLevel, Value};
 use cortisoff_ipc::{
     ClaimReport, DoctorReport, Notification, Origin, PluginReport, Request, Response, StateReport,
-    WorldReport,
+    UpdateCheck, UpdateReport, WorldReport,
 };
 use cortisoff_ui::theme::{self, glyph};
 use cortisoff_ui::{widgets, Effect, Page, State, Status};
@@ -43,6 +43,9 @@ const RECENT: usize = 40;
 /// A start or a stop asked from here shows as done this long before the
 /// daemon confirms it; past that, the window believes the daemon again.
 const IN_TRANSIT: Duration = Duration::from_secs(8);
+/// The window looks for a new release once, this long after it opens, so
+/// the check never competes with the first frames.
+const CHECK_AFTER: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Daemon {
@@ -123,6 +126,10 @@ pub struct Shell {
     installing: bool,
     at_logon: Option<bool>,
     update: Update,
+    /// The daemon's side: the automatic install setting and its last check.
+    updates: Option<UpdateReport>,
+    /// When the window opened, for its one check; `None` once it ran.
+    check_at: Option<Instant>,
     confirm: Option<&'static str>,
     jobs: (Sender<Done>, Receiver<Done>),
     themed: bool,
@@ -159,6 +166,8 @@ impl Shell {
             installing: false,
             at_logon: None,
             update: Update::Idle,
+            updates: None,
+            check_at: (!demo).then(Instant::now),
             confirm: None,
             jobs: channel(),
             themed: false,
@@ -177,6 +186,7 @@ impl Shell {
         }
         self.receive();
         self.finish_jobs(ui.ctx());
+        self.check_once(ui.ctx());
         self.flush_settings(ui);
         if self.state_stale && !self.state_asked {
             self.ask(Ask::State, Request::State);
@@ -261,10 +271,12 @@ impl Shell {
                     self.ask(Ask::Plugins, Request::Plugins);
                     self.ask(Ask::State, Request::State);
                     self.ask(Ask::Doctor, Request::Doctor);
+                    self.ask(Ask::Updates, Request::Updates { auto: None });
                 }
                 Inbound::Disconnected => {
                     self.daemon = Daemon::Down;
                     self.stopping = None;
+                    self.updates = None;
                     self.state = None;
                     self.state_asked = false;
                 }
@@ -288,6 +300,7 @@ impl Shell {
             Notification::Plugins => self.ask(Ask::Plugins, Request::Plugins),
             Notification::Event(_) | Notification::Action(_) => self.state_stale = true,
             Notification::Log { level, message } => self.log(level, message),
+            Notification::Updates(report) => self.take_updates(*report),
             Notification::Closing => {
                 self.daemon = Daemon::Down;
                 self.state = None;
@@ -306,6 +319,7 @@ impl Shell {
             }
             (Ask::Plugins, Response::Plugins { plugins }) => self.list(plugins),
             (Ask::Doctor, Response::Doctor(doctor)) => self.doctor = Some(*doctor),
+            (Ask::Updates, Response::Updates(report)) => self.take_updates(*report),
             (ask, Response::Error { message }) => {
                 if ask == Ask::State {
                     self.state_asked = false;
@@ -509,6 +523,53 @@ impl Shell {
                 Done::Uninstalled(Err(e)) => self.say(format!("Uninstall: {e}"), true),
             }
         }
+    }
+
+    /// The one check after the window opens: an installed copy only, and
+    /// only when nothing was asked by hand meanwhile. It never downloads.
+    fn check_once(&mut self, ctx: &egui::Context) {
+        let Some(opened) = self.check_at else { return };
+        match CHECK_AFTER.checked_sub(opened.elapsed()) {
+            Some(left) if !left.is_zero() => ctx.request_repaint_after(left),
+            _ => {
+                self.check_at = None;
+                if self.link.is_some()
+                    && installed()
+                    && self.behind().is_none()
+                    && matches!(self.update, Update::Idle)
+                {
+                    self.check(ctx);
+                }
+            }
+        }
+    }
+
+    /// The daemon's report. A daemon that updated itself while this window
+    /// stayed open runs a newer build than the window: say so once.
+    fn take_updates(&mut self, report: UpdateReport) {
+        let was_behind = self.behind().is_some();
+        self.updates = Some(report);
+        if let (false, Some(version)) = (was_behind, self.behind()) {
+            let text = format!("cortisoff {version} is installed. Reopen this window to use it");
+            self.say(text, false);
+        }
+    }
+
+    /// The version the daemon runs, when this installed window is an older
+    /// build of it.
+    fn behind(&self) -> Option<&str> {
+        let version = self.updates.as_ref()?.version.as_str();
+        (version != env!("CARGO_PKG_VERSION") && installed()).then_some(version)
+    }
+
+    fn check(&mut self, ctx: &egui::Context) {
+        self.update = Update::Checking;
+        self.spawn(ctx, || {
+            Done::Checked(cortisoff_update::check(
+                cortisoff_update::FEED_URL,
+                env!("CARGO_PKG_VERSION"),
+            ))
+        });
     }
 
     fn install(&mut self, ctx: &egui::Context, link: String) {
@@ -1235,9 +1296,23 @@ impl Shell {
     fn updates(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let installed = installed();
         let mut act: Option<u8> = None;
+        let mut auto = self.updates.as_ref().map(|u| u.auto);
         widgets::card(ui, Some("Updates"), |ui| {
+            if let Some(on) = auto.as_mut() {
+                let mut changed = false;
+                widgets::row(
+                    ui,
+                    "Install updates automatically",
+                    Some("When nothing is applied to a screen, so a night tint never flickers."),
+                    |ui| changed = widgets::switch(ui, on).changed(),
+                );
+                if !changed {
+                    auto = None;
+                }
+                widgets::divider(ui);
+            }
             let (line, hint): (String, Option<String>) = match &self.update {
-                Update::Idle => ("Not checked yet".to_owned(), None),
+                Update::Idle => self.daemon_check(),
                 Update::Checking => ("Checking".to_owned(), None),
                 Update::Current => ("Up to date".to_owned(), None),
                 Update::Available(r) => (
@@ -1252,6 +1327,23 @@ impl Shell {
             let hint = hint.or_else(|| {
                 (!installed).then(|| "Updates install over the installed copy only.".to_owned())
             });
+            if let Some(version) = self.behind() {
+                let hint = format!(
+                    "This window still runs {}. Reopen it to use the new one.",
+                    env!("CARGO_PKG_VERSION")
+                );
+                widgets::row(
+                    ui,
+                    &format!("Version {version} is installed"),
+                    Some(&hint),
+                    |ui| {
+                        if widgets::button(ui, Some(glyph::ARROW), "Reopen").clicked() {
+                            act = Some(3);
+                        }
+                    },
+                );
+                return;
+            }
             widgets::row(ui, &line, hint.as_deref(), |ui| match &self.update {
                 Update::Checking | Update::Downloading(_) | Update::Restarting => {
                     ui.add(egui::Spinner::new().size(16.0).color(theme::MUTED));
@@ -1273,16 +1365,22 @@ impl Shell {
                 }
             });
         });
-        match act {
-            Some(0) => {
-                self.update = Update::Checking;
-                self.spawn(ctx, || {
-                    Done::Checked(cortisoff_update::check(
-                        cortisoff_update::FEED_URL,
-                        env!("CARGO_PKG_VERSION"),
-                    ))
-                });
+        if let Some(on) = auto {
+            if let Some(report) = self.updates.as_mut() {
+                report.auto = on;
             }
+            let what = if on {
+                "switch automatic updates on"
+            } else {
+                "switch automatic updates off"
+            };
+            self.ask(
+                Ask::Do(what.to_owned()),
+                Request::Updates { auto: Some(on) },
+            );
+        }
+        match act {
+            Some(0) => self.check(ctx),
             Some(1) => {
                 if let Update::Available(release) = &self.update {
                     let release = release.clone();
@@ -1303,7 +1401,34 @@ impl Shell {
                     self.spawn(ctx, move || Done::Restarted(crate::restart_into(&staged)));
                 }
             }
+            // The new build is already in place and its daemon running:
+            // only the window has to start again.
+            Some(3) => {
+                self.update = Update::Restarting;
+                self.spawn(ctx, || {
+                    Done::Restarted(cortisoff_update::relaunch(&["--updated".to_owned()]))
+                });
+            }
             _ => {}
+        }
+    }
+
+    /// The Updates card before this window checked anything: what the
+    /// daemon's own last check found, if it made one.
+    fn daemon_check(&self) -> (String, Option<String>) {
+        match self.updates.as_ref().and_then(|u| u.last.clone()) {
+            None => ("Not checked yet".to_owned(), None),
+            Some(UpdateCheck::Current) => ("Up to date".to_owned(), None),
+            Some(UpdateCheck::Available { version }) => (format!("Version {version} is out"), None),
+            Some(UpdateCheck::Staged { version }) => (
+                format!("Version {version} is downloaded"),
+                Some(
+                    "It installs itself the next moment nothing is applied to a screen.".to_owned(),
+                ),
+            ),
+            Some(UpdateCheck::Failed { message }) => {
+                ("The last check failed".to_owned(), Some(message))
+            }
         }
     }
 
@@ -1415,7 +1540,10 @@ fn note(ui: &mut Ui, colour: Color32, text: &str) {
 
 fn world_chips(ui: &mut Ui, world: &WorldReport) {
     if let Some(app) = &world.app {
-        widgets::chip(ui, Some(glyph::GAME), &format!("{} in front", app.exe));
+        // The daemon reports the full path; the file name is what a plugin
+        // matches and what anyone recognises.
+        let name = app.exe.rsplit(['\\', '/']).next().unwrap_or(&app.exe);
+        widgets::chip(ui, Some(glyph::GAME), &format!("{name} in front"));
     }
     if world.fullscreen || world.maximized {
         widgets::chip(ui, Some(glyph::FULLSCREEN), "fills the screen");
@@ -1682,7 +1810,7 @@ impl Shell {
             active: true,
             world: WorldReport {
                 app: Some(cortisoff_host::AppRef {
-                    exe: "cs2.exe".into(),
+                    exe: r"C:\Games\Counter-Strike\game\bin\win64\cs2.exe".into(),
                     title: None,
                     pid: 4120,
                     started_at_ms: 0,
@@ -1770,6 +1898,12 @@ impl Shell {
         });
         shell.at_logon = Some(true);
         shell.update = Update::Current;
+        shell.updates = Some(UpdateReport {
+            auto: true,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            checks: true,
+            last: Some(UpdateCheck::Current),
+        });
         shell
     }
 

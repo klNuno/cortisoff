@@ -1,6 +1,7 @@
-//! Which plugins are on, their settings, and the folders linked for
-//! development. One JSON file the daemon owns: the window changes it only by
-//! asking the daemon, so two processes never write it at once.
+//! Which plugins are on, their settings, the folders linked for development,
+//! and the few settings that belong to cortisoff itself. One JSON file the
+//! daemon owns: the window changes it only by asking the daemon, so two
+//! processes never write it at once.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,12 +18,33 @@ pub struct Entry {
     pub settings: serde_json::Value,
 }
 
+/// cortisoff's own settings, as opposed to a plugin's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct App {
+    /// Download a newer release and put it in place without asking. A file
+    /// written before this setting existed reads as on.
+    #[serde(default = "on")]
+    pub auto_update: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self { auto_update: on() }
+    }
+}
+
+fn on() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]
     pub plugins: BTreeMap<String, Entry>,
     #[serde(default)]
     pub links: Vec<PathBuf>,
+    #[serde(default)]
+    pub app: App,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -184,6 +206,24 @@ mod tests {
         let (again, warning) = Store::open(&path);
         assert!(warning.is_none());
         assert!(again.entry("a").enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn automatic_updates_default_on_and_an_off_is_kept() {
+        let old: Store = serde_json::from_str(r#"{ "plugins": {}, "links": [] }"#).unwrap();
+        assert!(old.app.auto_update, "a file from before the setting");
+        assert!(Store::in_memory().app.auto_update);
+
+        let dir = std::env::temp_dir().join(format!("cortisoff-store-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plugins.json");
+        let (mut store, _) = Store::open(&path);
+        store.app.auto_update = false;
+        store.save().unwrap();
+        let (again, warning) = Store::open(&path);
+        assert!(warning.is_none());
+        assert!(!again.app.auto_update);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

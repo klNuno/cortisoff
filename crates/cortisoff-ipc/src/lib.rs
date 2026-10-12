@@ -21,6 +21,6 @@ mod value;
 pub use codec::{decode, encode, Frame, FrameReader, ProtocolError, RequestId, MAX_FRAME_BYTES};
 pub use protocol::{
     CapabilityReport, ClaimReport, DoctorReport, Json, Notification, Origin, PluginReport, Request,
-    Response, StateReport, WorldReport,
+    Response, StateReport, UpdateCheck, UpdateReport, WorldReport,
 };
 pub use value::parse_value;

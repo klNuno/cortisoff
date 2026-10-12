@@ -12,7 +12,8 @@ use cortisoff_host::{CapabilityId, Chord, LogLevel, WindowAction};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value, Variadic};
 
 use crate::runtime::{
-    until, wall_ms, Binding, Command, Env, HttpDone, HttpWait, Shared, Timer, Watch, KINDS,
+    exe_name, until, wall_ms, Binding, Command, Env, HttpDone, HttpWait, Shared, Timer, Watch,
+    KINDS,
 };
 use crate::sandbox;
 
@@ -145,7 +146,8 @@ impl Cx<'_, '_> {
         let t = lua.create_table()?;
         if let Some(app) = &w.app {
             let a = lua.create_table()?;
-            a.set("exe", app.exe.as_str())?;
+            a.set("exe", exe_name(&app.exe))?;
+            a.set("path", app.exe.as_str())?;
             a.set("title", app.title.clone())?;
             a.set("pid", app.pid)?;
             t.set("app", a)?;
@@ -421,7 +423,8 @@ impl UserData for Cx<'_, '_> {
                 let t = lua.create_table()?;
                 t.set("id", w.id)?;
                 t.set("title", w.title)?;
-                t.set("exe", w.exe)?;
+                t.set("exe", exe_name(&w.exe))?;
+                t.set("path", w.exe)?;
                 t.set("pid", w.pid)?;
                 t.set("focused", w.focused)?;
                 list.raw_set(i + 1, t)?;

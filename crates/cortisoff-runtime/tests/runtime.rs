@@ -226,6 +226,43 @@ fn watched_sources_reach_the_host_and_events_reach_the_plugin() {
     assert_eq!(rt.report("idle").unwrap().state["exe"], "cs2.exe");
 }
 
+/// Hosts report the full path of the application in front, and plugins
+/// match on its file name, so `exe` is the name and `path` the whole path,
+/// in an event and in `cx:world()` alike.
+#[test]
+fn a_plugin_sees_the_file_name_of_the_application_in_front() {
+    let p = plugin(
+        "focus",
+        "return {
+           start = function(cx, s) cx:watch('app.focus') end,
+           on = function(cx, s, ev)
+             local app = cx:world().app
+             cx:publish({ exe = ev.exe, path = ev.path, world = app and app.exe })
+           end,
+         }",
+    );
+    let mut rig = Rig::new();
+    let mut rt = Runtime::new(vec![p], &on(&["focus"]), None);
+    rig.with(|env| rt.start_all(env));
+    let path = if cfg!(windows) {
+        r"C:\Games\Counter-Strike\CS2.exe"
+    } else {
+        "/opt/games/cs2.exe"
+    };
+    let focus = Event::AppFocus(cortisoff_host::AppRef {
+        exe: path.into(),
+        title: None,
+        pid: 1,
+        started_at_ms: 0,
+    });
+    rig.world.absorb(&focus);
+    rig.with(|env| rt.on_event(env, &focus));
+    let state = &rt.report("focus").unwrap().state;
+    assert_eq!(state["exe"], "cs2.exe");
+    assert_eq!(state["path"], path);
+    assert_eq!(state["world"], "cs2.exe");
+}
+
 #[test]
 fn settings_from_the_window_are_stored_as_a_difference_and_heard() {
     let p = plugin(
@@ -418,8 +455,9 @@ fn the_builtin_plugins_run() {
     rig.host.now_ms += 31_000;
     rig.with(|env| rt.on_timer(env));
     // The daemon folds every event into the world before plugins hear it.
+    // A full path, as every host reports it.
     let cs2 = Event::AppFocus(cortisoff_host::AppRef {
-        exe: "CS2.exe".into(),
+        exe: r"C:\Program Files (x86)\Steam\steamapps\common\cs2\game\bin\win64\cs2.exe".into(),
         title: None,
         pid: 1,
         started_at_ms: 0,

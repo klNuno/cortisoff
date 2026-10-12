@@ -589,6 +589,31 @@ impl<J: JournalStore> Supervisor<J> {
         }
     }
 
+    /// Nothing is applied to any screen: no plugin, manual value or preview
+    /// holds any capability, and no release is still fading. The moment an
+    /// update can stop everything without anything visible moving.
+    pub fn quiet(&self) -> bool {
+        let arbiter = self.claims.arbiter();
+        (0..arbiter.table().len()).all(|i| arbiter.holder(CapIndex(i as u16)).is_none())
+    }
+
+    /// Install updates without asking, as stored.
+    pub fn auto_update(&self) -> bool {
+        self.store.app.auto_update
+    }
+
+    pub fn set_auto_update(&mut self, on: bool) {
+        if self.store.app.auto_update != on {
+            self.store.app.auto_update = on;
+            self.save_store();
+        }
+    }
+
+    /// A notification from outside the plugins, such as an update check.
+    pub fn notify(&mut self, notification: Notification) {
+        self.note(notification);
+    }
+
     /// A running plugin, or a manual value that is not blocked.
     fn active(&self) -> bool {
         if self.stopped {

@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         None => cortisoff_app::window(Launch::Normal),
         Some("--installed") => cortisoff_app::window(Launch::Installed),
         Some("--updated") => cortisoff_app::window(Launch::Updated),
+        Some("--register") => cortisoff_app::register(),
         Some("--daemon") => {
             let rest: Vec<String> = args.collect();
             if rest.iter().any(|a| a == "--help" || a == "-h") {
