@@ -181,7 +181,7 @@ Capabilities you can claim:
 
 | Id | Value | Windows | Linux | macOS |
 | --- | --- | --- | --- | --- |
-| `display.color_temp` | Integer kelvin, 1500 to 6600. 6600 leaves the screen as it is. Fades. | yes | yes (X11) | yes |
+| `display.color_temp` | Integer kelvin, 1500 to 6600. 6600 leaves the screen as it is. Fades. | yes | X11, or GNOME's Night Light under Wayland | yes |
 | `display.vibrance` | Integer, the driver's range (0 to 100 when it reports none). Fades. | NVIDIA only; AMD is not written yet | no | no |
 | `display.mode` | `{ width = 2560, height = 1440, refresh = 240 }`. `refresh` is in Hz and may be fractional (59.94). Leave out `width` and `height` to change only the rate, leave out `refresh` to change only the resolution. Switches at once. | yes | yes (X11) | yes |
 | `wallpaper.playback` | `true` plays, `false` pauses. Switches at once. | with Wallpaper Engine or Lively installed | no | no |
@@ -190,9 +190,9 @@ Watch-only capabilities, the event kinds above:
 
 | Id | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| `app.focus`, `app.maximized`, `app.fullscreen` | yes | X11 with a window manager that publishes `_NET_ACTIVE_WINDOW` | yes |
-| `user.idle` | yes | X11 with MIT-SCREEN-SAVER; not under XWayland | yes |
-| `session.lock` | yes | no | yes |
+| `app.focus`, `app.maximized`, `app.fullscreen` | yes | X11 with a window manager that publishes `_NET_ACTIVE_WINDOW`; never under Wayland | yes |
+| `user.idle` | yes | X11 with MIT-SCREEN-SAVER, or GNOME under Wayland | yes |
+| `session.lock` | yes | with systemd-logind | yes |
 | `power.source` | yes | when `/sys/class/power_supply` exists | when IOKit reports a power source |
 | `audio.active` | yes | when ALSA is present | no |
 | `display.config` | yes | X11 with RandR 1.2 | yes |
@@ -239,7 +239,7 @@ A value given to `cx:claim` converts as follows: a boolean stays a boolean, a wh
 
 Key chords are written `ctrl+alt+n`, `shift+f5`, `win+space`, case-insensitive, the last part being the key. Modifiers: `ctrl` (`control`), `alt` (`option`), `shift`, `win` (`meta`, `super`, `cmd`, `command`). Keys: a letter or digit, `f1` to `f24`, `space`, `enter`, `tab`, `esc`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, `up`, `down`, `left`, `right`, `printscreen`, `pause`, `volume_up`, `volume_down`, `volume_mute`, `media_next`, `media_previous`, `media_play_pause`, `media_stop`.
 
-On Linux, hotkeys, keys, text, the clipboard and windows need an X11 display.
+On Linux, keys, text, the clipboard and windows need an X11 display. Under Wayland, hotkeys go through the desktop's GlobalShortcuts portal, which GNOME has: it asks the user once to allow them.
 
 ## `ui` reference for pages
 
