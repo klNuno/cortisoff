@@ -269,24 +269,74 @@ fn system_faces() -> Faces {
     }
 }
 
-/// Whatever fontconfig answers for `sans-serif` and `monospace`: the desktop's
-/// own choice, Adwaita Sans, Ubuntu Sans, Noto Sans or DejaVu.
+/// The desktop's interface and monospace fonts. GNOME and the desktops
+/// built on its settings name them; fontconfig's `sans-serif` is often
+/// another face (Noto Sans where GNOME shows Ubuntu Sans), so it only
+/// answers where nothing names one.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn system_faces() -> Faces {
-    let sans = fc_match("sans-serif");
+    let ui = desktop_font("font-name");
+    let sans = ui
+        .as_deref()
+        .and_then(fc_match)
+        .or_else(|| fc_match("sans-serif"));
     let strong = match &sans {
         // One variable file holds the semibold too.
         Some((bytes, index)) if has_weight_axis(bytes, *index) => {
             Some(weighted(bytes.clone(), *index, 600.0))
         }
-        _ => fc_match("sans-serif:weight=180").map(|(b, i)| face(b, i)),
+        _ => fc_match(&format!(
+            "{}:weight=180",
+            ui.as_deref().unwrap_or("sans-serif")
+        ))
+        .map(|(b, i)| face(b, i)),
     };
+    let mono = desktop_font("monospace-font-name")
+        .as_deref()
+        .and_then(fc_match)
+        .or_else(|| fc_match("monospace"));
     Faces {
         text: sans.map(|(b, i)| weighted(b, i, 400.0)),
         strong,
-        mono: fc_match("monospace").map(|(b, i)| weighted(b, i, 400.0)),
+        mono: mono.map(|(b, i)| weighted(b, i, 400.0)),
         icons: None,
     }
+}
+
+/// A font family from `org.gnome.desktop.interface`, on a desktop that reads
+/// those settings. Elsewhere gsettings, when installed, answers GNOME's
+/// defaults, which are not what that desktop shows.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn desktop_font(key: &str) -> Option<String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let gnome_settings = desktop.split(':').any(|d| {
+        ["GNOME", "Unity", "Budgie", "Pantheon"]
+            .iter()
+            .any(|g| d.eq_ignore_ascii_case(g))
+    });
+    if !gnome_settings {
+        return None;
+    }
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    font_family(String::from_utf8(out.stdout).ok()?.trim())
+}
+
+/// The family in a Pango font name as gsettings prints it: `'Ubuntu Sans 11'`
+/// is `Ubuntu Sans`.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn font_family(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('\'').trim();
+    let name = match value.rsplit_once(' ') {
+        Some((name, size)) if size.parse::<f32>().is_ok() => name.trim(),
+        _ => value,
+    };
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -377,6 +427,26 @@ pub fn kelvin(k: f32) -> Color32 {
 mod tests {
     use super::*;
     use egui::epaint::text::{Fonts, TextOptions};
+
+    /// What gsettings prints for GNOME's fonts, down to the family fontconfig
+    /// is asked for.
+    #[test]
+    fn a_pango_font_name_gives_its_family() {
+        assert_eq!(
+            font_family("'Ubuntu Sans 11'\n").as_deref(),
+            Some("Ubuntu Sans")
+        );
+        assert_eq!(
+            font_family("'Adwaita Mono 11'").as_deref(),
+            Some("Adwaita Mono")
+        );
+        assert_eq!(
+            font_family("'Cantarell 10.5'").as_deref(),
+            Some("Cantarell")
+        );
+        assert_eq!(font_family("'Inter'").as_deref(), Some("Inter"));
+        assert_eq!(font_family("''"), None);
+    }
 
     /// Every glyph the window names exists in the bundled icons, so a system
     /// without Segoe Fluent Icons draws no empty box.
