@@ -1,7 +1,7 @@
 id = "wallpaper-pause"
-name = "Wallpaper pause"
-version = "0.1.0"
-description = "Stops an animated wallpaper while nobody can see it."
+name = "Wallpaper Engine pause"
+version = "0.2.1"
+description = "Pauses Wallpaper Engine while nobody is at the machine."
 icon = "picture"
-# Wallpaper Engine and Lively are Windows programs.
+# Wallpaper Engine is a Windows program.
 platforms = ["windows"]

@@ -26,7 +26,9 @@ pub struct AppRef {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     AppFocus(AppRef),
-    /// An exclusive-fullscreen D3D application took or released the screen.
+    /// An application went fullscreen or left it: exclusive, or a borderless
+    /// window over its whole monitor, never a maximised one. The field keeps
+    /// the name it had when only the exclusive case was seen.
     Fullscreen {
         exclusive: bool,
     },

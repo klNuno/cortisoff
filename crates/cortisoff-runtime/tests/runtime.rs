@@ -226,6 +226,34 @@ fn watched_sources_reach_the_host_and_events_reach_the_plugin() {
     assert_eq!(rt.report("idle").unwrap().state["exe"], "cs2.exe");
 }
 
+/// A watch with its own threshold hears `idle = true` when that threshold is
+/// crossed, even under the host's five-minute default, and `idle = false`
+/// when the user comes back; another watch's threshold says nothing to it.
+#[test]
+fn an_idle_watch_hears_its_own_threshold() {
+    let p = plugin(
+        "idle",
+        "return {
+           start = function(cx, s) cx:watch('user.idle', { after = 120 }) end,
+           on = function(cx, s, ev) cx:publish({ idle = ev.idle, seconds = ev.seconds }) end,
+         }",
+    );
+    let mut rig = Rig::new();
+    let mut rt = Runtime::new(vec![p], &on(&["idle"]), None);
+    rig.with(|env| rt.start_all(env));
+    let mut hear = |idle: bool, seconds: u32| {
+        rig.with(|env| rt.on_event(env, &Event::Idle { idle, seconds }));
+        let state = rt.report("idle").unwrap().state;
+        (state["idle"].clone(), state["seconds"].clone())
+    };
+    use serde_json::json;
+    // The host's flag is still false at two minutes: its default is five.
+    assert_eq!(hear(false, 120), (json!(true), json!(120)));
+    // Another plugin's threshold: unchanged.
+    assert_eq!(hear(true, 300), (json!(true), json!(120)));
+    assert_eq!(hear(false, 0), (json!(false), json!(0)));
+}
+
 /// Hosts report the full path of the application in front, and plugins
 /// match on its file name, so `exe` is the name and `path` the whole path,
 /// in an event and in `cx:world()` alike.
@@ -347,68 +375,137 @@ fn a_plugin_for_another_system_does_not_start() {
     assert!(r.error.unwrap().contains("macos"));
 }
 
-/// Night light wakes only when the colour moves: at the start of the next fade
-/// while nothing changes, every 30 s inside one. It used to look every 30 s all
-/// day, to find the same daylight each time.
+fn night_light() -> Vec<Package> {
+    cortisoff_runtime::builtin()
+        .into_iter()
+        .filter(|p| p.manifest.id == "night-light")
+        .collect()
+}
+
+fn night_light_with(settings: serde_json::Value) -> Store {
+    let mut store = on(&["night-light"]);
+    store.plugins.get_mut("night-light").unwrap().settings = settings;
+    store
+}
+
+/// The fade asked of cortisoff with the night colour, in milliseconds.
+fn night_fade(out: &[Command]) -> Option<u64> {
+    out.iter().find_map(|c| match c {
+        Command::Claim { cap, fade_ms, .. } if cap.as_str() == "display.color_temp" => {
+            Some(*fade_ms)
+        }
+        _ => None,
+    })
+}
+
+/// Night light wakes at the edges of the night and nowhere else: cortisoff
+/// runs the fade, so nothing steps it from Lua.
 #[test]
-fn night_light_sleeps_until_the_colour_has_to_move() {
+fn night_light_sleeps_until_the_next_edge() {
     let due_in = |minute: u16| {
-        let night: Vec<Package> = cortisoff_runtime::builtin()
-            .into_iter()
-            .filter(|p| p.manifest.id == "night-light")
-            .collect();
         let mut rig = Rig::new();
         rig.host.clock = Some(Event::TimeOfDay {
             minute,
             second: 0,
             millisecond: 0,
         });
-        let mut rt = Runtime::new(night, &on(&["night-light"]), None).with_os("windows");
+        let mut rt = Runtime::new(night_light(), &on(&["night-light"]), None).with_os("windows");
         rig.with(|env| rt.start_all(env));
         assert!(rt.report("night-light").unwrap().error.is_none());
         rt.next_due().unwrap() - rig.host.now_ms
     };
-    // The defaults: warm from 20:00 to 07:00, half an hour of fade each way.
+    // The defaults: warm from 20:00 to 07:00.
     assert_eq!(due_in(12 * 60), 8 * 3_600_000 + 50, "noon waits for 20:00");
-    assert_eq!(due_in(20 * 60 + 10), 30_000, "inside the evening fade");
     assert_eq!(
-        due_in(22 * 60),
-        510 * 60_000 + 50,
-        "the night waits for 06:30"
+        due_in(20 * 60 + 10),
+        650 * 60_000 + 50,
+        "the evening waits for 07:00"
     );
-    assert_eq!(due_in(6 * 60 + 40), 30_000, "inside the morning fade");
+    assert_eq!(
+        due_in(6 * 60 + 40),
+        20 * 60_000 + 50,
+        "so does the end of the night"
+    );
 }
 
-/// A fade steps every 30 s whatever else happens. Re-arming the step on every
-/// focus change pushed it back each time, so switching windows during a fade
-/// held the colour still and it jumped once the switching stopped.
+/// The fade is in seconds and zero is at once. A stored `fade` from before,
+/// in minutes, is read as minutes and capped at five.
 #[test]
-fn a_focus_change_does_not_hold_back_a_fade_step() {
-    let night: Vec<Package> = cortisoff_runtime::builtin()
-        .into_iter()
-        .filter(|p| p.manifest.id == "night-light")
-        .collect();
-    let mut rig = Rig::new();
-    rig.host.clock = Some(Event::TimeOfDay {
-        minute: 20 * 60 + 10,
-        second: 0,
-        millisecond: 0,
-    });
-    let mut rt = Runtime::new(night, &on(&["night-light"]), None).with_os("windows");
-    rig.with(|env| rt.start_all(env));
-    let step = rt.next_due().unwrap();
+fn night_light_fades_in_seconds_and_zero_is_instant() {
+    let fade_for = |settings: serde_json::Value| {
+        let mut rig = Rig::new();
+        let mut rt =
+            Runtime::new(night_light(), &night_light_with(settings), None).with_os("windows");
+        let out = rig.with(|env| rt.start_all(env));
+        assert!(rt.report("night-light").unwrap().error.is_none());
+        night_fade(&out)
+    };
+    assert_eq!(fade_for(serde_json::json!({ "fade_seconds": 0 })), Some(0));
+    assert_eq!(
+        fade_for(serde_json::json!({ "fade_seconds": 45 })),
+        Some(45_000)
+    );
+    assert_eq!(fade_for(serde_json::json!({})), Some(60_000), "the default");
+    assert_eq!(fade_for(serde_json::json!({ "fade": 2 })), Some(120_000));
+    assert_eq!(fade_for(serde_json::json!({ "fade": 30 })), Some(300_000));
+}
 
-    rig.host.now_ms += 20_000;
-    let focus = Event::AppFocus(cortisoff_host::AppRef {
-        exe: "code.exe".into(),
-        title: None,
-        pid: 2,
-        started_at_ms: 0,
-    });
-    rig.world.absorb(&focus);
-    rig.with(|env| rt.on_event(env, &focus));
-    assert!(rt.report("night-light").unwrap().error.is_none());
-    assert_eq!(rt.next_due(), Some(step), "the step keeps its time");
+/// A fullscreen game sends the colour away and its end brings it back within
+/// a second, whatever the evening fade. A maximised window changes nothing:
+/// a browser maximised all evening is not a film.
+#[test]
+fn night_light_stands_aside_for_fullscreen_only_and_comes_back_quickly() {
+    let mut rig = Rig::new();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    let out = rig.with(|env| rt.start_all(env));
+    assert_eq!(night_fade(&out), Some(300_000));
+
+    let maximized = Event::Maximized { maximized: true };
+    rig.world.absorb(&maximized);
+    let out = rig.with(|env| rt.on_event(env, &maximized));
+    assert!(
+        !out.iter().any(|c| matches!(c, Command::Release { .. })),
+        "{out:?}"
+    );
+    assert_eq!(rt.report("night-light").unwrap().state["holding"], true);
+
+    let full = Event::Fullscreen { exclusive: true };
+    rig.world.absorb(&full);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter()
+            .any(|c| matches!(c, Command::Release { fade_ms: 1000, .. })),
+        "{out:?}"
+    );
+    assert_eq!(rt.report("night-light").unwrap().state["reason"], "filled");
+
+    let back = Event::Fullscreen { exclusive: false };
+    rig.world.absorb(&back);
+    let out = rig.with(|env| rt.on_event(env, &back));
+    assert_eq!(night_fade(&out), Some(1000));
+}
+
+/// Display profiles says so when the session never names the app in front,
+/// as on GNOME Wayland, instead of waiting for an app that never comes.
+#[test]
+fn display_profiles_says_when_no_app_is_ever_in_front() {
+    let status_of = |rig: &mut Rig| {
+        let packages: Vec<Package> = cortisoff_runtime::builtin()
+            .into_iter()
+            .filter(|p| p.manifest.id == "display-profiles")
+            .collect();
+        let mut rt = Runtime::new(packages, &on(&["display-profiles"]), None).with_os("linux");
+        rig.with(|env| rt.start_all(env));
+        let report = rt.report("display-profiles").unwrap();
+        assert!(report.error.is_none(), "{:?}", report.error);
+        report.state["can_focus"].clone()
+    };
+    let mut without = Rig::new();
+    assert_eq!(status_of(&mut without), serde_json::json!(false));
+    let mut with = Rig::new();
+    with.host = std::mem::take(&mut with.host).with_source("app.focus");
+    assert_eq!(status_of(&mut with), serde_json::json!(true));
 }
 
 /// Every plugin shipped inside cortisoff starts, reacts and stops against a
@@ -467,6 +564,9 @@ fn the_builtin_plugins_run() {
     for r in rt.reports() {
         assert!(r.error.is_none(), "{}: {:?}", r.id, r.error);
     }
+    let locked = Event::SessionLock { locked: true };
+    rig.world.absorb(&locked);
+    rig.with(|env| rt.on_event(env, &locked));
     assert_eq!(
         rt.report("wallpaper-pause").unwrap().state["paused"],
         serde_json::json!(true)

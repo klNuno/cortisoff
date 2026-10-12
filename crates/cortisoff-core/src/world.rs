@@ -51,12 +51,11 @@ impl std::ops::BitOrAssign for Signals {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct World {
     pub app: Option<AppRef>,
-    /// An exclusive-fullscreen application owns the screen, which rules out the
-    /// magnification backend.
+    /// An application is fullscreen: exclusive, or a borderless window over
+    /// its whole monitor such as a game or a film. A maximised window is not.
     pub fullscreen: bool,
     /// The focused window fills its monitor: maximised, borderless or
-    /// exclusive fullscreen. What a person means by "an app is
-    /// fullscreen", while `fullscreen` above is the exclusive case only.
+    /// exclusive fullscreen. Where the wallpaper cannot be seen.
     pub maximized: bool,
     pub idle: bool,
     pub idle_seconds: u32,

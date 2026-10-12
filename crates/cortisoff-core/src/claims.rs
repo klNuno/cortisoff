@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use cortisoff_host::{Action, CapIndex, CapabilityId, Event, TimerId, Value};
+use cortisoff_host::{ids, Action, CapIndex, CapabilityId, Event, TimerId, Value};
 
 use crate::arbiter::{Arbiter, OwnerId};
-use crate::blend::{blend, fadeable};
+use crate::blend::{blend_on, ease, fadeable, peak_rate, Curve, EASE_PEAK};
 use crate::table::CapTable;
 use crate::world::{Signals, World};
 
@@ -21,9 +21,9 @@ pub const FADE_TIMER: TimerId = TimerId(1);
 /// enough to read as a fade, short enough that the slider feels released.
 pub const PREVIEW_FADE_MS: u64 = 800;
 
-/// The shortest step between two frames of a fade. One frame at 25 Hz is
-/// smooth on a colour temperature and still costs nothing measurable.
-const FRAME_MS: u64 = 40;
+/// The shortest step between two frames of a fade, about 60 Hz. At 25 Hz a
+/// one second release crossed 3000 K in 25 visible jumps.
+const FRAME_MS: u64 = 16;
 
 /// The longest. A fade of 100 K over an hour changes the screen every 36 s,
 /// and waking every 36 s for it is the point: no frame timer runs for a
@@ -37,6 +37,7 @@ struct Fade {
     priority: i32,
     from: Value,
     to: Value,
+    curve: Curve,
     start: u64,
     length: u64,
     /// The owner lets go at the end, and `to` is what lies underneath.
@@ -151,6 +152,7 @@ impl Claims {
                     priority,
                     from,
                     to: value,
+                    curve: self.curve(cap),
                     start: now,
                     length: fade_ms,
                     release: false,
@@ -196,6 +198,7 @@ impl Claims {
                 priority,
                 from: held,
                 to,
+                curve: self.curve(cap),
                 start: now,
                 length: fade_ms,
                 release: true,
@@ -237,7 +240,7 @@ impl Claims {
                     out.extend(self.arbiter.claim(f.cap, f.owner, f.priority, f.to.clone()));
                 }
             } else {
-                let value = blend(&f.from, &f.to, s);
+                let value = blend_on(f.curve, &f.from, &f.to, ease(s));
                 out.extend(self.arbiter.claim(f.cap, f.owner, f.priority, value));
             }
         }
@@ -257,6 +260,15 @@ impl Claims {
         out
     }
 
+    /// A colour temperature fades in mireds, everything else in a line.
+    fn curve(&self, cap: CapIndex) -> Curve {
+        if self.arbiter.table().id(cap).as_str() == ids::DISPLAY_COLOR_TEMP {
+            Curve::Mired
+        } else {
+            Curve::Linear
+        }
+    }
+
     fn beneath(&self, cap: CapIndex, owner: OwnerId, rest: Option<&Value>) -> Option<Value> {
         self.arbiter
             .beneath(cap, owner)
@@ -265,8 +277,9 @@ impl Claims {
     }
 
     /// The next frame, or the end of frames. Only as often as some fade
-    /// actually changes the value: an integer fade of 3400 K over thirty
-    /// minutes needs a frame every half second, not every 40 ms.
+    /// actually changes the value at its steepest: an integer fade of 3400 K
+    /// over thirty minutes needs a frame every few hundred milliseconds, not
+    /// sixty a second.
     fn timer(&mut self) -> Option<Action> {
         if self.fades.is_empty() {
             if self.armed {
@@ -283,7 +296,10 @@ impl Claims {
             .fades
             .iter()
             .map(|f| match (&f.from, &f.to) {
-                (Value::Int(a), Value::Int(b)) if a != b => f.length / a.abs_diff(*b).max(1),
+                (Value::Int(a), Value::Int(b)) if a != b => {
+                    let peak = peak_rate(f.curve, *a as f64, *b as f64) * EASE_PEAK;
+                    (f.length as f64 / (a.abs_diff(*b) as f64 * peak)) as u64
+                }
                 _ => FRAME_MS,
             })
             .min()
@@ -340,7 +356,8 @@ mod tests {
         assert!(out
             .iter()
             .any(|a| matches!(a, Action::SetTimer { id, .. } if *id == FADE_TIMER)));
-        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4900)]);
+        // Half way in mireds, not in kelvin.
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
         let out = c.tick(1000);
         assert_eq!(applied(&out), vec![Value::Int(3200)]);
         // The timer that fired was the last one: nothing is armed again.
@@ -356,7 +373,7 @@ mod tests {
         c.tick(500);
         let out = c.claim(i, P, 0, Value::Int(6000), 1000, 500, Some(&rest));
         assert!(applied(&out).is_empty(), "{out:?}");
-        assert_eq!(applied(&c.tick(1000)), vec![Value::Int(5450)]);
+        assert_eq!(applied(&c.tick(1000)), vec![Value::Int(5016)]);
     }
 
     #[test]
@@ -366,7 +383,7 @@ mod tests {
         c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
         let out = c.release(i, P, 1000, 0, Some(&rest));
         assert!(applied(&out).is_empty());
-        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4900)]);
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
         let out = c.tick(1000);
         assert!(out.contains(&Action::RestoreBaseline {
             cap: CapabilityId::new(TEMP)
@@ -388,7 +405,7 @@ mod tests {
             None,
         );
         c.release(i, OwnerId::Preview, PREVIEW_FADE_MS, 0, None);
-        assert_eq!(applied(&c.tick(400)), vec![Value::Int(3000)]);
+        assert_eq!(applied(&c.tick(400)), vec![Value::Int(2667)]);
         assert_eq!(applied(&c.tick(800)), vec![Value::Int(4000)]);
         assert_eq!(c.arbiter().holder(i), Some(P));
     }
@@ -420,7 +437,9 @@ mod tests {
             Action::SetTimer { after, .. } => Some(*after),
             _ => None,
         });
-        assert_eq!(after, Some(Duration::from_millis(529)));
+        // 3400 K, twice as fast at the warm end and 1.5 times at the middle
+        // of the easing: a frame every 171 ms.
+        assert_eq!(after, Some(Duration::from_millis(171)));
     }
 
     #[test]

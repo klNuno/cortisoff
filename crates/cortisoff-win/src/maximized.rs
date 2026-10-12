@@ -23,16 +23,33 @@ const SHELL_CLASSES: &[&str] = &[
     "Windows.UI.Core.CoreWindow",
 ];
 
-/// True when `hwnd` is maximised or its frame covers the monitor it is on.
-/// An invalid or vanished window answers false, which is what a plugin wants
-/// on a fast alt-tab.
-pub fn covers_monitor(hwnd: HWND) -> bool {
+/// How the focused window sits on its monitor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fill {
+    /// Maximised, or covering the whole monitor.
+    pub maximized: bool,
+    /// Covering the whole monitor, taskbar included, without being
+    /// maximised: a borderless game, a film or a browser in fullscreen. A
+    /// maximised window is not this: it leaves the taskbar, and a browser
+    /// maximised all evening is not a film.
+    pub fullscreen: bool,
+}
+
+/// How `hwnd` fills its monitor. An invalid or vanished window fills
+/// nothing, which is what a plugin wants on a fast alt-tab.
+pub fn fill(hwnd: HWND) -> Fill {
     if hwnd.is_invalid() || is_shell(hwnd) {
-        return false;
+        return Fill::default();
     }
-    if unsafe { IsZoomed(hwnd) }.as_bool() {
-        return true;
+    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+    let covers = covers(hwnd);
+    Fill {
+        maximized: zoomed || covers,
+        fullscreen: covers && !zoomed,
     }
+}
+
+fn covers(hwnd: HWND) -> bool {
     let mut window = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
         return false;

@@ -23,6 +23,7 @@ fn capture_every_page() {
         ("overview", View::Overview, SIZE),
         ("stopped", View::Overview, SIZE),
         ("logo-hover", View::Overview, SIZE),
+        ("close-hover", View::Overview, SIZE),
         ("night-light", plugin("night-light"), SIZE),
         ("night-light-full", plugin("night-light"), [SIZE[0], 1240.0]),
         ("display-profiles", plugin("display-profiles"), SIZE),
@@ -49,6 +50,11 @@ fn capture_every_page() {
             // The logo is the on and off switch; this is how it answers the
             // pointer.
             harness.get_by_label("cortisoff").hover();
+            harness.run_steps(4);
+        }
+        if name == "close-hover" {
+            // The window's own caption buttons, where the system frame was.
+            harness.get_by_label("Close").hover();
             harness.run_steps(4);
         }
         let image = harness.render().expect("render");
