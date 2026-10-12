@@ -36,6 +36,9 @@ const DESKTOP: &str = "/org/freedesktop/portal/desktop";
 const SHORTCUTS: &str = "org.freedesktop.portal.GlobalShortcuts";
 const REQUEST: &str = "org.freedesktop.portal.Request";
 const SESSION: &str = "org.freedesktop.portal.Session";
+const REGISTRY: &str = "org.freedesktop.host.portal.Registry";
+/// The id the portal knows this app by: the installed desktop entry's name.
+const APP_ID: &str = "cortisoff";
 
 /// How long `set` waits for the portal before answering. Long enough for a
 /// set the user already allowed, which needs no dialog; a dialog answer
@@ -77,6 +80,7 @@ fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
 impl Shortcuts {
     pub fn new(buses: &Buses) -> Result<Self, String> {
         let conn = buses.session.as_ref().map_err(Clone::clone)?.clone();
+        register(&conn);
         // The portal starts on demand, so it is asked rather than looked for.
         let portal = dbus::proxy(&conn, PORTAL, DESKTOP, SHORTCUTS)?;
         portal.get_property::<u32>("version").map_err(|e| {
@@ -118,18 +122,18 @@ impl Shortcuts {
             let Some(trigger) = trigger(&hotkey.chord) else {
                 refused.push((
                     hotkey.id,
-                    format!("{id}: the GlobalShortcuts portal has no name for this key"),
+                    "the GlobalShortcuts portal has no name for this key".to_owned(),
                 ));
                 continue;
             };
             if self.declined.contains(&id) {
-                refused.push((hotkey.id, format!("{id}: {DECLINED}")));
+                refused.push((hotkey.id, DECLINED.to_owned()));
                 continue;
             }
             if self.live.contains_key(&id) {
                 refused.push((
                     hotkey.id,
-                    format!("{id} is already a shortcut of another plugin"),
+                    "this chord is already a shortcut of another plugin".to_owned(),
                 ));
                 continue;
             }
@@ -196,17 +200,32 @@ impl Shortcuts {
         match outcome {
             Ok(missing) => missing
                 .into_iter()
-                .filter_map(|(id, why)| self.live.remove(&id).map(|h| (h, format!("{id}: {why}"))))
+                .filter_map(|(id, why)| self.live.remove(&id).map(|h| (h, why)))
                 .collect(),
             Err(why) => {
                 if why == DECLINED {
                     self.declined.extend(self.live.keys().cloned());
                 }
-                self.live
-                    .drain()
-                    .map(|(id, h)| (h, format!("{id}: {why}")))
-                    .collect()
+                self.live.drain().map(|(_, h)| (h, why.clone())).collect()
             }
+        }
+    }
+}
+
+/// Tell the portal which application this connection is. A sandboxed app
+/// gets its id from the sandbox; a host app like this one has none, and
+/// GNOME's GlobalShortcuts refuses a caller without one ("An app id is
+/// required"). The host Registry (xdg-desktop-portal 1.19 and later) names
+/// it, and only for an id with a desktop entry in the XDG data dirs, which
+/// the installer writes as `cortisoff.desktop`. It must come before any other
+/// portal call on the connection. Failing is not fatal here: an older portal
+/// without the Registry, or a desktop that needs no id, binds anyway, and one
+/// that does need it says so when the session is created.
+fn register(conn: &Connection) {
+    if let Ok(p) = dbus::proxy(conn, PORTAL, DESKTOP, REGISTRY) {
+        let options: HashMap<&str, Value> = HashMap::new();
+        if let Err(e) = p.call::<_, _, ()>("Register", &(APP_ID, options)) {
+            eprintln!("warning: the desktop portal did not take {APP_ID} as this app's id: {e}");
         }
     }
 }
