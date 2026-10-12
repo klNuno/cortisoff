@@ -28,6 +28,8 @@ Plugins never set a screen directly. They ask for a value (a colour temperature,
 
 ## Install
 
+### Windows
+
 Windows 10 and 11:
 
 1. Download `cortisoff-windows-x86_64.exe` from the [latest release](https://github.com/klNuno/cortisoff/releases/latest).
@@ -35,7 +37,15 @@ Windows 10 and 11:
 
 Closing the window leaves cortisoff running in the background; the window only shows and edits what it does. To remove it, use Uninstall in the settings page, or Settings > Apps. Your plugins and their settings stay, in case you come back.
 
-Linux (X11) and macOS builds are on the same release page. They work but are less tested than Windows; expect rough edges, and please report them.
+### Linux
+
+Download `cortisoff-linux-x86_64` from the same release page, make it executable with `chmod +x cortisoff-linux-x86_64`, and run it. It installs itself into `~/.local/bin`, adds an entry to the applications menu and starts with your session. `cortisoff --uninstall` removes it.
+
+It needs an X11 session. Under Wayland the night light and the idle time are missing, a locked screen goes unseen on either, and `cortisoff-cli doctor` lists what your session supports.
+
+### macOS
+
+`cortisoff-darwin-aarch64` (Apple Silicon) and `cortisoff-darwin-x86_64` (Intel) are on the same release page. They are built and tested on every change but have not run on a real Mac yet, so please report what you find.
 
 ### Updates
 
