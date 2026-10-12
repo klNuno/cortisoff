@@ -127,7 +127,10 @@ impl Shortcuts {
                 continue;
             }
             if self.live.contains_key(&id) {
-                refused.push((hotkey.id, format!("{id} is already a shortcut of another plugin")));
+                refused.push((
+                    hotkey.id,
+                    format!("{id} is already a shortcut of another plugin"),
+                ));
                 continue;
             }
             self.live.insert(id.clone(), hotkey.id);
@@ -291,9 +294,11 @@ fn bind_all(
         .get("session_handle")
         .and_then(|v| {
             // Version 1 of the interface sends a string, later ones a path.
-            String::try_from(v.clone())
-                .ok()
-                .or_else(|| OwnedObjectPath::try_from(v.clone()).ok().map(|p| p.to_string()))
+            String::try_from(v.clone()).ok().or_else(|| {
+                OwnedObjectPath::try_from(v.clone())
+                    .ok()
+                    .map(|p| p.to_string())
+            })
         })
         .and_then(|s| OwnedObjectPath::try_from(s).ok())
         .ok_or("the portal opened a session but did not say which")?;
