@@ -65,7 +65,28 @@ pub fn check(feed: &str, current: &str) -> Result<Option<Release>, String> {
         .limit(FEED_LIMIT)
         .read_to_string()
         .map_err(|e| format!("cannot read the update feed: {e}"))?;
-    feed::pick(&json, current, platform_key())
+    let in_bundle = replace::current_exe().is_ok_and(|exe| install::runs_in_bundle(&exe));
+    let key = feed::update_key_for(platform_key(), in_bundle);
+    feed::pick(&json, current, key.as_deref())
+}
+
+/// What a download is staged as: the bare executable, or on macOS the
+/// zipped bundle, which [`apply`] recognises by this name.
+fn staged_name(version: &str, bundle: bool) -> String {
+    if bundle {
+        format!("cortisoff-{version}.zip")
+    } else {
+        format!("cortisoff-{version}{}", std::env::consts::EXE_SUFFIX)
+    }
+}
+
+/// The version a staged bundle was downloaded for, from its name, when it
+/// is one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn staged_bundle_version(staged: &Path) -> Option<&str> {
+    let name = staged.file_name()?.to_str()?;
+    let version = name.strip_prefix("cortisoff-")?.strip_suffix(".zip")?;
+    (!version.is_empty()).then_some(version)
 }
 
 /// Download `release` into `dir` and verify it. Returns the path of the
@@ -78,10 +99,9 @@ pub fn download(release: &Release, dir: &Path) -> Result<PathBuf, String> {
 fn download_with(public_key: &str, release: &Release, dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let artifact = artifact_name(&release.platform);
-    let staged = dir.join(format!(
-        "cortisoff-{}{}",
-        release.version,
-        std::env::consts::EXE_SUFFIX
+    let staged = dir.join(staged_name(
+        &release.version,
+        feed::is_bundle_key(&release.platform),
     ));
     let partial = dir.join(format!("{artifact}.part"));
     // Checked before a byte is fetched, so a malformed feed costs no download.
@@ -143,6 +163,24 @@ fn fetch_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_bundle_is_named_for_its_version() {
+        let zip = staged_name("1.2.0", true);
+        assert_eq!(zip, "cortisoff-1.2.0.zip");
+        assert_eq!(
+            staged_bundle_version(&Path::new("/tmp").join(&zip)),
+            Some("1.2.0")
+        );
+        let bare = staged_name("1.2.0", false);
+        assert_eq!(
+            bare,
+            format!("cortisoff-1.2.0{}", std::env::consts::EXE_SUFFIX)
+        );
+        assert_eq!(staged_bundle_version(Path::new(&bare)), None);
+        assert_eq!(staged_bundle_version(Path::new("cortisoff-.zip")), None);
+        assert_eq!(staged_bundle_version(Path::new("other-1.2.0.zip")), None);
+    }
 
     #[test]
     fn the_feed_url_is_the_latest_release_asset() {
@@ -220,6 +258,29 @@ Connection: close
             1,
             "no partial file left"
         );
+    }
+
+    #[test]
+    fn a_bundle_download_is_checked_like_any_artifact_and_staged_as_a_zip() {
+        let keys = verify::tests::Keys::new();
+        let scratch = replace::tests::Scratch::new("download-app");
+        let body = b"PK zipped bundle".repeat(3000);
+        let signature = keys.sign_for_feed(&body, "cortisoff-darwin-x86_64.zip", "1.2.0");
+        let mut app = release(serve_once(body.clone()), signature);
+        app.platform = "darwin-x86_64-app".into();
+        let staged = download_with(&keys.public, &app, &scratch.0).unwrap();
+        assert_eq!(staged.file_name().unwrap(), "cortisoff-1.2.0.zip");
+        assert_eq!(staged_bundle_version(&staged), Some("1.2.0"));
+        assert_eq!(fs::read(&staged).unwrap(), body);
+
+        // Signed under the bare executable's name: refused.
+        let keys = verify::tests::Keys::new();
+        let scratch = replace::tests::Scratch::new("download-app-bad");
+        let signature = keys.sign_for_feed(&body, "cortisoff-darwin-x86_64", "1.2.0");
+        let mut app = release(serve_once(body), signature);
+        app.platform = "darwin-x86_64-app".into();
+        assert!(download_with(&keys.public, &app, &scratch.0).is_err());
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

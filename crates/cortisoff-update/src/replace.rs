@@ -9,9 +9,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Replace the running executable with `staged`, a verified download.
+/// Replace the running executable with `staged`, a verified download. On
+/// macOS a staged bundle (`cortisoff-<version>.zip`) replaces the whole
+/// `Cortisoff.app` the executable runs in instead.
 pub fn apply(staged: &Path) -> Result<(), String> {
     let exe = current_exe()?;
+    #[cfg(target_os = "macos")]
+    if let Some(version) = crate::staged_bundle_version(staged) {
+        return crate::install::apply_bundle(staged, &exe, version);
+    }
     replace(staged, &exe)
 }
 

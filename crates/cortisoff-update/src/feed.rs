@@ -56,13 +56,42 @@ pub(crate) fn platform_key_for(os: &str, arch: &str) -> Option<&'static str> {
 }
 
 /// The file name a release publishes the app under for `platform`, which is
-/// also the name its signature's trusted comment carries.
+/// also the name its signature's trusted comment carries. A macOS `-app` key
+/// is the zipped, signed `Cortisoff.app`.
 pub fn artifact_name(platform: &str) -> String {
     if platform.starts_with("windows-") {
         format!("cortisoff-{platform}.exe")
+    } else if let Some(base) = bundle_base(platform) {
+        format!("cortisoff-{base}.zip")
     } else {
         format!("cortisoff-{platform}")
     }
+}
+
+/// `darwin-x86_64` for `darwin-x86_64-app`: the platform a bundle key
+/// stands for.
+fn bundle_base(platform: &str) -> Option<&str> {
+    platform
+        .strip_suffix("-app")
+        .filter(|base| base.starts_with("darwin-"))
+}
+
+/// The feed key to update from. A macOS build running inside an app bundle
+/// takes the whole bundle (`darwin-<arch>-app`), so its client, its
+/// `Info.plist` and its signature move together; a bare executable, which
+/// is what v0.2.0 installed, takes the bare key.
+pub(crate) fn update_key_for(platform: Option<&str>, in_bundle: bool) -> Option<String> {
+    let platform = platform?;
+    if in_bundle && platform.starts_with("darwin-") {
+        Some(format!("{platform}-app"))
+    } else {
+        Some(platform.to_owned())
+    }
+}
+
+/// Whether `platform` is a key whose artifact is a zipped bundle.
+pub(crate) fn is_bundle_key(platform: &str) -> bool {
+    bundle_base(platform).is_some()
 }
 
 pub(crate) fn parse_version(text: &str) -> Result<semver::Version, String> {
@@ -233,5 +262,63 @@ mod tests {
         );
         assert_eq!(artifact_name("linux-x86_64"), "cortisoff-linux-x86_64");
         assert_eq!(artifact_name("darwin-aarch64"), "cortisoff-darwin-aarch64");
+        assert_eq!(
+            artifact_name("darwin-aarch64-app"),
+            "cortisoff-darwin-aarch64.zip"
+        );
+        assert_eq!(
+            artifact_name("darwin-x86_64-app"),
+            "cortisoff-darwin-x86_64.zip"
+        );
+        // Only macOS ships a bundle.
+        assert_eq!(
+            artifact_name("linux-x86_64-app"),
+            "cortisoff-linux-x86_64-app"
+        );
+        assert!(is_bundle_key("darwin-x86_64-app"));
+        assert!(!is_bundle_key("darwin-x86_64"));
+        assert!(!is_bundle_key("linux-x86_64-app"));
+    }
+
+    #[test]
+    fn a_bundle_reads_its_app_key_and_a_bare_executable_the_bare_one() {
+        assert_eq!(
+            update_key_for(Some("darwin-x86_64"), true).as_deref(),
+            Some("darwin-x86_64-app")
+        );
+        assert_eq!(
+            update_key_for(Some("darwin-aarch64"), true).as_deref(),
+            Some("darwin-aarch64-app")
+        );
+        // v0.2.0's bare install keeps the key it always read.
+        assert_eq!(
+            update_key_for(Some("darwin-x86_64"), false).as_deref(),
+            Some("darwin-x86_64")
+        );
+        // Windows and Linux are untouched whatever the flag says.
+        assert_eq!(
+            update_key_for(Some("windows-x86_64"), true).as_deref(),
+            Some("windows-x86_64")
+        );
+        assert_eq!(
+            update_key_for(Some("linux-x86_64"), true).as_deref(),
+            Some("linux-x86_64")
+        );
+        assert_eq!(update_key_for(None, true), None);
+    }
+
+    #[test]
+    fn a_feed_with_both_mac_keys_serves_each_its_own() {
+        let json = r#"{"version":"2.0.0","platforms":{
+            "darwin-x86_64":{"url":"https://x/cortisoff-darwin-x86_64","signature":"bare"},
+            "darwin-x86_64-app":{"url":"https://x/cortisoff-darwin-x86_64.zip","signature":"app"}}}"#;
+        let app = pick(json, "1.0.0", Some("darwin-x86_64-app"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(app.signature, "app");
+        assert!(app.url.ends_with(".zip"));
+        assert_eq!(artifact_name(&app.platform), "cortisoff-darwin-x86_64.zip");
+        let bare = pick(json, "1.0.0", Some("darwin-x86_64")).unwrap().unwrap();
+        assert_eq!(bare.signature, "bare");
     }
 }

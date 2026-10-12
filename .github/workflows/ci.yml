@@ -128,6 +128,28 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --locked --no-fail-fast
 
+      # The bundle a release ships, signed the same way, so the designated
+      # requirement macOS keeps permission grants under is checked on every
+      # change. A pull request from a fork has no secrets and signs ad hoc.
+      - name: Import the macOS signing identity
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+        run: sh packaging/macos/keychain.sh import
+
+      - name: Bundle and check the signature
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked -p cortisoff-app -p cortisoff-cli
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "cortisoff-app") | .version')
+          sh packaging/macos/bundle.sh target/debug "$version" "$RUNNER_TEMP/cortisoff-check.zip"
+
+      - name: Remove the macOS signing keychain
+        if: always() && runner.os == 'macOS'
+        run: sh packaging/macos/keychain.sh remove
+
   # The release profile (fat LTO, abort on panic) builds nothing a pull request
   # does, and a release is the wrong place to learn it breaks. Windows is built
   # from main. A manual run builds every release target of any branch, to try
@@ -185,6 +207,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p cortisoff-app -p cortisoff-cli
 
+      - name: Import the macOS signing identity
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+        run: sh packaging/macos/keychain.sh import
+
       # The same bundle a release ships, so it can be tried before a tag.
       - name: Bundle the macOS app
         if: runner.os == 'macOS'
@@ -194,6 +223,10 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 |
             jq -r '.packages[] | select(.name == "cortisoff-app") | .version')
           sh packaging/macos/bundle.sh target/release "$version" "target/release/cortisoff-$KEY.zip"
+
+      - name: Remove the macOS signing keychain
+        if: always() && runner.os == 'macOS'
+        run: sh packaging/macos/keychain.sh remove
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

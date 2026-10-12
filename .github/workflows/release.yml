@@ -27,9 +27,17 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
         run: |
           if [ -z "$MINISIGN_SECRET_KEY" ] || [ -z "$MINISIGN_PASSWORD" ]; then
             echo "::error::MINISIGN_SECRET_KEY or MINISIGN_PASSWORD is missing. Updates cannot be signed."
+            exit 1
+          fi
+          # An ad hoc bundle would carry a new designated requirement, and
+          # every macOS permission grant would silently stop matching.
+          if [ -z "$MACOS_SIGNING_P12" ] || [ -z "$MACOS_SIGNING_PASSWORD" ]; then
+            echo "::error::MACOS_SIGNING_P12 or MACOS_SIGNING_PASSWORD is missing. The macOS app cannot be signed."
             exit 1
           fi
 
@@ -128,9 +136,17 @@ jobs:
           cp "$out/cortisoff-cli${{ matrix.ext }}" "dist/cortisoff-cli-${{ matrix.key }}${{ matrix.ext }}"
           ls -la dist
 
-      # macOS also gets Cortisoff.app, zipped and signed ad hoc. The bare
-      # executables above stay: latest.json and the updater point at them,
-      # and an update swaps the executable inside the installed bundle.
+      - name: Import the macOS signing identity
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+        run: sh packaging/macos/keychain.sh import
+
+      # macOS also gets Cortisoff.app, zipped and signed with the release
+      # certificate. An installed bundle updates from that zip, whole. The
+      # bare executables stay for v0.2.0, which installed a bare executable
+      # and updates from the bare keys until it has moved into the bundle.
       - name: Bundle the macOS app
         if: runner.os == 'macOS'
         env:
@@ -138,6 +154,10 @@ jobs:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.version.outputs.version }}
         run: sh packaging/macos/bundle.sh "target/$TARGET/release" "$VERSION" "dist/cortisoff-$KEY.zip"
+
+      - name: Remove the macOS signing keychain
+        if: always() && runner.os == 'macOS'
+        run: sh packaging/macos/keychain.sh remove
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -197,7 +217,9 @@ jobs:
             dist/cortisoff-windows-x86_64.exe \
             dist/cortisoff-linux-x86_64 \
             dist/cortisoff-darwin-aarch64 \
-            dist/cortisoff-darwin-x86_64
+            dist/cortisoff-darwin-x86_64 \
+            dist/cortisoff-darwin-aarch64.zip \
+            dist/cortisoff-darwin-x86_64.zip
 
       - name: Write the release notes
         run: |
@@ -214,7 +236,9 @@ jobs:
           cat RELEASE_NOTES.md
 
       # The feed cortisoff-update reads, in the Tauri updater's shape: each
-      # signature is the base64 of its .sig file.
+      # signature is the base64 of its .sig file. A macOS bundle reads its
+      # `-app` key, the zipped Cortisoff.app; the bare darwin keys stay for
+      # v0.2.0's bare executable.
       - name: Write latest.json
         env:
           TAG: ${{ github.ref_name }}
@@ -223,11 +247,13 @@ jobs:
         run: |
           set -euo pipefail
           platforms='{}'
-          for key in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64; do
-            name="cortisoff-$key"
-            if [ "$key" = windows-x86_64 ]; then
-              name="$name.exe"
-            fi
+          for key in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64 \
+            darwin-aarch64-app darwin-x86_64-app; do
+            case "$key" in
+              windows-*) name="cortisoff-$key.exe" ;;
+              *-app) name="cortisoff-${key%-app}.zip" ;;
+              *) name="cortisoff-$key" ;;
+            esac
             if [ ! -s "dist/$name.sig" ]; then
               echo "::error::Missing signature for $name"
               exit 1

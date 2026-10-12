@@ -88,6 +88,18 @@ pub fn remove_legacy() {
     clear_old_folder(&mac::legacy_dir());
 }
 
+/// Whether `exe` runs inside a macOS app bundle, which then updates whole.
+pub(crate) fn runs_in_bundle(exe: &Path) -> bool {
+    cfg!(target_os = "macos") && bundle::bundle_of(exe).is_some()
+}
+
+/// Replace the bundle `exe` runs in with the one zipped in `zip`, a
+/// verified download for `version`.
+#[cfg(target_os = "macos")]
+pub(crate) fn apply_bundle(zip: &Path, exe: &Path, version: &str) -> Result<(), String> {
+    mac::apply_update(zip, exe, version, APP_EXE)
+}
+
 /// The app, the client and their `.old` copies, then the folder if nothing
 /// else is in it: a file the user put there keeps the folder.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

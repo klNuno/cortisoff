@@ -1,12 +1,18 @@
 //! What installing on macOS needs from macOS itself: the per-user bundle in
-//! `~/Applications`, the quarantine attribute and an ad hoc signature.
+//! `~/Applications`, the quarantine attribute and the bundle's signature.
 //!
 //! A browser download carries `com.apple.quarantine`, and Gatekeeper asks
 //! once before the first start. Once the user has said yes, the copy made
 //! here drops the attribute, so the installed app, its LaunchAgent and every
-//! later start run without asking again. An update swaps the executable
-//! inside the bundle, which breaks the bundle's seal; `--register` from the
-//! new build writes its version into `Info.plist` and signs the bundle again.
+//! later start run without asking again.
+//!
+//! Releases sign the bundle with one stable certificate, and an update
+//! replaces the whole bundle with the next signed one, so the designated
+//! requirement macOS files permission grants under stays the same. Nothing
+//! here signs a released bundle again: an ad hoc signature would give it a
+//! new requirement at each update. Only a bundle built here around a bare
+//! executable (the move from v0.2.0) is signed ad hoc, since it has no
+//! signature at all.
 
 use std::ffi::CString;
 use std::fs;
@@ -20,6 +26,7 @@ use crate::replace;
 
 const QUARANTINE: &str = "com.apple.quarantine";
 const CODESIGN: &str = "/usr/bin/codesign";
+const DITTO: &str = "/usr/bin/ditto";
 const TCCUTIL: &str = "/usr/bin/tccutil";
 
 /// `~/Applications/Cortisoff.app`.
@@ -67,21 +74,25 @@ fn build_around(exe: &Path, app_exe: &str, at: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Make the installed bundle describe this build: its version in
-/// `Info.plist`, the icon when missing, no quarantine, and a signature that
-/// covers what is now inside. Signing runs only when something changed or
-/// the seal no longer holds, which is the state an update leaves.
+/// Make the installed bundle ready to run: no quarantine, and for a bundle
+/// that carries no valid signature (one built here around a bare
+/// executable) this build's `Info.plist`, the icon and an ad hoc signature.
+/// A sealed bundle, which every release and every update is, is left as
+/// signed: writing into it would break the seal, and signing it again would
+/// change the requirement macOS keeps permission grants under.
 pub fn register(app: &Path, version: &str) -> Result<(), String> {
     let Some(bundle) = bundle::bundle_of(app) else {
         return Ok(());
     };
+    unquarantine(&bundle);
+    if sealed(&bundle) {
+        return Ok(());
+    }
     let contents = bundle.join("Contents");
     let plist = contents.join("Info.plist");
     let wanted = bundle::info_plist(version);
-    let mut changed = false;
     if fs::read_to_string(&plist).ok().as_deref() != Some(wanted.as_str()) {
         fs::write(&plist, &wanted).map_err(|e| format!("cannot write {}: {e}", plist.display()))?;
-        changed = true;
     }
     let icon = contents.join("Resources").join(ICON);
     if !icon.is_file() {
@@ -90,16 +101,51 @@ pub fn register(app: &Path, version: &str) -> Result<(), String> {
             .map_err(|e| format!("cannot create {}: {e}", resources.display()))?;
         fs::write(&icon, bundle::icns())
             .map_err(|e| format!("cannot write {}: {e}", icon.display()))?;
-        changed = true;
     }
-    unquarantine(&bundle);
-    // A broken seal does not stop a bundle that carries no quarantine from
-    // starting, and an Apple Silicon executable keeps the linker's own
-    // signature, so a failed signing costs an install nothing.
-    if changed || !sealed(&bundle) {
-        let _ = sign(&bundle);
-    }
+    // A bundle that carries no quarantine starts with a broken seal too,
+    // and an Apple Silicon executable keeps the linker's own signature, so
+    // a failed signing costs an install nothing.
+    let _ = sign(&bundle);
     Ok(())
+}
+
+/// Replace the bundle `exe` runs in with the one in `zip`: unpacked with
+/// `ditto` beside it, checked (executable, `version`, a signature that
+/// verifies), then swapped in, the old one moving back if the new one
+/// cannot. The unpacked copy goes either way.
+pub fn apply_update(zip: &Path, exe: &Path, version: &str, app_exe: &str) -> Result<(), String> {
+    let installed = bundle::bundle_of(exe)
+        .ok_or_else(|| format!("{} is not inside an app bundle", exe.display()))?;
+    let unpack = bundle::update_dir(&installed);
+    let _ = fs::remove_dir_all(&unpack);
+    fs::create_dir_all(&unpack).map_err(|e| format!("cannot create {}: {e}", unpack.display()))?;
+    let result = unpack_and_swap(zip, &unpack, &installed, version, app_exe);
+    let _ = fs::remove_dir_all(&unpack);
+    result
+}
+
+fn unpack_and_swap(
+    zip: &Path,
+    unpack: &Path,
+    installed: &Path,
+    version: &str,
+    app_exe: &str,
+) -> Result<(), String> {
+    let unpacked = Command::new(DITTO)
+        .args(["-x", "-k"])
+        .arg(zip)
+        .arg(unpack)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run {DITTO}: {e}"))?;
+    if !unpacked.success() {
+        return Err(format!("cannot unpack {}", zip.display()));
+    }
+    let staged = unpack.join(BUNDLE);
+    bundle::check_staged(&staged, version, app_exe, sealed)?;
+    bundle::swap_bundle(&staged, installed)
 }
 
 /// Remove the bundle, what v0.2.0 left, and the permission rows macOS keeps

@@ -87,6 +87,51 @@ pub fn staging_names(bundle: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
+/// The folder an update unpacks into, beside the bundle so the swap is a
+/// rename on one volume.
+pub fn update_dir(bundle: &Path) -> PathBuf {
+    let name = bundle
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    bundle.with_file_name(format!(".{name}.update"))
+}
+
+/// Whether a bundle an update unpacked may replace the installed one: the
+/// app executable is there, its `Info.plist` names the version the signed
+/// feed announced, and `sealed` (`codesign --verify --deep --strict` on
+/// macOS) accepts its signature.
+pub fn check_staged(
+    staged: &Path,
+    version: &str,
+    app_exe: &str,
+    sealed: impl FnOnce(&Path) -> bool,
+) -> Result<(), String> {
+    if !executables(staged).join(app_exe).is_file() {
+        return Err(format!(
+            "the downloaded app has no {app_exe} in {}",
+            executables(staged).display()
+        ));
+    }
+    let plist = staged.join("Contents").join("Info.plist");
+    let found = fs::read_to_string(&plist)
+        .ok()
+        .and_then(|text| plist_version(&text));
+    match found {
+        Some(found) if found == version => {}
+        Some(found) => {
+            return Err(format!(
+                "the downloaded app is version {found}, the release said {version}"
+            ))
+        }
+        None => return Err("the downloaded app does not say its version".to_owned()),
+    }
+    if !sealed(staged) {
+        return Err("the downloaded app's signature does not verify".to_owned());
+    }
+    Ok(())
+}
+
 /// Copy a folder tree, symbolic links as links. A signed bundle keeps
 /// links (frameworks do), and following one would copy what it points at
 /// and break the seal.
@@ -303,6 +348,57 @@ mod tests {
         assert_eq!(
             fs::read(executables(&installed).join("cortisoff")).unwrap(),
             b"old"
+        );
+    }
+
+    #[test]
+    fn a_staged_bundle_must_be_whole_the_announced_version_and_sealed() {
+        let scratch = Scratch::new("staged");
+        let staged = bundle_in(&scratch.0.join("update"), b"new");
+        fs::write(
+            staged.join("Contents").join("Info.plist"),
+            info_plist("0.4.0"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            check_staged(&staged, "0.4.0", "cortisoff", |_| true),
+            Ok(())
+        );
+
+        let wrong = check_staged(&staged, "0.5.0", "cortisoff", |_| true).unwrap_err();
+        assert!(
+            wrong.contains("0.4.0") && wrong.contains("0.5.0"),
+            "{wrong}"
+        );
+
+        let unsigned = check_staged(&staged, "0.4.0", "cortisoff", |_| false).unwrap_err();
+        assert!(unsigned.contains("signature"), "{unsigned}");
+
+        // The seal is asked about the staged bundle, not some other path.
+        let mut asked = None;
+        let _ = check_staged(&staged, "0.4.0", "cortisoff", |p| {
+            asked = Some(p.to_path_buf());
+            true
+        });
+        assert_eq!(asked.as_deref(), Some(staged.as_path()));
+
+        fs::write(staged.join("Contents").join("Info.plist"), b"<dict></dict>").unwrap();
+        assert!(check_staged(&staged, "0.4.0", "cortisoff", |_| true)
+            .unwrap_err()
+            .contains("version"));
+
+        fs::remove_file(executables(&staged).join("cortisoff")).unwrap();
+        assert!(check_staged(&staged, "0.4.0", "cortisoff", |_| true)
+            .unwrap_err()
+            .contains("cortisoff"));
+    }
+
+    #[test]
+    fn an_update_unpacks_beside_the_bundle() {
+        assert_eq!(
+            update_dir(Path::new("/h/Applications/Cortisoff.app")),
+            Path::new("/h/Applications/.Cortisoff.app.update")
         );
     }
 
