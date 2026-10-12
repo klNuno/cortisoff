@@ -40,6 +40,9 @@ const SETTLE: Duration = Duration::from_millis(300);
 const NOTICE_FOR: Duration = Duration::from_secs(6);
 /// Log lines kept for the overview.
 const RECENT: usize = 40;
+/// A start or a stop asked from here shows as done this long before the
+/// daemon confirms it; past that, the window believes the daemon again.
+const IN_TRANSIT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Daemon {
@@ -109,6 +112,8 @@ pub struct Shell {
     state_asked: bool,
     /// When the daemon was started from here, so the page can say so.
     starting: Option<Instant>,
+    /// When the daemon was asked to stop from here, so the logo turns at once.
+    stopping: Option<Instant>,
     /// Open this plugin as soon as the list carries it: one just added.
     open_when_listed: Option<String>,
     /// A linked folder was sent; open whichever plugin is new in the next
@@ -147,6 +152,7 @@ impl Shell {
             state_stale: false,
             state_asked: false,
             starting: None,
+            stopping: None,
             open_when_listed: None,
             open_new: None,
             add_text: String::new(),
@@ -243,12 +249,14 @@ impl Shell {
                 Inbound::Connected => {
                     self.daemon = Daemon::Up;
                     self.starting = None;
+                    self.stopping = None;
                     self.ask(Ask::Plugins, Request::Plugins);
                     self.ask(Ask::State, Request::State);
                     self.ask(Ask::Doctor, Request::Doctor);
                 }
                 Inbound::Disconnected => {
                     self.daemon = Daemon::Down;
+                    self.stopping = None;
                     self.state = None;
                     self.state_asked = false;
                 }
@@ -417,6 +425,40 @@ impl Shell {
         }
     }
 
+    /// Stops the daemon, which releases every claim on the way out.
+    fn stop_daemon(&mut self) {
+        self.ask(Ask::Do("stop cortisoff".to_owned()), Request::Shutdown);
+        self.stopping = Some(Instant::now());
+    }
+
+    /// Whether cortisoff is on as the logo shows it: running, or asked to
+    /// start from here. `None` until the daemon has answered or failed to.
+    fn switched_on(&self) -> Option<bool> {
+        if recent(self.stopping) {
+            return Some(false);
+        }
+        if recent(self.starting) {
+            return Some(true);
+        }
+        match self.daemon {
+            Daemon::Unknown => None,
+            Daemon::Up => Some(true),
+            Daemon::Down => Some(false),
+        }
+    }
+
+    /// The logo's click: stop what runs, start what does not.
+    fn toggle(&mut self) {
+        if recent(self.starting) || recent(self.stopping) {
+            return;
+        }
+        match self.switched_on() {
+            Some(true) => self.stop_daemon(),
+            Some(false) => self.start_daemon(),
+            None => {}
+        }
+    }
+
     // ---- background work -----------------------------------------------
 
     fn spawn(&self, ctx: &egui::Context, work: impl FnOnce() -> Done + Send + 'static) {
@@ -487,16 +529,11 @@ impl Shell {
 
     fn sidebar(&mut self, ui: &mut Ui, now: f64) {
         ui.spacing_mut().item_spacing.y = 2.0;
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            logo(ui);
-            ui.label(
-                RichText::new("cortisoff")
-                    .font(theme::strong(16.0))
-                    .color(theme::TEXT),
-            );
-        });
-        ui.add_space(14.0);
+        let busy = recent(self.starting) || recent(self.stopping);
+        if switch(ui, self.switched_on(), busy).clicked() {
+            self.toggle();
+        }
+        ui.add_space(6.0);
         if widgets::nav_item(
             ui,
             glyph::HOME,
@@ -629,9 +666,7 @@ impl Shell {
         if self.daemon != Daemon::Down {
             return;
         }
-        let starting = self
-            .starting
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(8));
+        let starting = recent(self.starting);
         let mut start = false;
         Frame::new()
             .fill(theme::CARD)
@@ -1156,7 +1191,7 @@ impl Shell {
             widgets::row(ui, "Background process", Some(&hint), |ui| {
                 if running {
                     if widgets::button(ui, Some(glyph::PAUSE), "Stop").clicked() {
-                        self.ask(Ask::Do("stop cortisoff".to_owned()), Request::Shutdown);
+                        self.stop_daemon();
                     }
                 } else if widgets::button(ui, Some(glyph::ARROW), "Start").clicked() {
                     self.start_daemon();
@@ -1469,25 +1504,71 @@ fn installed() -> bool {
         .unwrap_or(false)
 }
 
-/// The gauge logo, drawn rather than shipped as an image.
-fn logo(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::hover());
-    let c = rect.center() + vec2(0.0, 3.0);
+/// Whether a start or a stop asked at `t` is still on its way.
+fn recent(t: Option<Instant>) -> bool {
+    t.is_some_and(|t| t.elapsed() < IN_TRANSIT)
+}
+
+/// The logo, which is also cortisoff's own switch: the gauge and the name,
+/// a green "cortisoff" while it runs and a red "cortison" while it does not.
+/// The needle swings from calm to stressed as it goes off. Grey and calm
+/// before the daemon has answered.
+fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
+    let t =
+        ui.ctx()
+            .animate_bool_with_time(egui::Id::new("cortisoff-switch"), on.unwrap_or(true), 0.3);
+    let colour = match on {
+        None => theme::SUBTLE,
+        Some(_) => theme::FAILED.lerp_to_gamma(theme::HOLDING, t),
+    };
+    let word = if t >= 0.5 { "cortisoff" } else { "cortison" };
+    // The name dims through the swap instead of jumping from one to the other.
+    let ink = colour.gamma_multiply(0.35 + 0.65 * (2.0 * t - 1.0).abs());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(word.to_owned(), theme::strong(16.0), ink);
+    let size = vec2(10.0 + 22.0 + 8.0 + galley.size().x + 12.0, 36.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on == Some(true), word)
+    });
+
     let painter = ui.painter();
+    if response.hovered() && !busy && on.is_some() {
+        painter.rect_filled(rect, theme::RADIUS_CONTROL, colour.gamma_multiply(0.12));
+    }
+    let c = pos2(rect.left() + 21.0, rect.center().y + 3.0);
     let arc: Vec<_> = (0..=24)
         .map(|i| {
             let a = std::f32::consts::PI * (1.0 + i as f32 / 24.0);
             pos2(c.x + 9.0 * a.cos(), c.y + 9.0 * a.sin())
         })
         .collect();
-    painter.add(egui::Shape::line(
-        arc,
-        egui::Stroke::new(2.5, theme::HOLDING),
-    ));
+    painter.add(egui::Shape::line(arc, egui::Stroke::new(2.5, colour)));
+    let a = std::f32::consts::PI * (1.75 - 0.5 * t);
     painter.line_segment(
-        [c, c + vec2(-5.0, -5.0)],
+        [c, c + 7.0 * vec2(a.cos(), a.sin())],
         egui::Stroke::new(2.0, theme::TEXT),
     );
+    painter.galley(
+        pos2(rect.left() + 40.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+
+    let tip = match (on, busy) {
+        (None, _) => "Looking for cortisoff",
+        (Some(true), true) => "Starting",
+        (Some(false), true) => "Stopping",
+        (Some(true), false) => "Running. Click to stop every plugin.",
+        (Some(false), false) => "Stopped. Click to start.",
+    };
+    let response = if busy || on.is_none() {
+        response
+    } else {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    };
+    response.on_hover_text(tip)
 }
 
 pub(crate) fn local_time() -> (u16, u8, u8, u8, u8, u8, u16) {
@@ -1666,5 +1747,36 @@ impl Shell {
         self.state = None;
         self.recent.clear();
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_logo_follows_the_daemon_and_turns_off_at_once() {
+        let mut shell = Shell::with(None, true);
+        assert_eq!(shell.switched_on(), None);
+        shell.daemon = Daemon::Up;
+        assert_eq!(shell.switched_on(), Some(true));
+
+        // A stop shows before the daemon has gone, and a second click while
+        // it goes does nothing rather than starting a new one.
+        shell.toggle();
+        assert_eq!(shell.switched_on(), Some(false));
+        shell.toggle();
+        assert_eq!(shell.switched_on(), Some(false));
+        assert!(shell.starting.is_none());
+
+        // A stop the daemon never acted on gives way to what it says.
+        if let Some(long_ago) = Instant::now().checked_sub(IN_TRANSIT * 2) {
+            shell.stopping = Some(long_ago);
+            assert_eq!(shell.switched_on(), Some(true));
+        }
+
+        shell.daemon = Daemon::Down;
+        shell.stopping = None;
+        assert_eq!(shell.switched_on(), Some(false));
     }
 }
