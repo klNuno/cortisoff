@@ -21,7 +21,6 @@ mod win;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(not(target_os = "macos"))]
 use crate::replace;
 
 /// The app's file name once installed.
@@ -61,9 +60,132 @@ fn home() -> PathBuf {
 }
 
 /// Whether `exe` is the installed copy, which is what the app asks before
-/// offering to install.
+/// offering to install and what the daemon asks before checking for
+/// updates. On macOS the folder v0.2.0 installed to counts too, so a build
+/// its updater put there keeps updating until it has moved into the bundle.
 pub fn is_installed(exe: &Path) -> bool {
-    same_path(exe, &dir().join(APP_EXE))
+    same_path(exe, &dir().join(APP_EXE)) || is_legacy(exe)
+}
+
+/// Whether `exe` runs from where v0.2.0 installed macOS,
+/// `~/Applications/Cortisoff/cortisoff`, rather than from the bundle.
+pub fn is_legacy(exe: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        same_path(exe, &mac::legacy_dir().join(APP_EXE))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+        false
+    }
+}
+
+/// Remove what v0.2.0 installed on macOS, once the bundle holds the app.
+/// Nothing elsewhere.
+pub fn remove_legacy() {
+    #[cfg(target_os = "macos")]
+    clear_old_folder(&mac::legacy_dir());
+}
+
+/// The app, the client and their `.old` copies, then the folder if nothing
+/// else is in it: a file the user put there keeps the folder.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn clear_old_folder(dir: &Path) {
+    let app = dir.join(APP_EXE);
+    let cli = dir.join(CLI_EXE);
+    let files = [app.clone(), cli.clone()]
+        .into_iter()
+        .chain(replace::previous_files(&app))
+        .chain(replace::previous_files(&cli));
+    for file in files {
+        let _ = fs::remove_file(file);
+    }
+    let _ = fs::remove_dir(dir);
+}
+
+/// What a copy started from outside the install path does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// Nothing installed, or an older build: copy this one in.
+    Install,
+    /// The installed copy is this version or newer: start it instead, so an
+    /// old download opened again never undoes an update.
+    UseInstalled(PathBuf),
+}
+
+/// Install over the installed copy, or leave it and start it, by comparing
+/// versions. Reads the installed version without opening a window: on macOS
+/// from the bundle's `Info.plist`, elsewhere from `<installed> --version`.
+pub fn placement() -> Placement {
+    let installed = dir().join(APP_EXE);
+    if !installed.is_file() {
+        return Placement::Install;
+    }
+    if keeps_installed(
+        env!("CARGO_PKG_VERSION"),
+        installed_version(&installed).as_deref(),
+    ) {
+        Placement::UseInstalled(installed)
+    } else {
+        Placement::Install
+    }
+}
+
+/// True when the installed version is at least `running`. An installed
+/// version that cannot be read or parsed counts as older, and so does
+/// anything when `running` itself does not parse.
+fn keeps_installed(running: &str, installed: Option<&str>) -> bool {
+    let running = crate::feed::parse_version(running);
+    let installed = installed.map(crate::feed::parse_version);
+    matches!((running, installed), (Ok(r), Some(Ok(i))) if i >= r)
+}
+
+#[cfg(target_os = "macos")]
+fn installed_version(app: &Path) -> Option<String> {
+    let bundle = bundle::bundle_of(app)?;
+    let text = fs::read_to_string(bundle.join("Contents").join("Info.plist")).ok()?;
+    bundle::plist_version(&text)
+}
+
+/// `<app> --version`, given three seconds: a build too old to know the flag
+/// refuses it and exits, it never opens a window.
+#[cfg(not(target_os = "macos"))]
+fn installed_version(app: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(app)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(30)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    version_output(&out)
+}
+
+/// The version in what `cortisoff --version` prints: `cortisoff 0.2.0`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn version_output(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let version = line.strip_prefix("cortisoff ")?.trim();
+    (!version.is_empty()).then(|| version.to_owned())
 }
 
 /// Install `exe`, and `cortisoff-cli` when it sits beside it, then register
@@ -290,6 +412,76 @@ mod tests {
         let installed = scratch.0.join(CLI_EXE);
         fs::write(&installed, b"cli").unwrap();
         assert_eq!(cli_beside(&app), Some(installed));
+    }
+
+    #[test]
+    fn an_installed_copy_as_new_or_newer_is_kept() {
+        assert!(keeps_installed("0.3.0", Some("0.3.1")), "never downgrade");
+        assert!(
+            keeps_installed("0.3.0", Some("0.3.0")),
+            "same version: start it"
+        );
+        assert!(keeps_installed("0.3.0", Some("v0.3.0")));
+        assert!(
+            !keeps_installed("0.3.1", Some("0.3.0")),
+            "older: replace it"
+        );
+        assert!(!keeps_installed("0.3.0", Some("0.3.0-rc.1")));
+        assert!(
+            !keeps_installed("0.3.0", None),
+            "unreadable counts as older"
+        );
+        assert!(!keeps_installed("0.3.0", Some("not a version")));
+        assert!(!keeps_installed("garbage", Some("9.9.9")));
+        assert!(keeps_installed("0.9.0", Some("0.10.0")), "semver, not text");
+    }
+
+    #[test]
+    fn the_version_flag_output_gives_the_version() {
+        assert_eq!(
+            version_output("cortisoff 0.2.0\n").as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            version_output("\r\ncortisoff 1.4.0\r\n").as_deref(),
+            Some("1.4.0")
+        );
+        assert_eq!(version_output("unknown argument --version"), None);
+        assert_eq!(version_output("cortisoff \n"), None);
+        assert_eq!(version_output(""), None);
+    }
+
+    #[test]
+    fn nothing_installed_means_install() {
+        // The scratch folder is never the install path, and the decision only
+        // keeps a copy that exists.
+        assert!(!is_legacy(
+            Path::new("somewhere-else").join(APP_EXE).as_path()
+        ));
+        if !dir().join(APP_EXE).is_file() {
+            assert_eq!(placement(), Placement::Install);
+        }
+    }
+
+    #[test]
+    fn the_old_folder_goes_but_keeps_what_the_user_added() {
+        let scratch = Scratch::new("legacy");
+        let old = scratch.0.join("Cortisoff");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(APP_EXE), b"app").unwrap();
+        fs::write(old.join(CLI_EXE), b"cli").unwrap();
+        fs::write(replace::previous_path(&old.join(APP_EXE), 1), b"old").unwrap();
+        clear_old_folder(&old);
+        assert!(!old.exists());
+
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(APP_EXE), b"app").unwrap();
+        fs::write(old.join("notes.txt"), b"mine").unwrap();
+        clear_old_folder(&old);
+        assert!(!old.join(APP_EXE).exists());
+        assert!(old.join("notes.txt").is_file());
+
+        clear_old_folder(&scratch.0.join("never-there"));
     }
 
     #[test]

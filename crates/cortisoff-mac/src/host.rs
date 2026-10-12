@@ -36,7 +36,7 @@ use crate::hotkeys::Hotkeys;
 use crate::mode::DisplayMode;
 use crate::runloop::{Raw, Shared};
 use crate::sources::{self, DisplayWatch, Observers, PowerWatch};
-use crate::timers::{idle_bucket, idle_check_after, Beat, Return, Timers};
+use crate::timers::{idle_bucket, idle_check_after, Beat, Return, Timers, LAYOUT_AFTER_MS};
 use crate::windows::{self, Placements, Window};
 use crate::{ax, clock, input, notify, screen};
 
@@ -421,8 +421,13 @@ impl MacHost {
                     vec![event]
                 }
             }
+            // Read on a later pass: see `LAYOUT_AFTER_MS`.
             Raw::Layout => {
-                self.hotkeys.follow_layout();
+                self.arm(
+                    Beat::Layout,
+                    Duration::from_millis(LAYOUT_AFTER_MS),
+                    Duration::ZERO,
+                );
                 Vec::new()
             }
         }
@@ -470,6 +475,10 @@ impl MacHost {
                 }
                 self.arm(Beat::Power, POWER_EVERY, POWER_SLACK);
                 self.power_event()
+            }
+            Beat::Layout => {
+                self.hotkeys.follow_layout();
+                Vec::new()
             }
         }
     }

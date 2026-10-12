@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 pub const BUNDLE: &str = "Cortisoff.app";
 /// The icon file `Info.plist` names (`CFBundleIconFile`).
 pub const ICON: &str = "cortisoff.icns";
+/// `CFBundleIdentifier`, which TCC files its permission rows under.
+pub const BUNDLE_ID: &str = "dev.mtsu.cortisoff";
 
 const TEMPLATE: &str = include_str!("../../../../packaging/macos/Info.plist");
 const LOGO: &[u8] = include_bytes!("../../../../assets/icon.png");
@@ -22,6 +24,16 @@ const LOGO: &[u8] = include_bytes!("../../../../assets/icon.png");
 /// converted them still writes the bytes the release signed.
 pub fn info_plist(version: &str) -> String {
     TEMPLATE.replace("\r\n", "\n").replace("@VERSION@", version)
+}
+
+/// The version an `Info.plist` gives (`CFBundleShortVersionString`), read
+/// without a plist parser: the value is the next `<string>` after its key.
+pub fn plist_version(text: &str) -> Option<String> {
+    let after_key = &text[text.find("<key>CFBundleShortVersionString</key>")?..];
+    let start = after_key.find("<string>")? + "<string>".len();
+    let rest = &after_key[start..];
+    let value = rest[..rest.find("</string>")?].trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// The app's icon in Apple's `icns` container: one 512 px PNG under the
@@ -155,8 +167,29 @@ mod tests {
         }
         assert_eq!(text.matches("<dict>").count(), 1);
         assert!(text.trim_end().ends_with("</plist>"));
+        assert!(text.contains(&format!("<string>{BUNDLE_ID}</string>")));
         // The icon the plist names is the one the installer writes.
         assert_eq!(ICON, "cortisoff.icns");
+    }
+
+    #[test]
+    fn the_installed_version_is_read_back_from_the_plist() {
+        assert_eq!(
+            plist_version(&info_plist("1.2.3")).as_deref(),
+            Some("1.2.3")
+        );
+        let spaced =
+            "<dict>\n  <key>CFBundleShortVersionString</key>\n  <string> 0.4.0 </string>\n</dict>";
+        assert_eq!(plist_version(spaced).as_deref(), Some("0.4.0"));
+        assert_eq!(
+            plist_version("<dict><key>CFBundleVersion</key><string>1</string></dict>"),
+            None
+        );
+        assert_eq!(
+            plist_version("<key>CFBundleShortVersionString</key><string></string>"),
+            None
+        );
+        assert_eq!(plist_version("<key>CFBundleShortVersionString</key>"), None);
     }
 
     #[test]

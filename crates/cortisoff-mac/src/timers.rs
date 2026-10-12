@@ -21,7 +21,17 @@ pub enum Beat {
     Settle,
     /// The power source, when IOKit would not hand over its notification.
     Power,
+    /// Re-reading the keyboard layout after a switch, one run loop turn
+    /// later (see [`LAYOUT_AFTER_MS`]).
+    Layout,
 }
+
+/// How long after the layout switch notification the hotkeys read the
+/// layout again. Text input services learn the new source from the same
+/// notification, and nothing orders their observer before ours; reading it
+/// in the pass that delivered the notification may still see the old one.
+/// Any delay above zero sends the poll back into the run loop first.
+pub const LAYOUT_AFTER_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy)]
 struct Pending {
@@ -152,6 +162,22 @@ mod tests {
         assert_eq!(t.take_due(150), vec![Beat::Idle]);
         assert_eq!(t.take_due(400), vec![engine(1), engine(2)]);
         assert!(t.take_due(1_000).is_empty());
+    }
+
+    #[test]
+    fn the_layout_is_read_on_a_later_pass_than_its_notification() {
+        // The poll translates what woke it, then takes what is due at the
+        // same instant: a beat armed while translating must not be due yet,
+        // or the layout would be read in the notification's own pass.
+        let mut t = Timers::default();
+        let now = 10_000;
+        t.arm(Beat::Layout, now, LAYOUT_AFTER_MS, 0);
+        assert!(t.take_due(now).is_empty());
+        assert_eq!(t.deadline(), Some(now + LAYOUT_AFTER_MS));
+        // A second switch before it fires replaces it: one re-read.
+        t.arm(Beat::Layout, now + 20, LAYOUT_AFTER_MS, 0);
+        assert!(t.take_due(now + LAYOUT_AFTER_MS).is_empty());
+        assert_eq!(t.take_due(now + 20 + LAYOUT_AFTER_MS), vec![Beat::Layout]);
     }
 
     #[test]

@@ -14,16 +14,23 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::bundle::{self, BUNDLE, ICON};
+use super::bundle::{self, BUNDLE, BUNDLE_ID, ICON};
 use super::{cli_beside, home, CLI_EXE};
 use crate::replace;
 
 const QUARANTINE: &str = "com.apple.quarantine";
 const CODESIGN: &str = "/usr/bin/codesign";
+const TCCUTIL: &str = "/usr/bin/tccutil";
 
 /// `~/Applications/Cortisoff.app`.
 pub fn bundle() -> PathBuf {
     home().join("Applications").join(BUNDLE)
+}
+
+/// `~/Applications/Cortisoff`, where v0.2.0 put a bare executable and its
+/// client.
+pub fn legacy_dir() -> PathBuf {
+    home().join("Applications").join("Cortisoff")
 }
 
 /// Put the app at [`bundle`], from the bundle `exe` runs in or, for a bare
@@ -43,6 +50,9 @@ pub fn install(exe: &Path, app_exe: &str) -> Result<PathBuf, String> {
         let _ = fs::remove_dir_all(&incoming);
         return Err(e);
     }
+    // The bundle replaces what v0.2.0 installed; a daemon still running
+    // from there keeps its open executable until it exits.
+    super::remove_legacy();
     Ok(bundle::executables(&target).join(app_exe))
 }
 
@@ -92,18 +102,35 @@ pub fn register(app: &Path, version: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the bundle. A running daemon keeps its open executable; unix
-/// unlinks it without complaint.
+/// Remove the bundle, what v0.2.0 left, and the permission rows macOS keeps
+/// for the app. A running daemon keeps its open executable; unix unlinks it
+/// without complaint.
 pub fn uninstall() -> Result<(), String> {
     let target = bundle();
     let (incoming, aside) = bundle::staging_names(&target);
     let _ = fs::remove_dir_all(incoming);
     let _ = fs::remove_dir_all(aside);
+    super::remove_legacy();
+    forget_permissions();
     match fs::remove_dir_all(&target) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("cannot remove {}: {e}", target.display())),
     }
+}
+
+/// `tccutil reset All dev.mtsu.cortisoff`: the Accessibility, Input
+/// Monitoring and Screen Recording rows stay in System Settings after the
+/// app is gone, and a reinstall, signed with a new ad hoc hash, would then
+/// meet a row that shows as on and grants nothing. The user's own rows need
+/// no administrator. A failure leaves the rows, which is the old state.
+fn forget_permissions() {
+    let _ = Command::new(TCCUTIL)
+        .args(["reset", "All", BUNDLE_ID])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Drop the quarantine attribute from every file and folder in `root`.
