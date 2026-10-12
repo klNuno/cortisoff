@@ -3,8 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -16,19 +15,72 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Nothing in CI attaches a debugger. Without debug info the test binaries
+  # link faster and the cache is a fraction of the size to restore.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
+  # What changed, and the checks that need no build: formatting and the
+  # workflows themselves. A pull request that only touches the docs stops here.
+  changes:
+    name: changes and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sort the changed files
+        id: filter
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            files=$(git ls-files)
+          else
+            files=$(git diff --name-only "$BASE" HEAD)
+          fi
+          # Text nobody compiles. Anything else, an empty diff included, builds.
+          docs='^(docs/|[A-Z]+\.md$|LICENSE-|\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE\.md$|CODEOWNERS$|dependabot\.yml$))'
+          if printf '%s\n' "$files" | grep -qvE "$docs"; then rust=true; else rust=false; fi
+          if printf '%s\n' "$files" | grep -q '^\.github/workflows/'; then workflows=true; else workflows=false; fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "workflows=$workflows" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust workflows=$workflows"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Validate workflows
+        if: steps.filter.outputs.workflows == 'true'
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint"
+
   rust:
     name: rust (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-2025, ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # OpenSSL headers for ureq's native-tls, and what eframe's x11 and
       # wayland backends and glow link against.
@@ -51,21 +103,22 @@ jobs:
             libxcb-xfixes0-dev
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          components: rustfmt, clippy
+          toolchain: stable
+          components: clippy
 
+      # Saved from main only. A pull request's cache is visible to that pull
+      # request alone, evicts the one every pull request restores, and saving
+      # it cost the Windows job 104 s a run.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      # Clippy and the tests still run after a formatting failure, and keep
-      # going past a failing crate, so one run reports every crate and every
-      # check rather than the first one that failed.
+      # Clippy and the tests keep going past a failing crate, so one run
+      # reports every crate and every check rather than the first failure.
       - name: Clippy
-        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
       # The capture tests render through wgpu and hosted runners have no GPU,
@@ -74,3 +127,63 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         run: cargo test --workspace --locked --no-fail-fast
+
+  # The release profile (fat LTO, abort on panic) builds nothing a pull request
+  # does, and a release is the wrong place to learn it breaks. Built from main
+  # only, and kept a week as a build to try.
+  release-build:
+    name: release build (windows)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request'
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo build --release --locked -p cortisoff-app -p cortisoff-cli
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cortisoff-windows-x86_64
+          path: |
+            target/release/cortisoff.exe
+            target/release/cortisoff-cli.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # The one check branch protection needs: every job that had to run passed,
+  # and a job the changes made unnecessary was skipped, not failed.
+  required:
+    name: CI required
+    if: always()
+    needs: [changes, rust, release-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -e '
+            .changes.result == "success"
+            and ([.rust.result, ."release-build".result] | all(. == "success" or . == "skipped"))
+            and (if .changes.outputs.rust == "true" then .rust.result == "success" else true end)
+          ' > /dev/null || { echo "$RESULTS"; exit 1; }
+          echo "All applicable checks passed"
