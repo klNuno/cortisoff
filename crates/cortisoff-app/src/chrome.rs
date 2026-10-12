@@ -2,6 +2,11 @@
 //! macOS, so the window draws its caption buttons, moves from its top band
 //! and resizes from its edges itself. macOS keeps its traffic lights over a
 //! transparent title bar, and its own edges.
+//!
+//! On Windows the system still does the moving and the resizing: each frame
+//! tells it which pixels are the band and which are the edges, and its hit
+//! test answers from the press on (see `cortisoff_win::frame`). Elsewhere a
+//! press on them asks the window manager to start a move or a resize.
 
 use eframe::egui::{
     self, pos2, vec2, Color32, CursorIcon, Id, LayerId, Order, PointerButton, Rect,
@@ -40,6 +45,53 @@ const CLOSE_DOWN: Color32 = Color32::from_rgb(0xb2, 0x27, 0x1a);
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 12.0;
 
+/// Whether the system answers the window's hit test, see [`adopt`].
+#[cfg(windows)]
+static NATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn native() -> bool {
+    #[cfg(windows)]
+    {
+        NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Hands the window's hit test to the system, once the window exists.
+#[cfg(windows)]
+pub fn adopt(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    if let RawWindowHandle::Win32(window) = handle.as_raw() {
+        let adopted = cortisoff_win::frame::adopt(window.hwnd.get());
+        NATIVE.store(adopted, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What this frame drew in the top band: where a press moves the window,
+/// and the widgets over it that take their own.
+#[derive(Clone, Default)]
+struct Band {
+    caption: Vec<Rect>,
+    buttons: Vec<Rect>,
+}
+
+fn band(ui: &Ui, f: impl FnOnce(&mut Band)) {
+    ui.ctx()
+        .data_mut(|d| f(d.get_temp_mut_or_default::<Band>(Id::new("cortisoff-band"))));
+}
+
+/// Marks a widget drawn over the top band: a press on it is its own, not a
+/// move.
+pub fn over_band(ui: &Ui, rect: Rect) {
+    band(ui, |b| b.buttons.push(rect));
+}
+
 /// The frame the window asks the system for.
 pub fn viewport(builder: ViewportBuilder) -> ViewportBuilder {
     if cfg!(target_os = "macos") {
@@ -59,6 +111,7 @@ pub fn viewport(builder: ViewportBuilder) -> ViewportBuilder {
 pub fn title_bar(ui: &mut Ui) {
     let width = ui.available_width();
     let (rect, bar) = ui.allocate_exact_size(vec2(width, TITLE_BAR), Sense::click_and_drag());
+    band(ui, |b| b.caption.push(rect));
     if OWN_FRAME {
         caption_buttons(ui, rect);
     }
@@ -78,6 +131,7 @@ pub fn sidebar_band(ui: &mut Ui, margin: f32) {
         Id::new("cortisoff-sidebar-band"),
         Sense::click_and_drag(),
     );
+    self::band(ui, |b| b.caption.push(band));
     drag(ui, &response);
 }
 
@@ -112,6 +166,7 @@ fn caption_buttons(ui: &mut Ui, bar: Rect) {
     for kind in [Caption::Close, middle, Caption::Minimize] {
         let rect = Rect::from_min_size(pos2(right - BUTTON.x, bar.top()), BUTTON);
         right -= BUTTON.x;
+        over_band(ui, rect);
         if caption_button(ui, rect, kind).clicked() {
             ui.ctx().send_viewport_cmd(match kind {
                 Caption::Minimize => ViewportCommand::Minimized(true),
@@ -188,8 +243,13 @@ fn caption_button(ui: &mut Ui, rect: Rect, kind: Caption) -> Response {
 
 /// Resizes the window from its edges, which an undecorated window no longer
 /// has. Drawn above everything, so a press on an edge never reaches the
-/// widget under it. Nothing while maximised.
+/// widget under it. Nothing while maximised. Called last in the frame: on
+/// Windows it hands the band and the edges to the system's hit test.
 pub fn resize_edges(ui: &mut Ui) {
+    let drawn = ui
+        .ctx()
+        .data_mut(|d| d.remove_temp::<Band>(Id::new("cortisoff-band")))
+        .unwrap_or_default();
     if !OWN_FRAME {
         return;
     }
@@ -199,7 +259,32 @@ pub fn resize_edges(ui: &mut Ui) {
             i.viewport().fullscreen.unwrap_or(false),
         )
     });
-    if maximized || fullscreen {
+    #[cfg(windows)]
+    if native() {
+        let ppp = ui.ctx().pixels_per_point();
+        let px = |r: &Rect| {
+            [
+                (r.left() * ppp).round() as i32,
+                (r.top() * ppp).round() as i32,
+                (r.right() * ppp).round() as i32,
+                (r.bottom() * ppp).round() as i32,
+            ]
+        };
+        let resizable = !(maximized || fullscreen);
+        cortisoff_win::frame::set(cortisoff_win::frame::Regions {
+            caption: drawn.caption.iter().map(px).collect(),
+            buttons: drawn.buttons.iter().map(px).collect(),
+            edge: if resizable {
+                (EDGE * ppp).round() as i32
+            } else {
+                0
+            },
+            corner: (CORNER * ppp).round() as i32,
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = drawn;
+    if maximized || fullscreen || native() {
         return;
     }
     let window = ui.ctx().content_rect();

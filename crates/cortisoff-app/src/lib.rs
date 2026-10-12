@@ -113,6 +113,8 @@ pub fn window(launch: Launch) -> Result<(), String> {
         "cortisoff",
         options,
         Box::new(move |cc| {
+            #[cfg(windows)]
+            chrome::adopt(cc);
             let mut shell = Shell::live(&cc.egui_ctx);
             if let Some(problem) = problem {
                 shell.warn(problem);
