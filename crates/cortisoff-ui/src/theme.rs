@@ -39,12 +39,14 @@ pub fn body(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
-/// A glyph from the system icon font.
+/// A glyph from [`glyph`]: Segoe Fluent Icons on Windows, the bundled
+/// Phosphor icons elsewhere.
 pub fn icon(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("icons".into()))
 }
 
-/// Segoe Fluent Icons code points, which Segoe MDL2 Assets shares on Windows 10.
+/// Segoe Fluent Icons code points, which Segoe MDL2 Assets shares on Windows
+/// 10 and the bundled icons copy everywhere.
 pub mod glyph {
     pub const HOME: char = '\u{E80F}';
     pub const SETTINGS: char = '\u{E713}';
@@ -164,12 +166,12 @@ pub fn install(ctx: &egui::Context) {
 }
 
 fn fonts() -> FontDefinitions {
+    let faces = system_faces();
     let mut fonts = FontDefinitions::default();
-    let mut add = |name: &str, bytes: Option<Vec<u8>>, family: FontFamily| {
-        if let Some(bytes) = bytes {
-            fonts
-                .font_data
-                .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
+    // Each face goes in front of its family, ahead of egui's own.
+    let mut add = |name: &str, data: Option<FontData>, family: FontFamily| {
+        if let Some(data) = data {
+            fonts.font_data.insert(name.to_owned(), Arc::new(data));
             fonts
                 .families
                 .entry(family)
@@ -177,31 +179,18 @@ fn fonts() -> FontDefinitions {
                 .insert(0, name.to_owned());
         }
     };
+    add("text", faces.text, FontFamily::Proportional);
+    add("strong", faces.strong, FontFamily::Name("strong".into()));
+    add("mono", faces.mono, FontFamily::Monospace);
+    // The bundled icons answer every glyph the system font lacks, and every
+    // glyph on a system without one.
+    let icons = FontFamily::Name("icons".into());
     add(
-        "segoe",
-        system_font(&["segoeui.ttf"]),
-        FontFamily::Proportional,
+        "icons-bundled",
+        Some(FontData::from_static(BUNDLED_ICONS)),
+        icons.clone(),
     );
-    add(
-        "segoe-strong",
-        system_font(&["seguisb.ttf", "segoeuib.ttf"]),
-        FontFamily::Name("strong".into()),
-    );
-    add(
-        "icons",
-        system_font(&["SegoeIcons.ttf", "segmdl2.ttf"]),
-        FontFamily::Name("icons".into()),
-    );
-    add(
-        "consolas",
-        system_font(&["consola.ttf"]),
-        FontFamily::Monospace,
-    );
-    // Consolas sits about three points higher than Segoe UI on the same
-    // line, which shows in a field holding one of each.
-    if let Some(consolas) = fonts.font_data.get_mut("consolas") {
-        Arc::make_mut(consolas).tweak.y_offset_factor = 0.2;
-    }
+    add("icons", faces.icons, icons);
 
     // A family that names no font panics at the first glyph, so every named
     // family falls back to the proportional list.
@@ -220,11 +209,142 @@ fn fonts() -> FontDefinitions {
     fonts
 }
 
-/// A font from the Windows font directory. `None` elsewhere, or when it is
-/// missing, and egui's bundled fonts stand in.
-fn system_font(names: &[&str]) -> Option<Vec<u8>> {
-    let dir = std::env::var_os("WINDIR").map(|w| std::path::PathBuf::from(w).join("Fonts"))?;
-    names.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
+/// Phosphor Regular (MIT, `fonts/icons-LICENSE.txt`) cut down to the glyphs
+/// in [`glyph`], each moved to its Segoe Fluent code point, so one `char`
+/// draws with either font. 8 KB, made by `fonts/make_icons.py`.
+const BUNDLED_ICONS: &[u8] = include_bytes!("../fonts/icons.ttf");
+
+/// The faces the window draws with, taken from the system. A missing one
+/// leaves egui's bundled fonts, and [`BUNDLED_ICONS`] for the icons.
+#[derive(Default)]
+struct Faces {
+    text: Option<FontData>,
+    strong: Option<FontData>,
+    mono: Option<FontData>,
+    icons: Option<FontData>,
+}
+
+/// Segoe UI, its semibold, Consolas and Segoe Fluent Icons: on every
+/// Windows install.
+#[cfg(windows)]
+fn system_faces() -> Faces {
+    let dir = std::env::var_os("WINDIR").map(|w| std::path::PathBuf::from(w).join("Fonts"));
+    let read = |names: &[&str]| {
+        let dir = dir.as_ref()?;
+        names
+            .iter()
+            .find_map(|n| std::fs::read(dir.join(n)).ok())
+            .map(FontData::from_owned)
+    };
+    // Consolas sits about three points higher than Segoe UI on the same
+    // line, which shows in a field holding one of each.
+    let mono = read(&["consola.ttf"]).map(|f| {
+        f.tweak(egui::FontTweak {
+            y_offset_factor: 0.2,
+            ..Default::default()
+        })
+    });
+    Faces {
+        text: read(&["segoeui.ttf"]),
+        strong: read(&["seguisb.ttf", "segoeuib.ttf"]),
+        mono,
+        icons: read(&["SegoeIcons.ttf", "segmdl2.ttf"]),
+    }
+}
+
+/// San Francisco, the system face since 10.11, one variable file for every
+/// weight, and SF Mono beside it.
+#[cfg(target_os = "macos")]
+fn system_faces() -> Faces {
+    let dir = std::path::Path::new("/System/Library/Fonts");
+    let read = |name: &str| std::fs::read(dir.join(name)).ok();
+    let sans = read("SFNS.ttf");
+    Faces {
+        text: sans.clone().map(|b| weighted(b, 0, 400.0)),
+        strong: sans.map(|b| weighted(b, 0, 600.0)),
+        mono: read("SFNSMono.ttf")
+            .map(|b| weighted(b, 0, 400.0))
+            .or_else(|| read("Menlo.ttc").map(FontData::from_owned)),
+        icons: None,
+    }
+}
+
+/// Whatever fontconfig answers for `sans-serif` and `monospace`: the desktop's
+/// own choice, Adwaita Sans, Ubuntu Sans, Noto Sans or DejaVu.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_faces() -> Faces {
+    let sans = fc_match("sans-serif");
+    let strong = match &sans {
+        // One variable file holds the semibold too.
+        Some((bytes, index)) if has_weight_axis(bytes, *index) => {
+            Some(weighted(bytes.clone(), *index, 600.0))
+        }
+        _ => fc_match("sans-serif:weight=180").map(|(b, i)| face(b, i)),
+    };
+    Faces {
+        text: sans.map(|(b, i)| weighted(b, i, 400.0)),
+        strong,
+        mono: fc_match("monospace").map(|(b, i)| weighted(b, i, 400.0)),
+        icons: None,
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn system_faces() -> Faces {
+    Faces::default()
+}
+
+/// The file and face index fontconfig picks for `pattern`. `None` without
+/// fontconfig, which leaves egui's fonts.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fc_match(pattern: &str) -> Option<(Vec<u8>, u32)> {
+    let out = std::process::Command::new("fc-match")
+        .args(["--format=%{file}\n%{index}", pattern])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut lines = text.lines();
+    let file = lines.next()?;
+    let index = lines.next().and_then(|i| i.parse().ok()).unwrap_or(0);
+    // Variable faces carry their instance in the upper half of the index.
+    Some((std::fs::read(file).ok()?, index & 0xffff))
+}
+
+#[cfg(unix)]
+fn face(bytes: Vec<u8>, index: u32) -> FontData {
+    FontData {
+        index,
+        ..FontData::from_owned(bytes)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn has_weight_axis(bytes: &[u8], index: u32) -> bool {
+    face(bytes.to_vec(), index)
+        .variation_axes()
+        .iter()
+        .any(|a| a.tag == egui::epaint::text::Tag::new(b"wght"))
+}
+
+/// `bytes` at `weight` when it is a variable font with a weight axis, as it
+/// is otherwise.
+#[cfg(unix)]
+fn weighted(bytes: Vec<u8>, index: u32, weight: f32) -> FontData {
+    let data = face(bytes, index);
+    let wght = data
+        .variation_axes()
+        .into_iter()
+        .find(|a| a.tag == egui::epaint::text::Tag::new(b"wght"));
+    match wght {
+        Some(axis) => {
+            let w = weight.clamp(axis.range.min, axis.range.max);
+            data.tweak(egui::FontTweak {
+                coords: egui::epaint::text::VariationCoords::new([(b"wght", w)]),
+                ..Default::default()
+            })
+        }
+        None => data,
+    }
 }
 
 /// The colour a black body glows at, which is what a colour temperature looks
@@ -251,4 +371,40 @@ pub fn kelvin(k: f32) -> Color32 {
     };
     let c = |x: f32| x.clamp(0.0, 255.0) as u8;
     Color32::from_rgb(c(r), c(g), c(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::epaint::text::{Fonts, TextOptions};
+
+    /// Every glyph the window names exists in the bundled icons, so a system
+    /// without Segoe Fluent Icons draws no empty box.
+    #[test]
+    fn the_bundled_icons_hold_every_glyph() {
+        let mut defs = FontDefinitions::empty();
+        defs.font_data.insert(
+            "icons".into(),
+            Arc::new(FontData::from_static(BUNDLED_ICONS)),
+        );
+        defs.families
+            .insert(FontFamily::Proportional, vec!["icons".into()]);
+        let mut fonts = Fonts::new(TextOptions::default(), defs);
+        let font = FontId::proportional(16.0);
+
+        let glyphs: Vec<char> = include_str!("theme.rs")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const "))
+            .filter_map(|l| l.split_once(r": char = '\u{"))
+            .filter_map(|(_, rest)| u32::from_str_radix(rest.split('}').next()?, 16).ok())
+            .filter_map(char::from_u32)
+            .collect();
+        assert!(glyphs.len() >= 29, "{glyphs:?}");
+        let missing: Vec<String> = glyphs
+            .iter()
+            .filter(|&&c| !fonts.has_glyph(&font, c))
+            .map(|c| format!("U+{:04X}", *c as u32))
+            .collect();
+        assert!(missing.is_empty(), "missing from icons.ttf: {missing:?}");
+    }
 }

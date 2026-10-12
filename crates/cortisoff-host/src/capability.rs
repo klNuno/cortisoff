@@ -122,7 +122,7 @@ pub enum Control {
 pub fn label(id: &str) -> String {
     let known = match id {
         ids::APP_FOCUS => "Focused app",
-        ids::APP_FULLSCREEN => "Exclusive fullscreen",
+        ids::APP_FULLSCREEN => "Fullscreen app",
         ids::APP_MAXIMIZED => "Maximised window",
         ids::USER_IDLE => "Nobody there",
         ids::SESSION_LOCK => "Session lock",

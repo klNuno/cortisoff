@@ -12,9 +12,9 @@ A small program that runs plugins on your desktop: a night light that warms the 
 
 | Plugin | What it does |
 | --- | --- |
-| Night light | Warms the screen from the evening to the morning with a slow fade, and steps aside while a game or a film fills the screen or a listed app is in front. |
+| Night light | Warms the screen from the evening to the morning over a fade you choose, from instant to five minutes, and steps aside while a game or a film is fullscreen or a listed app is in front. |
 | Display profiles | Gives each app its own refresh rate and vibrance while it is in front, and puts yours back when it leaves. Vibrance needs an NVIDIA card. |
-| Wallpaper pause | Stops Wallpaper Engine or Lively while an app fills the screen, while you are away or locked, or on battery. Windows only. |
+| Wallpaper Engine pause | Pauses Wallpaper Engine (or Lively) while the session is locked or nobody is at the machine. Apps in front, fullscreen, sound and battery stay in its own settings. Windows only. |
 | Shortcuts | Global key chords that start a program, type text, press other keys or move the window in front. |
 
 Every plugin is off until you switch it on, and only what an enabled plugin asks about is watched.

@@ -83,24 +83,29 @@ pub fn ramp_for(c: &Rgb) -> Ramp {
 /// from the identity, `(i - 128) * 256` to `(i + 128) * 256`, unless the
 /// `GdiIcmGammaRange` value has lifted the clamp. A tint never goes above the
 /// identity, so only the floor bites, and it bites on blue below about
-/// 3400 K: at 3200 K blue sits at 0.48 of full scale, the floor at 0.5. The
-/// strongest ramp Windows accepts is this one, and it is what goes out when
-/// the wanted one is refused. `None` when the ramp is already inside.
-pub fn within_windows_range(ramp: &Ramp) -> Option<Ramp> {
-    let mut out = *ramp;
-    let mut changed = false;
-    for (n, entry) in out.iter_mut().enumerate() {
-        let i = (n % 256) as i32;
-        let floor = ((i - 128).max(0) * 256) as u16;
-        let ceiling = ((i + 128).min(255) * 256 + 255) as u16;
-        let clamped = (*entry).clamp(floor, ceiling);
-        if clamped != *entry {
-            *entry = clamped;
-            changed = true;
-        }
-    }
-    changed.then_some(out)
+/// 3400 K. The tightest index is the last one, so a straight channel stays
+/// inside as long as its gain is at least [`MIN_GAIN`].
+///
+/// The strongest tint Windows accepts is the wanted one with each channel's
+/// gain raised to that floor, and it is what goes out when the wanted ramp is
+/// refused. Clamping the entries one by one instead bent the blue curve: dark
+/// tones followed the tint, bright ones climbed at full slope from wherever
+/// they met the floor, and that bend moved on every frame of a fade, which
+/// showed as colour shifting in bands across the screen. `None` when the
+/// colour is already inside.
+pub fn within_windows_range(c: &Rgb) -> Option<Rgb> {
+    let lift = |g: f32| g.max(MIN_GAIN);
+    let inside = Rgb {
+        r: lift(c.r),
+        g: lift(c.g),
+        b: lift(c.b),
+    };
+    (inside != *c).then_some(inside)
 }
+
+/// `127 * 256 / 65535`, plus enough that rounding the last entry cannot land
+/// it under the floor.
+pub const MIN_GAIN: f32 = 0.4962;
 
 /// A captured baseline, as it goes into the journal.
 ///
@@ -173,26 +178,30 @@ mod tests {
         }
     }
 
-    /// The Windows floor: 3400 K passes untouched, 3200 K loses a little
-    /// blue at the top of the ramp and nothing else, 2500 K loses a lot.
+    /// The Windows floor: 3400 K passes untouched, a warmer colour keeps its
+    /// red and green and stops its blue at the floor, and the ramp it makes is
+    /// still a straight line that Windows' rule accepts at every index.
     #[test]
-    fn the_windows_floor_bites_on_blue_below_3400_kelvin() {
-        assert!(within_windows_range(&ramp_for(&Rgb::NEUTRAL)).is_none());
-        assert!(within_windows_range(&ramp_for(&from_kelvin(3400.0))).is_none());
+    fn the_windows_floor_stops_blue_and_keeps_the_ramp_straight() {
+        assert!(within_windows_range(&Rgb::NEUTRAL).is_none());
+        assert!(within_windows_range(&from_kelvin(3400.0)).is_none());
 
-        let wanted = ramp_for(&from_kelvin(3200.0));
-        let sent = within_windows_range(&wanted).expect("3200 K is below the floor");
-        assert_eq!(&sent[..512], &wanted[..512], "red and green are untouched");
-        assert_eq!(sent[512 + 255], 127 * 256);
-        assert_eq!(
-            sent[512 + 128],
-            wanted[512 + 128],
-            "the floor is zero there"
-        );
-
-        let deep = within_windows_range(&ramp_for(&from_kelvin(2500.0))).unwrap();
-        assert_eq!(deep[512 + 255], 127 * 256);
-        assert!(deep[512 + 200] > ramp_for(&from_kelvin(2500.0))[512 + 200]);
+        for k in [3200.0, 2500.0, 1900.0] {
+            let wanted = from_kelvin(k);
+            let sent = within_windows_range(&wanted).expect("below the floor");
+            assert_eq!(sent.r, wanted.r);
+            assert_eq!(sent.g, wanted.g.max(MIN_GAIN));
+            assert_eq!(sent.b, MIN_GAIN);
+            let ramp = ramp_for(&sent);
+            for (n, &entry) in ramp.iter().enumerate() {
+                let i = (n % 256) as i32;
+                let floor = ((i - 128).max(0) * 256) as u16;
+                assert!(entry >= floor, "{k} K, entry {n}: {entry} < {floor}");
+            }
+            // Straight: every blue entry is the same gain times the identity.
+            let gain = f32::from(ramp[512 + 255]) / 65535.0;
+            assert!((f32::from(ramp[512 + 100]) / (100.0 * 257.0) - gain).abs() < 0.001);
+        }
     }
 
     #[test]

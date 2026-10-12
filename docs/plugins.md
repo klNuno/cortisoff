@@ -131,7 +131,7 @@ Subscribe with `cx:watch(kind)`. Each event is a table whose `kind` is the watch
 | Kind | Fields | Meaning |
 | --- | --- | --- |
 | `app.focus` | `exe`, `path`, `title` (may be `nil`), `pid` | Another application came to the front. `exe` is its file name, lowercase on Windows (`cs2.exe`, `firefox`); `path` is the full path. |
-| `app.fullscreen` | `exclusive` | An exclusive-fullscreen game took or released the screen. Narrower than `app.maximized`. |
+| `app.fullscreen` | `exclusive` | An app went fullscreen or left it: exclusive, or a borderless window over its whole monitor. A maximised window is not fullscreen. The field keeps the name it had when only the exclusive case was seen. |
 | `app.maximized` | `maximized` | The focused window fills its monitor (maximised, borderless or exclusive fullscreen), or stopped doing so. |
 | `user.idle` | `idle`, `seconds` | `idle = true` when an inactivity threshold is crossed, with that threshold in `seconds`; `idle = false, seconds = 0` when the user comes back. |
 | `session.lock` | `locked` | The session was locked or unlocked. |
@@ -173,7 +173,7 @@ Priorities are integers, clamped to -100 through 999. The anchors:
 | 0 | The default when you name none. |
 | 100 | A plugin reacting to the focused application, which should beat a schedule. |
 
-`opts.fade` is a duration in milliseconds, up to a day. With a fade, a numeric value travels from where it is now to the new value; cortisoff steps it, you claim once. Claiming the same target again while it fades does not restart the fade. Values that are not numbers switch at once. `cx:release(cap, { fade = ms })` fades back to whatever lies underneath.
+`opts.fade` is a duration in milliseconds, up to a day. With a fade, a numeric value travels from where it is now to the new value; cortisoff steps it, you claim once. Claiming the same target again while it fades does not restart the fade. A fade eases in and out, and a colour temperature travels in mireds, evenly to the eye, rather than in kelvin, which would rush through the warm end. Values that are not numbers switch at once. `cx:release(cap, { fade = ms })` fades back to whatever lies underneath.
 
 `cx:claim` returns `true` when the claim was accepted, or `nil` and a sentence when the capability is missing on this machine, only watchable, or the value has the wrong type. Accepted does not mean winning: the claim is applied after your call returns. `cortisoff-cli state` shows who holds what.
 

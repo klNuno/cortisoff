@@ -5,6 +5,7 @@
 //! the same way, shows what is happening now, and hosts each plugin's own
 //! page. Closing it leaves the daemon running.
 
+mod chrome;
 pub mod client;
 pub mod shell;
 
@@ -93,11 +94,13 @@ pub fn window(launch: Launch) -> Result<(), String> {
         }
     }
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("cortisoff")
-        .with_app_id("cortisoff")
-        .with_inner_size(SIZE)
-        .with_min_inner_size([760.0, 520.0]);
+    let mut viewport = chrome::viewport(
+        egui::ViewportBuilder::default()
+            .with_title("cortisoff")
+            .with_app_id("cortisoff")
+            .with_inner_size(SIZE)
+            .with_min_inner_size([760.0, 520.0]),
+    );
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon.png"))
     {
         viewport = viewport.with_icon(icon);
