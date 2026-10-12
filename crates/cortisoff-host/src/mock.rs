@@ -164,6 +164,8 @@ impl JournalStore for MemJournal {
 #[derive(Debug, Default)]
 pub struct MockHost {
     actuators: BTreeMap<CapabilityId, MockActuator>,
+    /// Event sources `probe` reports beside the actuators.
+    sources: Vec<CapabilityId>,
     pub installed: Vec<CapabilityId>,
     pub active: bool,
     pub idle_thresholds: Vec<u32>,
@@ -194,6 +196,12 @@ impl MockHost {
     /// into.
     pub fn trace(&self) -> Trace {
         self.trace.clone()
+    }
+
+    /// An event source this machine offers, such as `app.focus`.
+    pub fn with_source(mut self, id: &str) -> Self {
+        self.sources.push(CapabilityId::new(id));
+        self
     }
 
     pub fn with_actuator(mut self, id: &str, initial: Value, volatile: bool) -> Self {
@@ -241,9 +249,12 @@ impl Host for MockHost {
         self.active = active;
     }
     fn probe(&self) -> CapabilitySet {
-        self.actuators.keys().fold(CapabilitySet::new(), |set, id| {
-            set.available(id.clone(), Some("mock"))
-        })
+        self.actuators
+            .keys()
+            .chain(&self.sources)
+            .fold(CapabilitySet::new(), |set, id| {
+                set.available(id.clone(), Some("mock"))
+            })
     }
 
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {

@@ -25,6 +25,8 @@ serde_json = { workspace = true }
 # The client half of the transport. Everything above the bytes is shared.
 [target.'cfg(windows)'.dependencies]
 cortisoff-win = { path = "../cortisoff-win" }
+# The window's handle, for the system's hit test of its drawn frame.
+raw-window-handle = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 cortisoff-unix = { path = "../cortisoff-unix" }

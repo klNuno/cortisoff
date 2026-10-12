@@ -607,7 +607,9 @@ impl Shell {
         ui.add_space(chrome::SIDEBAR_TOP);
         ui.spacing_mut().item_spacing.y = 2.0;
         let busy = recent(self.starting) || recent(self.stopping);
-        if switch(ui, self.switched_on(), busy).clicked() {
+        let power = switch(ui, self.switched_on(), busy);
+        chrome::over_band(ui, power.rect);
+        if power.clicked() {
             self.toggle();
         }
         ui.add_space(10.0);

@@ -14,6 +14,7 @@ mod color;
 mod colortemp;
 mod console;
 mod ddc;
+pub mod frame;
 mod hotkeys;
 mod input;
 mod keymap;

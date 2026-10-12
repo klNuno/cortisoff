@@ -458,6 +458,28 @@ fn night_light_stands_aside_for_fullscreen_only_and_comes_back_quickly() {
     assert_eq!(night_fade(&out), Some(1000));
 }
 
+/// Display profiles says so when the session never names the app in front,
+/// as on GNOME Wayland, instead of waiting for an app that never comes.
+#[test]
+fn display_profiles_says_when_no_app_is_ever_in_front() {
+    let status_of = |rig: &mut Rig| {
+        let packages: Vec<Package> = cortisoff_runtime::builtin()
+            .into_iter()
+            .filter(|p| p.manifest.id == "display-profiles")
+            .collect();
+        let mut rt = Runtime::new(packages, &on(&["display-profiles"]), None).with_os("linux");
+        rig.with(|env| rt.start_all(env));
+        let report = rt.report("display-profiles").unwrap();
+        assert!(report.error.is_none(), "{:?}", report.error);
+        report.state["can_focus"].clone()
+    };
+    let mut without = Rig::new();
+    assert_eq!(status_of(&mut without), serde_json::json!(false));
+    let mut with = Rig::new();
+    with.host = std::mem::take(&mut with.host).with_source("app.focus");
+    assert_eq!(status_of(&mut with), serde_json::json!(true));
+}
+
 /// Every plugin shipped inside cortisoff starts, reacts and stops against a
 /// host offering everything, without a Lua error.
 #[test]
