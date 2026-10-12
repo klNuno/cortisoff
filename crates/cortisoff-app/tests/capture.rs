@@ -6,6 +6,7 @@
 //! which CI runners do not have.
 
 use cortisoff_app::{App, Shell, View, SIZE};
+use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
 
 #[test]
@@ -21,6 +22,7 @@ fn capture_every_page() {
     let pages = [
         ("overview", View::Overview, SIZE),
         ("stopped", View::Overview, SIZE),
+        ("logo-hover", View::Overview, SIZE),
         ("night-light", plugin("night-light"), SIZE),
         ("night-light-full", plugin("night-light"), [SIZE[0], 1240.0]),
         ("display-profiles", plugin("display-profiles"), SIZE),
@@ -43,6 +45,12 @@ fn capture_every_page() {
                 })
             });
         harness.run_steps(4);
+        if name == "logo-hover" {
+            // The logo is the on and off switch; this is how it answers the
+            // pointer.
+            harness.get_by_label("cortisoff").hover();
+            harness.run_steps(4);
+        }
         let image = harness.render().expect("render");
         let path = dir.join(format!("{name}.png"));
         image.save(&path).unwrap();
