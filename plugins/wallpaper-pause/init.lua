@@ -51,7 +51,8 @@ end
 
 function plugin.start(cx, s)
   local w = cx:world()
-  state.locked, state.idle = w.locked, w.idle
+  state.locked = w.locked
+  state.idle = s.when_idle and (w.idle_seconds or 0) >= math.max(1, s.idle_minutes) * 60
   rewatch(cx, s)
   settle(cx, s)
 end
