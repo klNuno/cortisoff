@@ -78,7 +78,11 @@ impl Link {
 fn subscribe(out: Sender<Inbound>, wake: impl Fn()) {
     let mut announced_down = false;
     loop {
-        let Some(mut client) = platform::connect() else {
+        let subscribed = platform::connect().and_then(|mut client| {
+            client.send(&Frame::request(1, Request::Subscribe)).ok()?;
+            Some(client)
+        });
+        let Some(mut client) = subscribed else {
             if !announced_down {
                 announced_down = out.send(Inbound::Disconnected).is_ok();
                 wake();
@@ -86,10 +90,6 @@ fn subscribe(out: Sender<Inbound>, wake: impl Fn()) {
             platform::wait_for_daemon();
             continue;
         };
-        if client.send(&Frame::request(1, Request::Subscribe)).is_err() {
-            platform::wait_for_daemon();
-            continue;
-        }
         if out.send(Inbound::Connected).is_err() {
             return;
         }

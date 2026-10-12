@@ -135,7 +135,10 @@ unsafe extern "system" fn on_foreground(
 /// on an idle desktop. The callback still keeps only a top-level record about
 /// the focused window and coalesces the burst a drag produces.
 ///
-/// `None` for no window, or when Windows refuses the hook.
+/// Refused for that one process, the hook falls back to the whole desktop:
+/// more wakeups, but no maximise missed until the focus moves.
+///
+/// `None` for no window, or when Windows refuses both.
 pub fn hook_location(foreground: HWND) -> Option<HWINEVENTHOOK> {
     if foreground.is_invalid() {
         return None;
@@ -145,18 +148,21 @@ pub fn hook_location(foreground: HWND) -> Option<HWINEVENTHOOK> {
     if process == 0 {
         return None;
     }
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            None,
-            Some(on_location),
-            process,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
+    let hook = |process: u32| {
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(on_location),
+                process,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        (!hook.is_invalid()).then_some(hook)
     };
-    (!hook.is_invalid()).then_some(hook)
+    hook(process).or_else(|| hook(0))
 }
 
 unsafe extern "system" fn on_location(

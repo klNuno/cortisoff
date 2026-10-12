@@ -322,11 +322,18 @@ impl WinHost {
             // Raw input refused: the old way, one look a second.
             Some(1)
         } else {
-            next_threshold_in(seconds, &self.idle_thresholds)
+            match next_threshold_in(seconds, &self.idle_thresholds) {
+                // Away past the last threshold. Input comes back through raw
+                // input, but a film or a fullscreen app that starts on its
+                // own sends none, so it is looked for now and then.
+                None if away => Some(HELD_RECHECK.as_secs() as u32),
+                next => next,
+            }
         };
         match wait {
             Some(s) => unsafe {
-                SetCoalescableTimer(self.window, IDLE_TIMER, s.max(1) * 1000, None, 100);
+                let ms = u32::try_from(u64::from(s.max(1)) * 1000).unwrap_or(u32::MAX);
+                SetCoalescableTimer(self.window, IDLE_TIMER, ms, None, 100);
             },
             None => {
                 let _ = unsafe { KillTimer(self.window, IDLE_TIMER) };
@@ -425,7 +432,11 @@ impl WinHost {
         match raw {
             Raw::Foreground(hwnd) => {
                 let hwnd = HWND(hwnd as *mut _);
-                self.follow_foreground(hwnd);
+                if !self.follow_foreground(hwnd) {
+                    eprintln!(
+                        "warning: SetWinEventHook refused the location hook, app.maximized waits for the next focus change"
+                    );
+                }
                 let mut out: Vec<Event> = self.foreground_event(hwnd).into_iter().collect();
                 out.extend(self.maximized_event(hwnd));
                 // Cheap one-shot read, and the moment it can change is exactly

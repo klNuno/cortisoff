@@ -36,10 +36,11 @@ pub fn supervise(
         let Some(how) = crash(&status) else {
             return Ok(status);
         };
+        // A crash after a long run says nothing about the next start.
         quick = if began.elapsed() < QUICK {
             quick + 1
         } else {
-            1
+            0
         };
         if quick >= GIVE_UP_AFTER {
             note(&format!(
@@ -114,6 +115,19 @@ mod tests {
     #[cfg(unix)]
     const CRASHED: i64 = 11;
 
+    /// A process that exits with this code, signals aside.
+    #[cfg(windows)]
+    fn exiting(code: i64) -> std::io::Result<ExitStatus> {
+        ending(code)
+    }
+
+    #[cfg(unix)]
+    fn exiting(code: i64) -> std::io::Result<ExitStatus> {
+        Command::new("sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+    }
+
     #[test]
     fn a_crash_is_started_again_and_a_clean_end_is_not() {
         let mut runs = 0;
@@ -159,7 +173,7 @@ mod tests {
             let status = supervise(
                 || {
                     runs += 1;
-                    ending(code)
+                    exiting(code)
                 },
                 |_| {},
                 Duration::ZERO,

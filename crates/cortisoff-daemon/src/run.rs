@@ -152,7 +152,7 @@ pub fn run(args: Options) -> Result<(), String> {
     let plugins_dir = args.plugins.clone().unwrap_or(paths.plugins);
     let store_path = args.store.clone().unwrap_or(paths.store);
 
-    // A run in the foreground or a report needs no one to start it again.
+    // A verbose run or a report needs no one to start it again.
     if !args.no_guard && !args.doctor && !args.verbose {
         return guard(&args, (!args.no_log).then_some(log_path.as_path()));
     }
@@ -327,6 +327,10 @@ pub fn run(args: Options) -> Result<(), String> {
 /// failed start still reads as a failure to whoever launched it.
 fn guard(args: &Options, log: Option<&Path>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
+    // Ctrl-C in a terminal reaches the worker too, which restores the screens
+    // and ends. Left to the default handler the guard would die first, hand
+    // the shell back early and lose the worker's exit code.
+    let _ = platform::watch_for_stop();
     let status = crate::guard::supervise(
         || {
             std::process::Command::new(&exe)

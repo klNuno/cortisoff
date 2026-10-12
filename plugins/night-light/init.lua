@@ -71,21 +71,22 @@ end
 
 -- ---- daemon ---------------------------------------------------------------
 
-local paused_until, resume_timer, step_timer
+local paused_until, resume_timer, step_timer, stepping
 
 local settle
 
 -- The next look: a step while a fade runs, the start of the next fade
 -- otherwise. A resume, a clock change or a new setting reaches `settle`
--- through an event and moves this along with it.
+-- through an event and moves this along with it. A step already on its way
+-- keeps its time: re-armed on every focus change, it slipped back each time
+-- and the fade stood still while the user switched windows.
 local function schedule(cx, s, minute)
-  if step_timer then cx:cancel(step_timer) end
-  local wait = STEP_MS
   local still = minute and still_for(s, minute)
-  if still then
-    -- Just past the edge, so the look lands inside the fade.
-    wait = still * 60000 + 50
-  end
+  if step_timer and stepping and not still then return end
+  if step_timer then cx:cancel(step_timer) end
+  stepping = not still
+  -- Just past the edge, so the look lands inside the fade.
+  local wait = still and still * 60000 + 50 or STEP_MS
   step_timer = cx:after(wait, function(cx, s)
     step_timer = nil
     settle(cx, s)
