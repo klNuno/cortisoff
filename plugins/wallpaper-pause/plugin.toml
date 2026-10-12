@@ -1,6 +1,6 @@
 id = "wallpaper-pause"
 name = "Wallpaper Engine pause"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pauses Wallpaper Engine while nobody is at the machine."
 icon = "picture"
 # Wallpaper Engine is a Windows program.

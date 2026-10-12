@@ -474,18 +474,21 @@ impl Runtime {
         let Some(kind) = kind_of(event) else {
             return out;
         };
-        let build = |lua: &Lua| event_table(lua, kind, event);
         for i in 0..self.slots.len() {
-            let calls: Vec<Call> = self.slots[i]
+            let calls: Vec<(Call, Event)> = self.slots[i]
                 .watches
                 .iter()
-                .filter(|w| w.kind == kind && idle_matches(w, event))
-                .map(|w| match &w.callback {
-                    Some(f) => Call::Fn(f.clone()),
-                    None => Call::Named("on"),
+                .filter(|w| w.kind == kind)
+                .filter_map(|w| {
+                    let call = match &w.callback {
+                        Some(f) => Call::Fn(f.clone()),
+                        None => Call::Named("on"),
+                    };
+                    Some((call, heard(w, event)?))
                 })
                 .collect();
-            for call in calls {
+            for (call, heard) in calls {
+                let build = |lua: &Lua| event_table(lua, kind, &heard);
                 out.extend(self.invoke(i, env, call, Some(&build)));
             }
         }
@@ -964,16 +967,24 @@ fn kind_of(e: &Event) -> Option<&'static str> {
     })
 }
 
-fn idle_matches(w: &Watch, e: &Event) -> bool {
+/// What a watch hears of an event. A `user.idle` watch with its own
+/// threshold hears `idle = true` when that threshold is crossed and
+/// `idle = false` when the user comes back, and nothing at the other
+/// watches' thresholds. The host's own `idle` flag follows its default
+/// threshold, five minutes, so a watch after two minutes would otherwise
+/// hear `idle = false` at its own threshold.
+fn heard(w: &Watch, e: &Event) -> Option<Event> {
     match (w.idle_after, e) {
-        (
-            Some(after),
-            Event::Idle {
-                idle: true,
-                seconds,
-            },
-        ) => *seconds == after,
-        _ => true,
+        (Some(after), Event::Idle { seconds, .. }) if *seconds == after => Some(Event::Idle {
+            idle: true,
+            seconds: after,
+        }),
+        (Some(_), Event::Idle { seconds: 0, .. }) => Some(Event::Idle {
+            idle: false,
+            seconds: 0,
+        }),
+        (Some(_), Event::Idle { .. }) => None,
+        _ => Some(e.clone()),
     }
 }
 

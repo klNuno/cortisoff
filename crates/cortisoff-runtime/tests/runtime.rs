@@ -226,6 +226,34 @@ fn watched_sources_reach_the_host_and_events_reach_the_plugin() {
     assert_eq!(rt.report("idle").unwrap().state["exe"], "cs2.exe");
 }
 
+/// A watch with its own threshold hears `idle = true` when that threshold is
+/// crossed, even under the host's five-minute default, and `idle = false`
+/// when the user comes back; another watch's threshold says nothing to it.
+#[test]
+fn an_idle_watch_hears_its_own_threshold() {
+    let p = plugin(
+        "idle",
+        "return {
+           start = function(cx, s) cx:watch('user.idle', { after = 120 }) end,
+           on = function(cx, s, ev) cx:publish({ idle = ev.idle, seconds = ev.seconds }) end,
+         }",
+    );
+    let mut rig = Rig::new();
+    let mut rt = Runtime::new(vec![p], &on(&["idle"]), None);
+    rig.with(|env| rt.start_all(env));
+    let mut hear = |idle: bool, seconds: u32| {
+        rig.with(|env| rt.on_event(env, &Event::Idle { idle, seconds }));
+        let state = rt.report("idle").unwrap().state;
+        (state["idle"].clone(), state["seconds"].clone())
+    };
+    use serde_json::json;
+    // The host's flag is still false at two minutes: its default is five.
+    assert_eq!(hear(false, 120), (json!(true), json!(120)));
+    // Another plugin's threshold: unchanged.
+    assert_eq!(hear(true, 300), (json!(true), json!(120)));
+    assert_eq!(hear(false, 0), (json!(false), json!(0)));
+}
+
 /// Hosts report the full path of the application in front, and plugins
 /// match on its file name, so `exe` is the name and `path` the whole path,
 /// in an event and in `cx:world()` alike.

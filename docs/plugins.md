@@ -140,7 +140,7 @@ Subscribe with `cx:watch(kind)`. Each event is a table whose `kind` is the watch
 | `display.config` | none | Monitors were plugged, unplugged or rearranged. |
 | `clock` | `minute`, `second`, `ms` | The wall clock moved under the timers: resume from sleep, a time zone or daylight saving change. It is not sent every minute; use `cx:at` or `cx:every` for that. |
 
-For `user.idle`, pass the threshold in seconds: `cx:watch("user.idle", { after = 600 })`. That watch only hears `idle = true` for its own threshold, plus every `idle = false`. Several watches with different thresholds can coexist.
+For `user.idle`, pass the threshold in seconds: `cx:watch("user.idle", { after = 600 })`. That watch hears `idle = true` when its own threshold is crossed and `idle = false` when the user comes back, whatever the other watches ask for. Several watches with different thresholds can coexist.
 
 Not every kind exists on every system; see the platform column in the next section. Watching a missing kind is not an error, the event simply never comes.
 
