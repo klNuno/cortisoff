@@ -533,7 +533,7 @@ impl Shell {
         if switch(ui, self.switched_on(), busy).clicked() {
             self.toggle();
         }
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         if widgets::nav_item(
             ui,
             glyph::HOME,
@@ -1527,17 +1527,33 @@ fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
     let galley = ui
         .painter()
         .layout_no_wrap(word.to_owned(), theme::strong(16.0), ink);
-    let size = vec2(10.0 + 22.0 + 8.0 + galley.size().x + 12.0, 36.0);
+    let size = vec2(14.0 + 22.0 + 8.0 + galley.size().x + 18.0, 38.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on == Some(true), word)
     });
 
+    // A pill outlined in the state's colour, so it reads as something to
+    // press rather than a title. Brighter under the pointer, brighter again
+    // while held.
+    let live = !busy && on.is_some();
+    let (fill, edge) = if live && response.is_pointer_button_down_on() {
+        (0.26, 1.0)
+    } else if live && response.hovered() {
+        (0.18, 0.9)
+    } else {
+        (0.09, 0.5)
+    };
     let painter = ui.painter();
-    if response.hovered() && !busy && on.is_some() {
-        painter.rect_filled(rect, theme::RADIUS_CONTROL, colour.gamma_multiply(0.12));
-    }
-    let c = pos2(rect.left() + 21.0, rect.center().y + 3.0);
+    let pill = egui::CornerRadius::same(19);
+    painter.rect(
+        rect.shrink(0.75),
+        pill,
+        colour.gamma_multiply(fill),
+        egui::Stroke::new(1.5, colour.gamma_multiply(edge)),
+        egui::StrokeKind::Inside,
+    );
+    let c = pos2(rect.left() + 25.0, rect.center().y + 3.0);
     let arc: Vec<_> = (0..=24)
         .map(|i| {
             let a = std::f32::consts::PI * (1.0 + i as f32 / 24.0);
@@ -1551,7 +1567,7 @@ fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
         egui::Stroke::new(2.0, theme::TEXT),
     );
     painter.galley(
-        pos2(rect.left() + 40.0, rect.center().y - galley.size().y / 2.0),
+        pos2(rect.left() + 44.0, rect.center().y - galley.size().y / 2.0),
         galley,
         ink,
     );
@@ -1563,7 +1579,7 @@ fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
         (Some(true), false) => "Running. Click to stop every plugin.",
         (Some(false), false) => "Stopped. Click to start.",
     };
-    let response = if busy || on.is_none() {
+    let response = if !live {
         response
     } else {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
