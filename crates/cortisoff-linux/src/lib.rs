@@ -27,6 +27,7 @@ mod mode;
 mod nightlight;
 mod procfs;
 mod randr;
+mod shortcuts;
 mod timers;
 mod wake;
 mod wm;

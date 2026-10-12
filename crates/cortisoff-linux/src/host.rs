@@ -11,8 +11,9 @@
 //! One host for X11 and Wayland, the backends picked at runtime. Under a
 //! Wayland session the D-Bus services stand in where XWayland cannot see:
 //! logind for the lock, Mutter's idle monitor for idle, GNOME's Night Light
-//! for the colour. Their signals arrive on threads (`dbus.rs`) that wake the
-//! same poll through the wake pipe.
+//! for the colour, the desktop portal for global shortcuts. Their signals
+//! arrive on threads (`dbus.rs`) that wake the same poll through the wake
+//! pipe.
 
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -41,6 +42,7 @@ use crate::keymap::Keymap;
 use crate::mode::DisplayMode;
 use crate::nightlight::NightLight;
 use crate::procfs;
+use crate::shortcuts::Shortcuts;
 use crate::timers::{Key, Timers};
 use crate::wake::{Alarm, ClockWatch, WakePipe};
 use crate::wm;
@@ -87,7 +89,17 @@ const DAY_S: i64 = 86_400;
 const NO_KEYMAP: &str = "the X server would not send its keyboard mapping";
 
 const WAYLAND_FOCUS: &str = "this is a Wayland session, where no protocol tells a client which window has the focus or whether it fills the screen. GNOME keeps that to the shell, and XWayland only sees X11 windows, so its answer would be wrong for every native one";
-const WAYLAND_HOTKEYS: &str = "this is a Wayland session: a key grab through XWayland only fires while an X11 window has the focus. A Wayland application gets a global shortcut through the GlobalShortcuts portal, which this host does not speak yet";
+const WAYLAND_INPUT: &str = "this is a Wayland session, where an application cannot press keys in another one: keys sent through XWayland only reach X11 windows. The desktop's RemoteDesktop portal would allow it, after asking the user, and this host does not speak it yet";
+
+/// A Wayland session: XWayland stands in for X, or there is no X at all and
+/// the compositor announced itself. Keys and shortcuts then belong to the
+/// compositor, not to any X server.
+fn wayland_session(x: Option<&Display>) -> bool {
+    match x {
+        Some(x) => x.xwayland,
+        None => std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+    }
+}
 
 /// Which of the two colour backends this session has.
 enum Colour {
@@ -163,6 +175,9 @@ pub struct LinuxHost {
     display_mode: Result<DisplayMode, String>,
     keymap: Option<Keymap>,
     hotkeys: Hotkeys,
+    /// Global shortcuts through the desktop portal, for a Wayland session.
+    /// `Err` holds why there are none.
+    shortcuts: Result<Shortcuts, String>,
     /// The last key release on a grab. X sends an auto-repeat as a release
     /// and a press with the same timestamp, and a held hotkey must fire once.
     last_release: Option<(u8, u32)>,
@@ -212,6 +227,11 @@ impl LinuxHost {
             None => Err(no_x.clone()),
         };
         let keymap = x.as_deref().and_then(input::load_keymap);
+        let shortcuts = if wayland_session(x.as_deref()) {
+            Shortcuts::new(&buses)
+        } else {
+            Err("an X11 session grabs its keys".to_owned())
+        };
         if let Some(d) = &x {
             // Always on, as `WM_DISPLAYCHANGE` is on Windows: the colour
             // tint needs to hear about a monitor change whatever the plugins
@@ -258,6 +278,7 @@ impl LinuxHost {
             display_mode,
             keymap,
             hotkeys: Hotkeys::default(),
+            shortcuts,
             last_release: None,
             clipboard: None,
             snapshot_sent: false,
@@ -275,7 +296,7 @@ impl LinuxHost {
                 self.no_x
             )),
             Some(x) if x.xwayland => out.push(
-                "this session is Wayland: the clipboard, the window list, typed text and sent keys go through XWayland, which sees X11 applications only (the clipboard is shared with Wayland ones), and no window is reported as focused"
+                "this session is Wayland: the clipboard and the window list go through XWayland, which sees X11 applications only (the clipboard is shared with Wayland ones), no window is reported as focused, text cannot be typed or keys sent into another application, and global shortcuts go through the desktop portal, which asks the user to allow them"
                     .to_owned(),
             ),
             Some(_) => {}
@@ -758,6 +779,18 @@ impl LinuxHost {
                     out.extend(clock::time_of_day());
                     self.arm_dst();
                 }
+                Signal::Shortcut(name) => {
+                    if let Some(id) = self.shortcuts.as_ref().ok().and_then(|s| s.hotkey(&name)) {
+                        out.push(Event::Hotkey { id });
+                    }
+                }
+                Signal::Bound(generation, outcome) => {
+                    if let Ok(portal) = &mut self.shortcuts {
+                        for (id, why) in portal.bound_late(generation, outcome) {
+                            eprintln!("warning: hotkey {id} is not bound: {why}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -1070,13 +1103,21 @@ impl Host for LinuxHost {
     }
 
     fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        if wayland_session(self.x.as_deref()) {
+            return match &mut self.shortcuts {
+                Ok(portal) => portal.set(wanted),
+                // Nothing wanted, nothing to refuse.
+                Err(_) if wanted.is_empty() => Vec::new(),
+                Err(why) => Self::refuse_all(
+                    wanted,
+                    &format!("this is a Wayland session, where a global shortcut goes through the desktop portal, and {why}"),
+                ),
+            };
+        }
         let x = match self.display() {
             Ok(x) => x,
             Err(why) => return Self::refuse_all(wanted, &why),
         };
-        if x.xwayland {
-            return Self::refuse_all(wanted, WAYLAND_HOTKEYS);
-        }
         let Some(map) = &self.keymap else {
             return Self::refuse_all(wanted, NO_KEYMAP);
         };
@@ -1084,12 +1125,18 @@ impl Host for LinuxHost {
     }
 
     fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {
+        if wayland_session(self.x.as_deref()) {
+            return Err(WAYLAND_INPUT.to_owned());
+        }
         let x = self.display()?;
         let map = self.keymap.as_ref().ok_or(NO_KEYMAP)?;
         input::send_chord(&x, map, chord)
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), String> {
+        if wayland_session(self.x.as_deref()) {
+            return Err(WAYLAND_INPUT.to_owned());
+        }
         let x = self.display()?;
         let map = self.keymap.as_ref().ok_or(NO_KEYMAP)?;
         input::type_text(&x, map, text)

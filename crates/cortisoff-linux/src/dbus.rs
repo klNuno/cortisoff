@@ -30,6 +30,10 @@ pub enum Signal {
     IdleWatch(u32),
     /// timedated announced a new time zone.
     Zone,
+    /// A portal global shortcut was pressed, by its id.
+    Shortcut(String),
+    /// A portal bind finished: its generation and what it refused.
+    Bound(u64, crate::shortcuts::Outcome),
 }
 
 /// The queue between the listener threads and the host's loop.
@@ -47,7 +51,7 @@ impl Inbox {
         }
     }
 
-    fn push(&self, signal: Signal) {
+    pub fn push(&self, signal: Signal) {
         self.queue
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
