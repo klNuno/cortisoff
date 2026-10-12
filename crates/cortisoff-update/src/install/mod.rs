@@ -5,16 +5,23 @@
 //!   `HKCU`, so no elevation is ever needed.
 //! - Linux: `~/.local/bin` and a `.desktop` entry in
 //!   `~/.local/share/applications`.
-//! - macOS: `~/Applications/Cortisoff`.
+//! - macOS: `~/Applications/Cortisoff.app`, a real bundle with an
+//!   `Info.plist`, an icon and an ad hoc signature, so Finder, Spotlight,
+//!   Launchpad and the LaunchAgent all find the same app.
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod bundle;
 #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 mod desktop;
+#[cfg(target_os = "macos")]
+mod mac;
 #[cfg(windows)]
 mod win;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "macos"))]
 use crate::replace;
 
 /// The app's file name once installed.
@@ -30,7 +37,7 @@ pub const CLI_EXE: &str = if cfg!(windows) {
     "cortisoff-cli"
 };
 
-/// The folder cortisoff installs to.
+/// The folder cortisoff installs to: on macOS the bundle's `Contents/MacOS`.
 pub fn dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -38,7 +45,7 @@ pub fn dir() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        home().join("Applications").join("Cortisoff")
+        bundle::executables(&mac::bundle())
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -64,6 +71,24 @@ pub fn is_installed(exe: &Path) -> bool {
 /// the installed copy rewrites the shortcut and the uninstall entry, which is
 /// how that entry's version follows an update.
 pub fn install(exe: &Path) -> Result<PathBuf, String> {
+    let target = copy_in(exe)?;
+    register(&target)?;
+    Ok(target)
+}
+
+/// A bundle is copied whole, or built around a bare executable, and the
+/// installed copy rewrites its own `Info.plist` in [`register`].
+#[cfg(target_os = "macos")]
+fn copy_in(exe: &Path) -> Result<PathBuf, String> {
+    let target = dir().join(APP_EXE);
+    if same_path(exe, &target) {
+        return Ok(target);
+    }
+    mac::install(exe, APP_EXE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_in(exe: &Path) -> Result<PathBuf, String> {
     let dir = dir();
     let target = dir.join(APP_EXE);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -80,14 +105,20 @@ pub fn install(exe: &Path) -> Result<PathBuf, String> {
     // client that way, so its copy goes at every install, this one or, when
     // a `trace` still runs from it, the next.
     let _ = replace::cleanup_previous_at(&dir.join(CLI_EXE));
-    register(&target)?;
     Ok(target)
+}
+
+/// Undo [`install`]: the whole bundle goes. Plugins and settings stay.
+#[cfg(target_os = "macos")]
+pub fn uninstall() -> Result<(), String> {
+    mac::uninstall()
 }
 
 /// Undo [`install`]: the desktop registration, the client and the app. On
 /// Windows a running installed app cannot delete itself, so a detached
 /// `cmd` removes it as soon as this process has exited; the caller should
 /// exit promptly after this returns.
+#[cfg(not(target_os = "macos"))]
 pub fn uninstall() -> Result<(), String> {
     let dir = dir();
     let app = dir.join(APP_EXE);
@@ -119,9 +150,6 @@ pub fn uninstall() -> Result<(), String> {
         // Unix unlinks a running executable without complaint.
         let _ = running;
         remove_if_present(&app, &mut problems);
-        if cfg!(target_os = "macos") {
-            let _ = fs::remove_dir(&dir);
-        }
     }
     if problems.is_empty() {
         Ok(())
@@ -130,6 +158,7 @@ pub fn uninstall() -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn remove_if_present(path: &Path, problems: &mut Vec<String>) {
     match fs::remove_file(path) {
         Ok(()) => {}
@@ -200,16 +229,11 @@ fn unregister() -> Result<(), String> {
     }
 }
 
-// A bare executable in ~/Applications is what the release ships for macOS;
-// Finder and Spotlight find it there without any registration.
+// Finder, Spotlight and Launchpad find a bundle in ~/Applications by
+// themselves; what is left to write is the bundle's own description.
 #[cfg(target_os = "macos")]
-fn register(_app: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn unregister() -> Result<(), String> {
-    Ok(())
+fn register(app: &Path) -> Result<(), String> {
+    mac::register(app, env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -228,7 +252,12 @@ mod tests {
             );
         } else if cfg!(target_os = "macos") {
             assert!(
-                dir.ends_with(Path::new("Applications").join("Cortisoff")),
+                dir.ends_with(
+                    Path::new("Applications")
+                        .join("Cortisoff.app")
+                        .join("Contents")
+                        .join("MacOS")
+                ),
                 "{}",
                 dir.display()
             );

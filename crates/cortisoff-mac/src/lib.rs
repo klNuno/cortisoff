@@ -6,6 +6,7 @@
 //! What this machine can do is still probed at runtime, never decided here.
 #![cfg(target_os = "macos")]
 
+mod activity;
 pub mod autostart;
 mod ax;
 mod clock;
@@ -16,6 +17,7 @@ mod host;
 mod hotkeys;
 mod input;
 mod keys;
+mod layout;
 mod mode;
 mod modes;
 mod notify;

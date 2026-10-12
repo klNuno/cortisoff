@@ -12,7 +12,7 @@ use cortisoff_host::TimerId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Beat {
     Engine(TimerId),
-    /// The next inactivity threshold, or the next second while away.
+    /// The next inactivity threshold, or a recheck while away.
     Idle,
     /// Whether the focused window fills its display. macOS has no event
     /// for a window being resized, so this is a coarse poll.
@@ -90,20 +90,49 @@ pub fn idle_bucket(seconds: u32, thresholds: &[u32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Seconds until the next idle check: near the next threshold while
-/// present, every second while away, so a key press resumes things without
-/// a long delay. Never more than fifteen, because input that was missed
-/// while the loop slept is only ever seen by a check.
-pub fn idle_poll_after(seconds: u32, thresholds: &[u32]) -> u32 {
-    if idle_bucket(seconds, thresholds) > 0 {
-        return 1;
+/// The recheck while something holds the user present (a film, a game
+/// played with a controller) or while away with the activity tap on: a film
+/// that starts or ends on its own sends no input. The Windows host uses the
+/// same 15 s.
+pub const RECHECK: u32 = 15;
+
+/// How the end of an absence is noticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Return {
+    /// The activity tap sees the mouse and the keys.
+    Tap,
+    /// The tap sees the mouse only, so a key press is seen by a recheck.
+    MouseTap,
+    /// No tap: only a check sees input.
+    Sampled,
+}
+
+/// Seconds until the next idle check.
+///
+/// - Present: at the next threshold. Input only moves the count back, so
+///   nothing can cross one earlier, and nothing needs a look in between.
+/// - Held present by a fullscreen window: [`RECHECK`].
+/// - Away: at the next threshold still to cross, and at least every
+///   [`RECHECK`]; with no tap on the keyboard every 3 s, with no tap at all
+///   every second, so a key press resumes things without a long delay.
+pub fn idle_check_after(seconds: u32, thresholds: &[u32], held: bool, back: Return) -> u32 {
+    if held {
+        return RECHECK;
     }
-    thresholds
+    let next = thresholds
         .iter()
         .filter_map(|t| t.checked_sub(seconds))
-        .min()
-        .unwrap_or(15)
-        .clamp(1, 15)
+        .filter(|d| *d > 0)
+        .min();
+    if idle_bucket(seconds, thresholds) == 0 {
+        return next.unwrap_or(RECHECK).max(1);
+    }
+    let every = match back {
+        Return::Tap => RECHECK,
+        Return::MouseTap => 3,
+        Return::Sampled => 1,
+    };
+    next.unwrap_or(every).clamp(1, every)
 }
 
 #[cfg(test)]
@@ -184,9 +213,42 @@ mod tests {
         assert_eq!(idle_bucket(119, &thresholds), 60);
         assert_eq!(idle_bucket(120, &thresholds), 120);
         assert_eq!(idle_bucket(0, &thresholds), 0);
-        assert_eq!(idle_poll_after(59, &thresholds), 1);
-        assert_eq!(idle_poll_after(120, &thresholds), 1);
-        assert_eq!(idle_poll_after(0, &thresholds), 15);
-        assert_eq!(idle_poll_after(50, &thresholds), 10);
+    }
+
+    /// While present the next look is the next threshold, however far: the
+    /// old fifteen second cap woke the daemon four times a minute for a user
+    /// typing at the keyboard.
+    #[test]
+    fn a_present_user_is_checked_at_the_next_threshold_only() {
+        let thresholds = [60, 120, 300];
+        assert_eq!(idle_check_after(0, &thresholds, false, Return::Tap), 60);
+        assert_eq!(idle_check_after(50, &thresholds, false, Return::Tap), 10);
+        assert_eq!(idle_check_after(0, &[300], false, Return::Sampled), 300);
+        assert_eq!(idle_check_after(299, &[300], false, Return::Sampled), 1);
+    }
+
+    #[test]
+    fn an_absent_user_is_checked_by_how_the_return_is_seen() {
+        let thresholds = [60, 120, 300];
+        // Past 60: the tap ends the absence, the recheck catches a film.
+        assert_eq!(idle_check_after(60, &thresholds, false, Return::Tap), 15);
+        assert_eq!(idle_check_after(115, &thresholds, false, Return::Tap), 5);
+        assert_eq!(
+            idle_check_after(60, &thresholds, false, Return::MouseTap),
+            3
+        );
+        assert_eq!(idle_check_after(60, &thresholds, false, Return::Sampled), 1);
+        // Past the last threshold nothing is left to cross.
+        assert_eq!(idle_check_after(900, &thresholds, false, Return::Tap), 15);
+        assert_eq!(
+            idle_check_after(900, &thresholds, false, Return::Sampled),
+            1
+        );
+    }
+
+    #[test]
+    fn a_fullscreen_window_holding_the_user_is_rechecked() {
+        assert_eq!(idle_check_after(0, &[300], true, Return::Tap), RECHECK);
+        assert_eq!(idle_check_after(0, &[300], true, Return::Sampled), RECHECK);
     }
 }

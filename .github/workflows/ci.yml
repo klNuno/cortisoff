@@ -185,6 +185,16 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p cortisoff-app -p cortisoff-cli
 
+      # The same bundle a release ships, so it can be tried before a tag.
+      - name: Bundle the macOS app
+        if: runner.os == 'macOS'
+        env:
+          KEY: ${{ matrix.key }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "cortisoff-app") | .version')
+          sh packaging/macos/bundle.sh target/release "$version" "target/release/cortisoff-$KEY.zip"
+
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -192,6 +202,7 @@ jobs:
           path: |
             target/release/cortisoff${{ matrix.ext }}
             target/release/cortisoff-cli${{ matrix.ext }}
+            target/release/cortisoff-darwin-*.zip
           if-no-files-found: error
           retention-days: 7
 

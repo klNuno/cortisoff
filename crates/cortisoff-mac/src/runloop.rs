@@ -28,6 +28,10 @@ pub enum Raw {
     ClockMoved,
     Power,
     Hotkey(u32),
+    /// Input while the user was away, from the activity tap.
+    Input,
+    /// The user switched keyboard layouts.
+    Layout,
 }
 
 pub struct Shared {

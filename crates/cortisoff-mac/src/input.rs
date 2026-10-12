@@ -7,10 +7,12 @@
 use cortisoff_host::Chord;
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
 
+use crate::layout::Layout;
 use crate::{ax, keys};
 
 pub fn send_keys(chord: &Chord) -> Result<(), String> {
-    let code = keys::code(chord.key).ok_or_else(|| keys::SYSTEM_KEY.to_owned())?;
+    let code = keys::code(chord.key, Layout::current().as_ref())
+        .ok_or_else(|| keys::SYSTEM_KEY.to_owned())?;
     if !ax::trusted() {
         return Err(ax::PERMISSION.to_owned());
     }

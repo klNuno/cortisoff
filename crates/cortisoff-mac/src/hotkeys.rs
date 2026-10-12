@@ -14,6 +14,7 @@ use std::sync::Arc;
 use cortisoff_host::Hotkey;
 
 use crate::keys;
+use crate::layout::Layout;
 use crate::runloop::{Raw, Shared};
 
 type OsStatus = i32;
@@ -132,6 +133,8 @@ pub struct Hotkeys {
     shared: Arc<Shared>,
     handler: EventHandlerRef,
     registered: Vec<EventHotKeyRef>,
+    /// The last set asked for, registered again when the layout changes.
+    wanted: Vec<Hotkey>,
 }
 
 impl Hotkeys {
@@ -140,6 +143,7 @@ impl Hotkeys {
             shared,
             handler: ptr::null_mut(),
             registered: Vec::new(),
+            wanted: Vec::new(),
         }
     }
 
@@ -183,19 +187,21 @@ impl Hotkeys {
         }
     }
 
-    /// Exactly these hotkeys, replacing every earlier set. Returns the ones
-    /// refused, with why.
+    /// Exactly these hotkeys, replacing every earlier set, on the keys that
+    /// type them in the active layout. Returns the ones refused, with why.
     pub fn set(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
         self.clear();
+        self.wanted = wanted.to_vec();
         if wanted.is_empty() {
             return Vec::new();
         }
         if let Err(e) = self.install() {
             return wanted.iter().map(|h| (h.id, e.clone())).collect();
         }
+        let layout = Layout::current();
         let mut refused = Vec::new();
         for hotkey in wanted {
-            let Some(code) = keys::code(hotkey.chord.key) else {
+            let Some(code) = keys::code(hotkey.chord.key, layout.as_ref()) else {
                 refused.push((hotkey.id, keys::SYSTEM_KEY.to_owned()));
                 continue;
             };
@@ -232,6 +238,14 @@ impl Hotkeys {
 
     pub fn active(&self) -> bool {
         !self.registered.is_empty()
+    }
+
+    /// Registers the same set again after the user switched layouts, so
+    /// `ctrl+a` follows the A. What was refused the first time was already
+    /// reported, and a chord another app took meanwhile is refused quietly.
+    pub fn follow_layout(&mut self) {
+        let wanted = std::mem::take(&mut self.wanted);
+        let _ = self.set(&wanted);
     }
 
     /// Dispatches what Carbon queued since the last pass, which is where a
