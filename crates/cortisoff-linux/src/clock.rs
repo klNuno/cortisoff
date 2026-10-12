@@ -32,6 +32,23 @@ pub fn wall_s() -> i64 {
     wall().0
 }
 
+extern "C" {
+    /// Declared here because the libc crate carries it for no unix target,
+    /// as in `cortisoff-unix`'s clock.
+    fn tzset();
+}
+
+/// Read the time zone again. glibc's `localtime_r` does not, so without
+/// this a zone changed while the daemon runs never reaches a schedule. It
+/// costs one `stat` of the zone file, so it runs once per clock event and
+/// once per daylight saving search, not once per conversion.
+pub fn refresh_zone() {
+    // SAFETY: no arguments; it rereads `TZ` and the zone file into the C
+    // library's own state under the library's own lock, as `localtime_r`
+    // already does on its first call.
+    unsafe { tzset() }
+}
+
 fn local_tm(epoch_s: i64) -> Option<libc::tm> {
     let t = epoch_s as libc::time_t;
     // SAFETY: `tm` is plain data that `localtime_r` fills in. Both pointers
@@ -44,6 +61,7 @@ fn local_tm(epoch_s: i64) -> Option<libc::tm> {
 /// The local time right now as the engine hears it. `None` only when the C
 /// library cannot convert the clock, which no machine has shown so far.
 pub fn time_of_day() -> Option<Event> {
+    refresh_zone();
     let (seconds, millisecond) = wall();
     let tm = local_tm(seconds)?;
     Some(clock_event(tm.tm_hour, tm.tm_min, tm.tm_sec, millisecond))

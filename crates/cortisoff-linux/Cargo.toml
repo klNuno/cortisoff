@@ -25,7 +25,16 @@ rustix = { version = "1", default-features = false, features = [
     "event",
     "param",
     "pipe",
+    "process",
     "time",
 ] }
 # `localtime_r` only. rustix has no time zone database access.
 libc = "0.2"
+# The session lock (logind), idle (Mutter) and GNOME's Night Light under
+# Wayland. Pure Rust over the bus socket, its blocking API on its own small
+# executor: no libdbus and no tokio. The window already links it through
+# accesskit, so the binary gains little.
+zbus = { version = "5", default-features = false, features = [
+    "blocking-api",
+    "async-io",
+] }
