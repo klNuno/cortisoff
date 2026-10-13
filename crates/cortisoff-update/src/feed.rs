@@ -21,6 +21,18 @@ pub struct Release {
     /// The minisign signature of that executable, as the feed spells it:
     /// base64 of the `.sig` file like Tauri, or the `.sig` text itself.
     pub signature: String,
+    /// The same release's `cortisoff-cli`, when the installed app has a
+    /// client beside it to update and the feed carries one.
+    pub client: Option<ClientBuild>,
+}
+
+/// Where a release's `cortisoff-cli` comes from, checked like the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientBuild {
+    /// The client's feed key, `windows-x86_64-cli` and so on.
+    pub platform: String,
+    pub url: String,
+    pub signature: String,
 }
 
 #[derive(Deserialize)]
@@ -59,7 +71,14 @@ pub(crate) fn platform_key_for(os: &str, arch: &str) -> Option<&'static str> {
 /// also the name its signature's trusted comment carries. A macOS `-app` key
 /// is the zipped, signed `Cortisoff.app`.
 pub fn artifact_name(platform: &str) -> String {
-    if platform.starts_with("windows-") {
+    if let Some(base) = client_base(platform) {
+        let suffix = if base.starts_with("windows-") {
+            ".exe"
+        } else {
+            ""
+        };
+        format!("cortisoff-cli-{base}{suffix}")
+    } else if platform.starts_with("windows-") {
         format!("cortisoff-{platform}.exe")
     } else if let Some(base) = bundle_base(platform) {
         format!("cortisoff-{base}.zip")
@@ -89,6 +108,22 @@ pub(crate) fn update_key_for(platform: Option<&str>, in_bundle: bool) -> Option<
     }
 }
 
+/// `windows-x86_64` for `windows-x86_64-cli`: the platform a client key
+/// stands for. macOS ships its client inside the bundle, so has none.
+fn client_base(platform: &str) -> Option<&str> {
+    platform
+        .strip_suffix("-cli")
+        .filter(|base| base.starts_with("windows-") || base.starts_with("linux-"))
+}
+
+/// The feed key of the client to update with the app: on Windows and Linux,
+/// only when an installed client sits beside the app. Nothing on macOS,
+/// whose bundle carries its client.
+pub(crate) fn client_key_for(platform: Option<&str>, has_client: bool) -> Option<String> {
+    let key = format!("{}-cli", platform?);
+    (has_client && client_base(&key).is_some()).then_some(key)
+}
+
 /// Whether `platform` is a key whose artifact is a zipped bundle.
 pub(crate) fn is_bundle_key(platform: &str) -> bool {
     bundle_base(platform).is_some()
@@ -100,14 +135,26 @@ pub(crate) fn parse_version(text: &str) -> Result<semver::Version, String> {
     semver::Version::parse(bare).map_err(|e| format!("`{text}` is not a version: {e}"))
 }
 
-/// Read a feed and answer the release to install, if the feed is newer than
-/// `current`. A newer release with no build for `platform` is an error rather
-/// than silence: the release pipeline always builds every key, so a missing
-/// one is a broken release someone should hear about.
+#[cfg(test)]
 pub(crate) fn pick(
     json: &str,
     current: &str,
     platform: Option<&str>,
+) -> Result<Option<Release>, String> {
+    pick_with_client(json, current, platform, None)
+}
+
+/// Read a feed and answer the release to install, if the feed is newer than
+/// `current`. A newer release with no build for `platform` is an error rather
+/// than silence: the release pipeline always builds every key, so a missing
+/// one is a broken release someone should hear about. The client's entry,
+/// read under `client` when given, is optional: without it the app updates
+/// alone, as it did before releases carried one.
+pub(crate) fn pick_with_client(
+    json: &str,
+    current: &str,
+    platform: Option<&str>,
+    client: Option<&str>,
 ) -> Result<Option<Release>, String> {
     let feed: Feed =
         serde_json::from_str(json).map_err(|e| format!("the update feed is not readable: {e}"))?;
@@ -135,6 +182,14 @@ pub(crate) fn pick(
             entry.url
         ));
     }
+    let client = client.and_then(|key| {
+        let entry = feed.platforms.get(key)?;
+        entry.url.starts_with("https://").then(|| ClientBuild {
+            platform: key.to_owned(),
+            url: entry.url.clone(),
+            signature: entry.signature.trim().to_owned(),
+        })
+    });
     Ok(Some(Release {
         version: offered.to_string(),
         notes: feed.notes.unwrap_or_default(),
@@ -142,6 +197,7 @@ pub(crate) fn pick(
         platform: platform.to_owned(),
         url: entry.url.clone(),
         signature: entry.signature.trim().to_owned(),
+        client,
     }))
 }
 
@@ -275,6 +331,19 @@ mod tests {
             artifact_name("linux-x86_64-app"),
             "cortisoff-linux-x86_64-app"
         );
+        assert_eq!(
+            artifact_name("windows-x86_64-cli"),
+            "cortisoff-cli-windows-x86_64.exe"
+        );
+        assert_eq!(
+            artifact_name("linux-x86_64-cli"),
+            "cortisoff-cli-linux-x86_64"
+        );
+        // The mac client is inside the bundle: no key of its own.
+        assert_eq!(
+            artifact_name("darwin-x86_64-cli"),
+            "cortisoff-darwin-x86_64-cli"
+        );
         assert!(is_bundle_key("darwin-x86_64-app"));
         assert!(!is_bundle_key("darwin-x86_64"));
         assert!(!is_bundle_key("linux-x86_64-app"));
@@ -320,5 +389,76 @@ mod tests {
         assert_eq!(artifact_name(&app.platform), "cortisoff-darwin-x86_64.zip");
         let bare = pick(json, "1.0.0", Some("darwin-x86_64")).unwrap().unwrap();
         assert_eq!(bare.signature, "bare");
+    }
+
+    #[test]
+    fn the_client_key_is_read_only_beside_an_installed_client() {
+        assert_eq!(
+            client_key_for(Some("windows-x86_64"), true).as_deref(),
+            Some("windows-x86_64-cli")
+        );
+        assert_eq!(
+            client_key_for(Some("linux-x86_64"), true).as_deref(),
+            Some("linux-x86_64-cli")
+        );
+        assert_eq!(client_key_for(Some("windows-x86_64"), false), None);
+        assert_eq!(client_key_for(Some("linux-x86_64"), false), None);
+        assert_eq!(client_key_for(Some("darwin-x86_64"), true), None);
+        assert_eq!(client_key_for(None, true), None);
+    }
+
+    #[test]
+    fn a_feed_with_a_client_key_carries_its_build() {
+        let json = r#"{"version":"2.0.0","platforms":{
+            "linux-x86_64":{"url":"https://x/cortisoff-linux-x86_64","signature":"app"},
+            "linux-x86_64-cli":{"url":"https://x/cortisoff-cli-linux-x86_64","signature":" cli "}}}"#;
+        let release = pick_with_client(
+            json,
+            "1.0.0",
+            Some("linux-x86_64"),
+            Some("linux-x86_64-cli"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(release.signature, "app");
+        let client = release.client.expect("the client entry");
+        assert_eq!(client.platform, "linux-x86_64-cli");
+        assert_eq!(client.signature, "cli");
+        assert_eq!(
+            artifact_name(&client.platform),
+            "cortisoff-cli-linux-x86_64"
+        );
+
+        // No client beside the app: the entry is not even read.
+        let alone = pick_with_client(json, "1.0.0", Some("linux-x86_64"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alone.client, None);
+    }
+
+    #[test]
+    fn a_feed_without_a_client_key_still_updates_the_app() {
+        let release = pick_with_client(
+            TAURI_SHAPED,
+            "1.0.0",
+            Some("windows-x86_64"),
+            Some("windows-x86_64-cli"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(release.url.ends_with("cortisoff-windows-x86_64.exe"));
+        assert_eq!(release.client, None);
+        let json = r#"{"version":"2.0.0","platforms":{
+            "linux-x86_64":{"url":"https://x/a","signature":"s"},
+            "linux-x86_64-cli":{"url":"http://x/c","signature":"s"}}}"#;
+        let plain = pick_with_client(
+            json,
+            "1.0.0",
+            Some("linux-x86_64"),
+            Some("linux-x86_64-cli"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plain.client, None, "a plain http client is not fetched");
     }
 }

@@ -93,6 +93,17 @@ pub(crate) fn runs_in_bundle(exe: &Path) -> bool {
     cfg!(target_os = "macos") && bundle::bundle_of(exe).is_some()
 }
 
+/// The installed client an update replaces along with the app at `exe`:
+/// the `cortisoff-cli` beside it, when there is one. None on macOS, where
+/// the bundle carries its client and updates whole.
+pub(crate) fn client_to_update(exe: &Path) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    let cli = exe.with_file_name(CLI_EXE);
+    cli.is_file().then_some(cli)
+}
+
 /// Replace the bundle `exe` runs in with the one zipped in `zip`, a
 /// verified download for `version`.
 #[cfg(target_os = "macos")]

@@ -219,7 +219,9 @@ jobs:
             dist/cortisoff-darwin-aarch64 \
             dist/cortisoff-darwin-x86_64 \
             dist/cortisoff-darwin-aarch64.zip \
-            dist/cortisoff-darwin-x86_64.zip
+            dist/cortisoff-darwin-x86_64.zip \
+            dist/cortisoff-cli-windows-x86_64.exe \
+            dist/cortisoff-cli-linux-x86_64
 
       - name: Write the release notes
         run: |
@@ -238,7 +240,8 @@ jobs:
       # The feed cortisoff-update reads, in the Tauri updater's shape: each
       # signature is the base64 of its .sig file. A macOS bundle reads its
       # `-app` key, the zipped Cortisoff.app; the bare darwin keys stay for
-      # v0.2.0's bare executable.
+      # v0.2.0's bare executable. Windows and Linux read their `-cli` key
+      # too when a client is installed beside the app, and update it with it.
       - name: Write latest.json
         env:
           TAG: ${{ github.ref_name }}
@@ -248,8 +251,11 @@ jobs:
           set -euo pipefail
           platforms='{}'
           for key in windows-x86_64 linux-x86_64 darwin-aarch64 darwin-x86_64 \
-            darwin-aarch64-app darwin-x86_64-app; do
+            darwin-aarch64-app darwin-x86_64-app \
+            windows-x86_64-cli linux-x86_64-cli; do
             case "$key" in
+              windows-*-cli) name="cortisoff-cli-${key%-cli}.exe" ;;
+              *-cli) name="cortisoff-cli-${key%-cli}" ;;
               windows-*) name="cortisoff-$key.exe" ;;
               *-app) name="cortisoff-${key%-app}.zip" ;;
               *) name="cortisoff-$key" ;;

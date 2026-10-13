@@ -38,6 +38,9 @@ pub enum Found {
         version: String,
     },
     Failed(String),
+    /// Worth a line in the log and nothing else: the release's client could
+    /// not be fetched or verified, so the app updates alone.
+    Warning(String),
 }
 
 /// A verified build waiting for its moment.
@@ -107,7 +110,7 @@ impl Updates {
     /// What the thread found. A build staged while automatic installs were
     /// switched off is dropped rather than installed.
     pub fn found(&mut self, found: Found) {
-        self.last = Some(match found {
+        let last = match found {
             Found::Current => {
                 self.staged = None;
                 UpdateCheck::Current
@@ -125,7 +128,10 @@ impl Updates {
                 UpdateCheck::Available { version }
             }
             Found::Failed(message) => UpdateCheck::Failed { message },
-        });
+            // The server writes it to the log; the result stays as it was.
+            Found::Warning(_) => return,
+        };
+        self.last = Some(last);
     }
 
     /// The staged build, handed over once and only when `quiet`.
@@ -185,7 +191,7 @@ pub fn spawn(
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
                 wait = EVERY;
-                let result = check_once(
+                let (result, warning) = check_once(
                     auto.load(Ordering::Relaxed),
                     &mut staged,
                     || {
@@ -194,8 +200,13 @@ pub fn spawn(
                             env!("CARGO_PKG_VERSION"),
                         )
                     },
-                    |release| cortisoff_update::download(release, &dir),
+                    |release| cortisoff_update::download_pair(release, &dir),
                 );
+                if let Some(warning) = warning {
+                    if found.send(Found::Warning(warning)).is_err() {
+                        return;
+                    }
+                }
                 if found.send(result).is_err() {
                     return;
                 }
@@ -207,43 +218,46 @@ pub fn spawn(
         .map(drop)
 }
 
-/// One check. A version already staged by an earlier check is not
-/// downloaded again while its file is still there.
+/// One check, and why the release's client was left out when it was. A
+/// version already staged by an earlier check is not downloaded again while
+/// its file is still there.
 fn check_once(
     auto: bool,
     staged: &mut Option<Staged>,
     check: impl FnOnce() -> Result<Option<cortisoff_update::Release>, String>,
-    download: impl FnOnce(&cortisoff_update::Release) -> Result<PathBuf, String>,
-) -> Found {
+    download: impl FnOnce(&cortisoff_update::Release) -> Result<(PathBuf, Option<String>), String>,
+) -> (Found, Option<String>) {
     let release = match check() {
         Ok(Some(release)) => release,
-        Ok(None) => return Found::Current,
-        Err(e) => return Found::Failed(e),
+        Ok(None) => return (Found::Current, None),
+        Err(e) => return (Found::Failed(e), None),
     };
     if !auto {
-        return Found::Available(release.version);
+        return (Found::Available(release.version), None);
     }
     if let Some(done) = staged
         .as_ref()
         .filter(|s| s.version == release.version && s.path.exists())
     {
-        return Found::Staged {
+        let found = Found::Staged {
             path: done.path.clone(),
             version: done.version.clone(),
         };
+        return (found, None);
     }
     match download(&release) {
-        Ok(path) => {
+        Ok((path, warning)) => {
             *staged = Some(Staged {
                 path: path.clone(),
                 version: release.version.clone(),
             });
-            Found::Staged {
+            let found = Found::Staged {
                 path,
                 version: release.version,
-            }
+            };
+            (found, warning)
         }
-        Err(e) => Found::Failed(e),
+        Err(e) => (Found::Failed(e), None),
     }
 }
 
@@ -259,6 +273,7 @@ mod tests {
             platform: "windows-x86_64".to_owned(),
             url: "https://example.invalid/cortisoff".to_owned(),
             signature: String::new(),
+            client: None,
         }
     }
 
@@ -272,7 +287,7 @@ mod tests {
     #[test]
     fn a_check_with_automatic_installs_off_never_downloads() {
         let mut none = None;
-        let found = check_once(
+        let (found, _) = check_once(
             false,
             &mut none,
             || Ok(Some(release("9.0.0"))),
@@ -289,7 +304,7 @@ mod tests {
             path: file.clone(),
             version: "9.0.0".into(),
         });
-        let found = check_once(
+        let (found, _) = check_once(
             true,
             &mut done,
             || Ok(Some(release("9.0.0"))),
@@ -303,6 +318,37 @@ mod tests {
             }
         );
         std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn a_client_left_out_is_a_warning_and_the_app_still_stages() {
+        let mut none = None;
+        let (found, warning) = check_once(
+            true,
+            &mut none,
+            || Ok(Some(release("9.0.0"))),
+            |_| Ok((PathBuf::from("staged-app"), Some("client refused".into()))),
+        );
+        assert_eq!(
+            found,
+            Found::Staged {
+                path: PathBuf::from("staged-app"),
+                version: "9.0.0".into()
+            }
+        );
+        assert_eq!(warning.as_deref(), Some("client refused"));
+
+        // The warning leaves the result and the staged build as they are.
+        let mut updates = Updates::new(true);
+        updates.found(found);
+        updates.found(Found::Warning("client refused".into()));
+        assert!(updates.waiting());
+        assert_eq!(
+            updates.report().last,
+            Some(UpdateCheck::Staged {
+                version: "9.0.0".into()
+            })
+        );
     }
 
     #[test]

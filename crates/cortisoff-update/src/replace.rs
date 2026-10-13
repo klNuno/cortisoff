@@ -12,19 +12,41 @@ use std::process::{Command, Stdio};
 /// Replace the running executable with `staged`, a verified download. On
 /// macOS a staged bundle (`cortisoff-<version>.zip`) replaces the whole
 /// `Cortisoff.app` the executable runs in instead.
+///
+/// A client staged with the app (see [`crate::download_pair`]) then
+/// replaces the `cortisoff-cli` installed beside it, the app first so a
+/// failed swap never leaves a new client talking to an old daemon. A client
+/// that cannot be swapped stays at its version and the next release tries
+/// again; the app update stands.
 pub fn apply(staged: &Path) -> Result<(), String> {
     let exe = current_exe()?;
     #[cfg(target_os = "macos")]
     if let Some(version) = crate::staged_bundle_version(staged) {
         return crate::install::apply_bundle(staged, &exe, version);
     }
-    replace(staged, &exe)
+    apply_pair(staged, &exe).map(drop)
+}
+
+/// [`apply`] for the app at `exe`. Answers whether a staged client was put
+/// in place too.
+pub(crate) fn apply_pair(staged: &Path, exe: &Path) -> Result<bool, String> {
+    replace(staged, exe)?;
+    let Some(client) = crate::staged_client_for(staged).filter(|c| c.is_file()) else {
+        return Ok(false);
+    };
+    let installed = exe.with_file_name(crate::install::CLI_EXE);
+    let swapped = installed.is_file() && replace(&client, &installed).is_ok();
+    let _ = fs::remove_file(&client);
+    Ok(swapped)
 }
 
 /// Delete what [`apply`] moved aside. The next start calls it; a file still
 /// held by a process that has not exited yet is left for the start after.
+/// The client's copy goes too when nothing runs from it any more.
 pub fn cleanup_previous() -> Result<(), String> {
-    cleanup_previous_at(&current_exe()?)
+    let exe = current_exe()?;
+    let _ = cleanup_previous_at(&exe.with_file_name(crate::install::CLI_EXE));
+    cleanup_previous_at(&exe)
 }
 
 /// Start the executable now at the running one's path, detached from this
@@ -280,6 +302,76 @@ pub(crate) mod tests {
         assert!(!old.exists());
         assert_eq!(fs::read(&exe).unwrap(), b"new build");
         cleanup_previous_at(&exe).unwrap();
+    }
+
+    fn cli_name() -> String {
+        crate::install::CLI_EXE.to_owned()
+    }
+
+    /// An installed app and client, and a staged pair for 1.2.0.
+    fn installed_pair(scratch: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
+        let exe = scratch.0.join("install").join(exe_name());
+        let cli = exe.with_file_name(cli_name());
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"old app").unwrap();
+        fs::write(&cli, b"old client").unwrap();
+        let staged = scratch
+            .0
+            .join("download")
+            .join(format!("cortisoff-1.2.0{}", std::env::consts::EXE_SUFFIX));
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"new app").unwrap();
+        fs::write(crate::staged_client_for(&staged).unwrap(), b"new client").unwrap();
+        (exe, cli, staged)
+    }
+
+    #[test]
+    fn apply_replaces_the_app_then_the_client() {
+        let scratch = Scratch::new("apply-pair");
+        let (exe, cli, staged) = installed_pair(&scratch);
+        assert_eq!(apply_pair(&staged, &exe), Ok(true));
+        assert_eq!(fs::read(&exe).unwrap(), b"new app");
+        assert_eq!(fs::read(&cli).unwrap(), b"new client");
+        assert!(!crate::staged_client_for(&staged).unwrap().exists());
+        if cfg!(windows) {
+            assert_eq!(fs::read(previous_path(&cli, 0)).unwrap(), b"old client");
+        }
+        cleanup_previous_at(&cli).unwrap();
+        cleanup_previous_at(&exe).unwrap();
+        assert!(previous_files(&cli).is_empty());
+    }
+
+    #[test]
+    fn an_app_that_cannot_be_replaced_leaves_the_client_alone() {
+        let scratch = Scratch::new("apply-pair-order");
+        let (exe, cli, staged) = installed_pair(&scratch);
+        // The app's staged file is gone: its swap fails first.
+        fs::remove_file(&staged).unwrap();
+        assert!(apply_pair(&staged, &exe).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"old app");
+        assert_eq!(fs::read(&cli).unwrap(), b"old client");
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_replaced_leaves_the_app_updated() {
+        let scratch = Scratch::new("apply-pair-cli");
+        let (exe, cli, staged) = installed_pair(&scratch);
+        // A folder where the client should be: no swap can land there.
+        fs::remove_file(&cli).unwrap();
+        fs::create_dir(&cli).unwrap();
+        assert_eq!(apply_pair(&staged, &exe), Ok(false));
+        assert_eq!(fs::read(&exe).unwrap(), b"new app");
+        assert!(cli.is_dir());
+    }
+
+    #[test]
+    fn an_app_without_a_client_beside_it_updates_alone() {
+        let scratch = Scratch::new("apply-alone");
+        let (exe, cli, staged) = installed_pair(&scratch);
+        fs::remove_file(&cli).unwrap();
+        assert_eq!(apply_pair(&staged, &exe), Ok(false));
+        assert_eq!(fs::read(&exe).unwrap(), b"new app");
+        assert!(!cli.exists(), "an update installs no client of its own");
     }
 
     #[test]
