@@ -43,6 +43,11 @@ pub struct MockActuator {
     /// arrived after the baseline was captured. Taken once, the way real
     /// hardware only moves once per event.
     grown: RefCell<Option<Value>>,
+    /// Set for an actuator whose baseline is no number, as a colour
+    /// temperature captures gamma ramps: `capture` hands back the first,
+    /// applying it puts the second back on the screen, and `rest` is the
+    /// second.
+    opaque: Option<(Value, Value)>,
 }
 
 impl Actuator for MockActuator {
@@ -52,12 +57,18 @@ impl Actuator for MockActuator {
 
     fn capture(&self) -> Result<Value, ActuatorError> {
         self.trace.push(format!("capture {}", self.id));
-        Ok(self.state.borrow().clone())
+        match &self.opaque {
+            Some((baseline, _)) => Ok(baseline.clone()),
+            None => Ok(self.state.borrow().clone()),
+        }
     }
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError> {
         self.trace.push(format!("apply {} {:?}", self.id, value));
-        *self.state.borrow_mut() = value.clone();
+        *self.state.borrow_mut() = match &self.opaque {
+            Some((baseline, rest)) if baseline == value => rest.clone(),
+            _ => value.clone(),
+        };
         Ok(())
     }
 
@@ -74,6 +85,9 @@ impl Actuator for MockActuator {
     /// A number rests where it is. Anything else has no resting number, as a
     /// display mode has none on a real machine.
     fn rest(&self) -> Option<Value> {
+        if let Some((_, rest)) = &self.opaque {
+            return Some(rest.clone());
+        }
         match &*self.state.borrow() {
             value @ Value::Int(_) => Some(value.clone()),
             _ => None,
@@ -214,6 +228,25 @@ impl MockHost {
                 volatile,
                 trace: self.trace.clone(),
                 grown: RefCell::new(None),
+                opaque: None,
+            },
+        );
+        self
+    }
+
+    /// An actuator whose baseline is no number: it captures `baseline` and
+    /// rests at `rest`, which is also where it starts.
+    pub fn with_opaque_actuator(mut self, id: &str, baseline: Value, rest: Value) -> Self {
+        let id = CapabilityId::new(id);
+        self.actuators.insert(
+            id.clone(),
+            MockActuator {
+                id,
+                state: RefCell::new(rest.clone()),
+                volatile: false,
+                trace: self.trace.clone(),
+                grown: RefCell::new(None),
+                opaque: Some((baseline, rest)),
             },
         );
         self
