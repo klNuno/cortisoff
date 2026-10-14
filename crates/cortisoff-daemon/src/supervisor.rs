@@ -555,6 +555,13 @@ impl<J: JournalStore> Supervisor<J> {
     /// Execute a batch, in order. Apply and restore go to the dispatcher, and
     /// everything it hands back is routed here.
     fn run(&mut self, host: &mut dyn Host, actions: Vec<Action>) {
+        // Before anything else: a fade whose last frame lands on the value
+        // the screen already shows ends with no action at all.
+        let fading = self.claims.moving();
+        if fading != self.fading {
+            self.fading = fading;
+            host.set_fading(fading);
+        }
         if actions.is_empty() {
             return;
         }
@@ -589,11 +596,6 @@ impl<J: JournalStore> Supervisor<J> {
                 Action::Run { program, args } => self.spawn(&program, &args),
                 Action::Apply { .. } | Action::RestoreBaseline { .. } => {}
             }
-        }
-        let fading = self.claims.moving();
-        if fading != self.fading {
-            self.fading = fading;
-            host.set_fading(fading);
         }
     }
 
@@ -1028,8 +1030,10 @@ mod tests {
         };
         assert!(first > 6400, "the first step is a small one: {first}");
         assert!(host.fading, "the host knows a fade runs");
-        for _ in 0..40 {
-            host.now_ms += 40;
+        // Frames close enough that the last ones already show 3200 K, so the
+        // one that ends the fade has nothing to apply.
+        for _ in 0..300 {
+            host.now_ms += 5;
             sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
         }
         assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
