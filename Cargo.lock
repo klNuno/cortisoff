@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-daemon",
  "cortisoff-host",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "cortisoff-ipc",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "serde",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-core",
  "cortisoff-host",
@@ -790,14 +790,14 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "cortisoff-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "serde",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-linux"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "libc",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-mac"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "block2 0.6.2",
  "cortisoff-host",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-core",
  "cortisoff-host",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-ui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "cortisoff-ipc",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-unix"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "cortisoff-ipc",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-update"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "cortisoff-win"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cortisoff-host",
  "cortisoff-ipc",
