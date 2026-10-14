@@ -28,6 +28,7 @@ const QUARANTINE: &str = "com.apple.quarantine";
 const CODESIGN: &str = "/usr/bin/codesign";
 const DITTO: &str = "/usr/bin/ditto";
 const TCCUTIL: &str = "/usr/bin/tccutil";
+const LAUNCHCTL: &str = "/bin/launchctl";
 
 /// `~/Applications/Cortisoff.app`.
 pub fn bundle() -> PathBuf {
@@ -158,11 +159,27 @@ pub fn uninstall() -> Result<(), String> {
     let _ = fs::remove_dir_all(aside);
     super::remove_legacy();
     forget_permissions();
+    unload_agent();
     match fs::remove_dir_all(&target) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("cannot remove {}: {e}", target.display())),
     }
+}
+
+/// `launchctl bootout gui/<uid>/dev.mtsu.cortisoff`: removing the
+/// LaunchAgent's file leaves its job loaded until logout, naming a program
+/// that is gone, which a `kickstart` would still try. A job that is not
+/// loaded makes it fail, which is the state wanted.
+fn unload_agent() {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let _ = Command::new(LAUNCHCTL)
+        .args(["bootout", &format!("gui/{uid}/{BUNDLE_ID}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// `tccutil reset All dev.mtsu.cortisoff`: the Accessibility, Input

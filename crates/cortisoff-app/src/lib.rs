@@ -76,6 +76,12 @@ pub fn window(launch: Launch) -> Result<(), String> {
                 let next = match install::placement() {
                     install::Placement::UseInstalled(target) => Ok((target, None)),
                     install::Placement::Install => {
+                        // An older install's daemon runs from the files this
+                        // replaces, or on macOS from v0.2.0's folder, which
+                        // this removes. Stopped first, the window below
+                        // starts one from the new copy instead of talking to
+                        // the old one until logout.
+                        stop_daemon();
                         install::install(&exe).map(|target| (target, Some("--installed")))
                     }
                 };
