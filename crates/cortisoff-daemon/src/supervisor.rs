@@ -948,7 +948,9 @@ mod tests {
     #[test]
     fn a_release_fades_even_when_the_baseline_is_no_number() {
         // A colour temperature captures its gamma ramps. The release still
-        // travels to where the screen rests, then the ramps go back.
+        // travels to where the screen rests, then the ramps go back. The
+        // plugin lets go on every clock event, as Night light does after its
+        // morning edge, and every fade frame brings one.
         let mut host = MockHost::new().with_opaque_actuator(
             ids::DISPLAY_COLOR_TEMP,
             Value::Text("ramps".to_owned()),
@@ -959,14 +961,22 @@ mod tests {
             &host,
             vec![plugin(
                 "warm",
-                "return { start = function(cx) cx:claim('display.color_temp', 3200) end }",
+                "return {
+                   start = function(cx) cx:watch('clock') cx:claim('display.color_temp', 3200) end,
+                   on = function(cx) cx:release('display.color_temp', { fade = 1000 }) end,
+                 }",
             )],
         );
         sup.start(&mut host);
         assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
-        sup.set_enabled(&mut host, "warm", false).unwrap();
+        let clock = Event::TimeOfDay {
+            minute: 420,
+            second: 0,
+            millisecond: 0,
+        };
         let mut seen = Vec::new();
         for _ in 0..100 {
+            sup.handle(&mut host, clock.clone());
             host.now_ms += 40;
             sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
             if let Some(Value::Int(k)) = host.value(ids::DISPLAY_COLOR_TEMP) {
