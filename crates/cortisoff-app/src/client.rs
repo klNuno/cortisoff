@@ -177,15 +177,13 @@ mod platform {
 mod platform {
     pub use cortisoff_unix::Client;
 
-    /// How often a missing daemon is looked for again. The socket has no
-    /// "now listening" signal yet; Windows has one (`TODO.md`).
-    const RETRY: std::time::Duration = std::time::Duration::from_millis(700);
-
     pub fn connect() -> Option<Client> {
         cortisoff_unix::connect()
     }
 
+    /// Parked on the socket's directory until the daemon listens (inotify
+    /// on Linux; a short retry on macOS, see `cortisoff_unix::wait_for_daemon`).
     pub fn wait_for_daemon() {
-        std::thread::sleep(RETRY);
+        cortisoff_unix::wait_for_daemon();
     }
 }

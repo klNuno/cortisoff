@@ -41,7 +41,7 @@ Closing the window leaves cortisoff running in the background; the window only s
 
 Download `cortisoff-linux-x86_64` from the same release page, make it executable with `chmod +x cortisoff-linux-x86_64`, and run it. It installs itself into `~/.local/bin`, adds an entry to the applications menu and starts with your session. `cortisoff --uninstall` removes it.
 
-It needs an X11 session. Under Wayland the night light and the idle time are missing, a locked screen goes unseen on either, and `cortisoff-cli doctor` lists what your session supports.
+It works on X11, and on GNOME under Wayland. There the night light goes through GNOME's own Night Light, and shortcuts through the desktop portal: GNOME asks once whether to allow them, and a shortcut there runs commands, while typing, sending keys and window actions need X11. Wayland tells no app which window is in front, so display profiles cannot follow apps there. Other Wayland desktops, KDE included, are not supported yet. `cortisoff-cli doctor` lists what your session supports.
 
 ### macOS
 
@@ -87,11 +87,12 @@ cortisoff-cli update auto <on|off>    install new versions on its own, or not
 
 | | Windows | Linux | macOS |
 | --- | --- | --- | --- |
-| Colour temperature | yes | X11 | yes |
+| Colour temperature | yes | X11, GNOME | yes |
 | Refresh rate | yes | X11 | yes |
 | Vibrance | NVIDIA | no | no |
 | Animated wallpaper | Wallpaper Engine, Lively | no | no |
-| Shortcuts | yes | X11 | yes |
+| App in front | yes | X11 | yes |
+| Shortcuts | yes | X11, GNOME | yes |
 | Install and updates | yes | yes | yes |
 
 `cortisoff-cli doctor` prints what your own machine supports, and each plugin's page says when something it needs is missing.
