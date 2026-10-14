@@ -7,16 +7,15 @@ fn main() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-    assert!(
-        cortisoff_mac::background_only(),
-        "macOS refused the prohibited activation policy"
-    );
     let mtm = MainThreadMarker::new().expect("main thread");
-    assert_eq!(
-        NSApplication::sharedApplication(mtm).activationPolicy(),
-        NSApplicationActivationPolicy::Prohibited
+    let before = NSApplication::sharedApplication(mtm).activationPolicy();
+    let done = cortisoff_mac::background_only();
+    let after = NSApplication::sharedApplication(mtm).activationPolicy();
+    assert!(
+        done && after == NSApplicationActivationPolicy::Prohibited,
+        "activation policy {before:?} before, {after:?} after"
     );
-    println!("test background_only_on_the_main_thread ... ok");
+    println!("test background_only_on_the_main_thread ... ok ({before:?} before)");
 }
 
 #[cfg(not(target_os = "macos"))]

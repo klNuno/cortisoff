@@ -12,15 +12,19 @@
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
-/// Make this process a background one for the rest of its life. `false` off
-/// the main thread, where `NSApplication` may not be touched, or when macOS
-/// refused the policy.
+/// Make this process a background one for the rest of its life, and say
+/// whether it now is. `false` off the main thread, where `NSApplication` may
+/// not be touched, or when macOS kept another policy.
+///
+/// The policy the process ends with decides, not the setter's answer: the
+/// setter has said NO on a CI runner.
 pub fn background_only() -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         return false;
     };
-    NSApplication::sharedApplication(mtm)
-        .setActivationPolicy(NSApplicationActivationPolicy::Prohibited)
+    let app = NSApplication::sharedApplication(mtm);
+    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+    app.activationPolicy() == NSApplicationActivationPolicy::Prohibited
 }
 
 #[cfg(test)]
