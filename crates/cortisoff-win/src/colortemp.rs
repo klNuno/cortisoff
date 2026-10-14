@@ -40,6 +40,13 @@ pub struct ColorTemp {
     /// What is pushed right now, so the path losing a monitor can let go
     /// before the next one takes it, and the two never stack.
     live: RefCell<Live>,
+    /// Panel gains go out on their own thread, so a slow panel never holds
+    /// back the ramps of the other monitors.
+    panels: ddc::Writer,
+    /// Panels that accepted a write from this process. Their next writes are
+    /// posted; a panel's first write is made in place, because its answer
+    /// decides whether its monitor needs the ramp in the same apply.
+    proven: RefCell<BTreeSet<String>>,
 }
 
 struct Captured {
@@ -119,6 +126,8 @@ impl ColorTemp {
             gamma,
             captured: RefCell::new(None),
             live: RefCell::new(Live::default()),
+            panels: ddc::Writer::new(),
+            proven: RefCell::new(BTreeSet::new()),
         })
     }
 
@@ -145,6 +154,14 @@ impl ColorTemp {
 
         let captured = self.captured.borrow();
         let mut live = self.live.borrow_mut();
+        // A posted write a panel refused since the last apply: its monitor
+        // takes the ramp from this apply on, and its next write is made in
+        // place again.
+        for key in self.panels.take_refused() {
+            live.panel.remove(&key);
+            self.proven.borrow_mut().remove(&key);
+            live.refused.insert(key);
+        }
         let panels: Vec<String> = captured
             .iter()
             .flat_map(|c| c.gains.iter().map(|(key, _)| key.clone()))
@@ -176,7 +193,7 @@ impl ColorTemp {
             .collect();
         for key in leaving {
             if let Some(base) = gains_of(captured.as_ref(), &key) {
-                ddc::write(&key, ddc::currents(base));
+                self.panels.write_now(&key, ddc::currents(base));
             }
             live.touched.remove(&key);
             live.panel.remove(&key);
@@ -195,7 +212,12 @@ impl ColorTemp {
                 continue;
             }
             live.touched.insert(key.clone());
-            if ddc::write(key, wanted) {
+            if self.proven.borrow().contains(key) {
+                self.panels.post(key, wanted);
+                live.panel.insert(key.clone(), wanted);
+                carried = true;
+            } else if self.panels.write_now(key, wanted) {
+                self.proven.borrow_mut().insert(key.clone());
                 live.panel.insert(key.clone(), wanted);
                 carried = true;
             } else {
@@ -248,7 +270,7 @@ impl ColorTemp {
             &screen::device_names(),
             set_magnifier,
             screen::write,
-            ddc::write,
+            |key, values| self.panels.write_now(key, values),
         )
     }
 
@@ -338,8 +360,11 @@ impl Actuator for ColorTemp {
         let gains = if capable.is_empty() {
             Vec::new()
         } else {
+            // Never read a panel while a write to it is still on the wire.
+            self.panels.settle();
             ddc::capture(&capable)
         };
+        self.panels.read_back(&gains);
 
         let captured = Captured { ramps, gains };
         let encoded = encode(&captured);
@@ -390,8 +415,11 @@ impl Actuator for ColorTemp {
         let gains = if capable.is_empty() {
             Vec::new()
         } else {
+            // Never read a panel while a write to it is still on the wire.
+            self.panels.settle();
             ddc::capture(&capable)
         };
+        self.panels.read_back(&gains);
 
         if fresh.is_empty() && gains.is_empty() {
             return None;
@@ -555,6 +583,8 @@ mod tests {
                 touched: [ddc::key(ONE, 0)].into_iter().collect(),
                 ..Live::default()
             }),
+            panels: ddc::Writer::new(),
+            proven: RefCell::new(BTreeSet::new()),
         };
         (actuator, encoded)
     }
