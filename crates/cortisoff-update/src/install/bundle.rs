@@ -132,6 +132,24 @@ pub fn check_staged(
     Ok(())
 }
 
+/// Whether macOS asks the user before an app reads `path`: the Desktop,
+/// Documents and Downloads folders, iCloud Drive, and other volumes
+/// (removable or on the network) under `/Volumes`. An app running from there
+/// asks even to read its own bundle, so copying it into `~/Applications`
+/// would stop on that question. A quarantined download runs translocated,
+/// from a read-only copy elsewhere, and is not under any of these.
+pub fn guarded(path: &Path, home: &Path) -> bool {
+    [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library/Mobile Documents",
+    ]
+    .iter()
+    .any(|folder| path.starts_with(home.join(folder)))
+        || path.starts_with("/Volumes")
+}
+
 /// Copy a folder tree, symbolic links as links. A signed bundle keeps
 /// links (frameworks do), and following one would copy what it points at
 /// and break the seal.
@@ -193,6 +211,30 @@ pub fn swap_bundle(incoming: &Path, bundle: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::replace::tests::Scratch;
+
+    #[test]
+    fn the_folders_macos_guards_are_known() {
+        let home = Path::new("/Users/me");
+        for guarded_path in [
+            "/Users/me/Downloads/Cortisoff.app",
+            "/Users/me/Downloads/unzipped/Cortisoff.app",
+            "/Users/me/Desktop/Cortisoff.app",
+            "/Users/me/Documents/apps/Cortisoff.app",
+            "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Cortisoff.app",
+            "/Volumes/USB/Cortisoff.app",
+        ] {
+            assert!(guarded(Path::new(guarded_path), home), "{guarded_path}");
+        }
+        for free in [
+            "/Users/me/Applications/Cortisoff.app",
+            "/Applications/Cortisoff.app",
+            "/private/var/folders/x/AppTranslocation/1/d/Cortisoff.app",
+            "/Users/me/DownloadsOld/Cortisoff.app",
+            "/Users/other/Downloads/Cortisoff.app",
+        ] {
+            assert!(!guarded(Path::new(free), home), "{free}");
+        }
+    }
 
     #[test]
     fn the_plist_names_the_bundle_and_carries_the_version() {

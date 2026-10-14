@@ -205,6 +205,9 @@ pub struct MockHost {
     pub desktop: Vec<String>,
     pub clipboard_text: String,
     pub open_windows: Vec<WindowInfo>,
+    /// What `warnings` answers, read at each call as a real host reads its
+    /// permissions.
+    pub warnings: Vec<String>,
     trace: Trace,
     /// Time the actuators took, added to `now_ms`.
     spent: Rc<Cell<u64>>,
@@ -296,6 +299,9 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn warnings(&self) -> Vec<String> {
+        self.warnings.clone()
+    }
     fn set_idle_thresholds(&mut self, seconds: &[u32]) {
         self.idle_thresholds = seconds.to_vec();
     }

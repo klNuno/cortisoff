@@ -111,6 +111,14 @@ pub trait Host {
         None
     }
 
+    /// Machine facts the user should know that are not failures, such as a
+    /// permission the system has not given. Asked again at every `doctor`,
+    /// so a permission granted while the daemon runs stops being reported
+    /// at once.
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Register exactly these global hotkeys, replacing every earlier set.
     /// Each one pressed comes back as [`Event::Hotkey`] with its id. Returns
     /// the ones the system refused, with a sentence: another application

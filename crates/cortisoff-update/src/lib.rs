@@ -56,21 +56,39 @@ fn agent(body_timeout: Duration) -> ureq::Agent {
 /// Ask `feed` whether a version newer than `current` exists, and answer its
 /// build for this platform. `Ok(None)` means up to date.
 pub fn check(feed: &str, current: &str) -> Result<Option<Release>, String> {
-    let json = agent(Duration::from_secs(20))
-        .get(feed)
-        .call()
-        .map_err(|e| format!("cannot reach the update feed: {e}"))?
-        .into_body()
-        .into_with_config()
-        .limit(FEED_LIMIT)
-        .read_to_string()
-        .map_err(|e| format!("cannot read the update feed: {e}"))?;
+    let json = read_feed(feed)?;
     let exe = replace::current_exe().ok();
     let in_bundle = exe.as_deref().is_some_and(install::runs_in_bundle);
     let has_client = exe.as_deref().and_then(install::client_to_update).is_some();
     let key = feed::update_key_for(platform_key(), in_bundle);
     let client = feed::client_key_for(platform_key(), has_client);
     feed::pick_with_client(&json, current, key.as_deref(), client.as_deref())
+}
+
+/// The feed published with release `version`, beside its downloads.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn release_feed_url(version: &str) -> String {
+    format!("https://github.com/klNuno/cortisoff/releases/download/v{version}/latest.json")
+}
+
+/// The signed build of release `version` itself under the feed key `key`,
+/// read from the feed that release published, so a copy of that version
+/// can be installed from its download rather than from files on disk.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn release_of(version: &str, key: &str) -> Result<Release, String> {
+    feed::pick_exact(&read_feed(&release_feed_url(version))?, version, key)
+}
+
+fn read_feed(url: &str) -> Result<String, String> {
+    agent(Duration::from_secs(20))
+        .get(url)
+        .call()
+        .map_err(|e| format!("cannot reach the update feed: {e}"))?
+        .into_body()
+        .into_with_config()
+        .limit(FEED_LIMIT)
+        .read_to_string()
+        .map_err(|e| format!("cannot read the update feed: {e}"))
 }
 
 /// What a download is staged as: the bare executable, or on macOS the
@@ -256,6 +274,11 @@ mod tests {
             FEED_URL.starts_with("https://github.com/klNuno/cortisoff/releases/latest/download/")
         );
         assert!(FEED_URL.ends_with("/latest.json"));
+        // The release workflow uploads the same file to every release.
+        assert_eq!(
+            release_feed_url("0.3.0"),
+            FEED_URL.replace("/latest/download/", "/download/v0.3.0/")
+        );
     }
 
     #[test]

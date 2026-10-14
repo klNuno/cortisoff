@@ -156,13 +156,39 @@ pub(crate) fn pick_with_client(
     platform: Option<&str>,
     client: Option<&str>,
 ) -> Result<Option<Release>, String> {
-    let feed: Feed =
-        serde_json::from_str(json).map_err(|e| format!("the update feed is not readable: {e}"))?;
+    let feed = read(json)?;
     let offered = parse_version(&feed.version)?;
     let running = parse_version(current)?;
     if offered <= running {
         return Ok(None);
     }
+    build(feed, offered, platform, client).map(Some)
+}
+
+/// The build for `platform` of the release this feed describes, which must
+/// be `version` itself: the feed published with that release, read to
+/// install that same version again from its signed download.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pick_exact(json: &str, version: &str, platform: &str) -> Result<Release, String> {
+    let feed = read(json)?;
+    let offered = parse_version(&feed.version)?;
+    let wanted = parse_version(version)?;
+    if offered != wanted {
+        return Err(format!("the feed of {wanted} describes {offered}"));
+    }
+    build(feed, offered, Some(platform), None)
+}
+
+fn read(json: &str) -> Result<Feed, String> {
+    serde_json::from_str(json).map_err(|e| format!("the update feed is not readable: {e}"))
+}
+
+fn build(
+    feed: Feed,
+    offered: semver::Version,
+    platform: Option<&str>,
+    client: Option<&str>,
+) -> Result<Release, String> {
     let Some(platform) = platform else {
         return Err(format!(
             "version {offered} is out, but no build is published for {} {}",
@@ -190,7 +216,7 @@ pub(crate) fn pick_with_client(
             signature: entry.signature.trim().to_owned(),
         })
     });
-    Ok(Some(Release {
+    Ok(Release {
         version: offered.to_string(),
         notes: feed.notes.unwrap_or_default(),
         pub_date: feed.pub_date,
@@ -198,7 +224,7 @@ pub(crate) fn pick_with_client(
         url: entry.url.clone(),
         signature: entry.signature.trim().to_owned(),
         client,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -389,6 +415,25 @@ mod tests {
         assert_eq!(artifact_name(&app.platform), "cortisoff-darwin-x86_64.zip");
         let bare = pick(json, "1.0.0", Some("darwin-x86_64")).unwrap().unwrap();
         assert_eq!(bare.signature, "bare");
+    }
+
+    #[test]
+    fn a_release_feed_read_for_its_own_version_serves_that_build() {
+        let json = r#"{"version":"v2.0.0","platforms":{
+            "darwin-x86_64-app":{"url":"https://x/cortisoff-darwin-x86_64.zip","signature":" app "},
+            "darwin-aarch64-app":{"url":"http://x/cortisoff-darwin-aarch64.zip","signature":"app"}}}"#;
+        // The same version is what this asks for, not an update.
+        let app = pick_exact(json, "2.0.0", "darwin-x86_64-app").unwrap();
+        assert_eq!(app.version, "2.0.0");
+        assert_eq!(app.signature, "app");
+        assert_eq!(app.client, None);
+        assert!(pick_exact(json, "2.0.1", "darwin-x86_64-app")
+            .unwrap_err()
+            .contains("describes 2.0.0"));
+        assert!(pick_exact(json, "2.0.0", "darwin-x86_64").is_err());
+        assert!(pick_exact(json, "2.0.0", "darwin-aarch64-app")
+            .unwrap_err()
+            .contains("non-https"));
     }
 
     #[test]

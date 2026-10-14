@@ -229,7 +229,7 @@ impl WinHost {
 
     /// Machine facts the user should know that are not failures. The doctor
     /// prints these next to the capability list.
-    pub fn warnings(&self) -> Vec<String> {
+    fn machine_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.color_temp.is_some() && !crate::screen::gamma_range_unlocked() {
             out.push(
@@ -642,6 +642,10 @@ impl WinHost {
 }
 
 impl Host for WinHost {
+    fn warnings(&self) -> Vec<String> {
+        self.machine_warnings()
+    }
+
     fn monotonic_ms(&self) -> u64 {
         // SAFETY: no argument, no failure mode.
         unsafe { GetTickCount64() }

@@ -815,7 +815,14 @@ impl<J: JournalStore> Supervisor<J> {
             capabilities,
             plugins: self.plugins(),
             journal_dirty,
-            warnings: self.warnings.clone(),
+            // The host's own are asked now: macOS gives a permission while
+            // the daemon runs, and the warning goes with it.
+            warnings: self
+                .warnings
+                .iter()
+                .cloned()
+                .chain(host.warnings())
+                .collect(),
         }
     }
 }
@@ -878,6 +885,24 @@ mod tests {
             .with_actuator(ids::DISPLAY_COLOR_TEMP, Value::Int(6500), false);
         host.now_ms = 10_000;
         host
+    }
+
+    #[test]
+    fn the_doctor_asks_the_host_for_its_warnings_each_time() {
+        let mut host = host();
+        host.warnings = vec!["no Accessibility permission".to_owned()];
+        let mut s = supervisor(&host, Vec::new());
+        s.warn("the journal could not be read");
+        assert_eq!(
+            s.doctor(&host).warnings,
+            [
+                "the journal could not be read",
+                "no Accessibility permission"
+            ]
+        );
+        // Granted while the daemon runs: gone from the next doctor.
+        host.warnings.clear();
+        assert_eq!(s.doctor(&host).warnings, ["the journal could not be read"]);
     }
 
     const GAME: &str = "return {

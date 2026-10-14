@@ -173,7 +173,7 @@ impl MacHost {
 
     /// Machine facts the user should know that are not failures: the two
     /// permissions macOS gates parts of this host behind.
-    pub fn warnings(&self) -> Vec<String> {
+    fn machine_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !ax::trusted() {
             out.push(
@@ -499,6 +499,10 @@ impl MacHost {
 }
 
 impl Host for MacHost {
+    fn warnings(&self) -> Vec<String> {
+        self.machine_warnings()
+    }
+
     fn probe(&self) -> CapabilitySet {
         let id = CapabilityId::new;
         let set = CapabilitySet::new()
