@@ -16,8 +16,9 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 /// whether it now is. `false` off the main thread, where `NSApplication` may
 /// not be touched, or when macOS kept another policy.
 ///
-/// The policy the process ends with decides, not the setter's answer: the
-/// setter has said NO on a CI runner.
+/// The policy the process ends with decides, not the setter's answer: an
+/// unbundled binary starts out prohibited, and the setter says NO to a
+/// policy the process already has.
 pub fn background_only() -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
         return false;

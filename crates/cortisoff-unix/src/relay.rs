@@ -94,27 +94,42 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::time::Instant;
 
-    fn run(script: &str) -> std::process::Child {
-        Command::new("sh")
-            .args(["-c", script])
+    /// A worker that says `ready` once `script` has set itself up, then
+    /// sleeps.
+    fn run(script: &str) -> Child {
+        let mut child = Command::new("sh")
+            .args(["-c", &format!("{script} echo ready; exec sleep 30")])
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .process_group(0)
             .spawn()
-            .expect("sh starts")
+            .expect("sh starts");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        child
     }
 
-    /// The pass-on itself, without raising a signal in the test process:
-    /// the signal flag and the waker are process-wide, and `console`'s own
-    /// test owns them.
+    /// The worker's pid set directly, not through `track`: `track` passes on
+    /// a stop already requested, and `console`'s test raises one in this
+    /// process while it runs. That test owns the flag and the waker; these
+    /// test the pass-on alone.
+    fn tracking(relay: &Relay, worker: &Child) {
+        relay.child.store(worker.id() as i32, Ordering::SeqCst);
+    }
+
     #[test]
     fn a_relayed_stop_ends_the_worker_with_sigterm() {
         let relay = Relay::new(Duration::from_secs(5));
-        let mut worker = run("exec sleep 30");
-        relay.track(worker.id());
+        let mut worker = run("");
+        tracking(&relay, &worker);
         let began = Instant::now();
         relay.forward();
         let status = worker.wait().unwrap();
@@ -129,10 +144,8 @@ mod tests {
     #[test]
     fn a_worker_that_ignores_sigterm_is_killed_after_the_grace() {
         let relay = Relay::new(Duration::from_millis(200));
-        let mut worker = run("trap '' TERM; exec sleep 30");
-        relay.track(worker.id());
-        // Give `sh` time to install the trap before the signal lands.
-        std::thread::sleep(Duration::from_millis(200));
+        let mut worker = run("trap '' TERM;");
+        tracking(&relay, &worker);
         relay.forward();
         let status = worker.wait().unwrap();
         relay.untrack();
@@ -143,7 +156,7 @@ mod tests {
     fn nothing_is_signalled_with_no_worker() {
         let relay = Relay::new(Duration::from_millis(1));
         relay.forward();
-        relay.track(0);
+        relay.untrack();
         relay.forward();
     }
 }
