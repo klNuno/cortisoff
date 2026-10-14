@@ -163,6 +163,22 @@ mod tests {
     use super::*;
     use crate::scratch::Scratch;
     use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+
+    /// [`claim_at`] on a lock this process just let go of. A test running
+    /// beside this one may be starting a process, and until that process
+    /// execs it shares every descriptor, close-on-exec ones included, so the
+    /// lock lives a moment longer than its drop.
+    fn claim_soon(path: &Path) -> Option<InstanceLock> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let lock = claim_at(path);
+            if lock.is_some() || Instant::now() >= deadline {
+                return lock;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn a_second_claim_is_refused_while_the_first_lives() {
@@ -174,7 +190,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
 
         drop(first);
-        assert!(claim_at(&path).is_some(), "claim free again once dropped");
+        assert!(claim_soon(&path).is_some(), "claim free again once dropped");
     }
 
     #[test]
@@ -185,7 +201,7 @@ mod tests {
         let path = scratch.join("dashboard.lock");
         assert!(!signal_holder(&path), "a free lock has no holder");
 
-        let held = claim_at(&path).expect("claim");
+        let held = claim_soon(&path).expect("claim");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             std::process::id().to_string()
