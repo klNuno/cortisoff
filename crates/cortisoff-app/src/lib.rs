@@ -260,8 +260,19 @@ pub fn register() -> Result<(), String> {
     Ok(())
 }
 
-/// `--uninstall`, and the button on the settings page: stop the daemon, stop
-/// starting it at login, remove the app. Plugins and settings stay.
+/// `--uninstall` from outside the window (Settings > Apps, a terminal): close
+/// the open window first, then [`uninstall`]. Left open, the window keeps
+/// running from the app this removes, says the daemon is not running as if it
+/// could be started again, and on Windows holds the executable the removal
+/// waits to delete.
+pub fn uninstall_command() -> Result<(), String> {
+    close_window();
+    uninstall()
+}
+
+/// The button on the settings page, and `--uninstall` once the window is
+/// closed: stop the daemon, stop starting it at login, remove the app.
+/// Plugins and settings stay.
 pub fn uninstall() -> Result<(), String> {
     stop_daemon();
     let mut problems = Vec::new();
@@ -323,6 +334,22 @@ fn raise_window() {
     #[cfg(windows)]
     {
         cortisoff_win::raise_dashboard();
+    }
+}
+
+/// Ask the open window to close and wait, five seconds at most, until its
+/// lock is free, which is when its process has gone.
+fn close_window() {
+    #[cfg(windows)]
+    let asked = cortisoff_win::close_dashboard();
+    #[cfg(unix)]
+    let asked = cortisoff_unix::close_dashboard();
+    if !asked {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while claim_window(Duration::ZERO).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

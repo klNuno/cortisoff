@@ -23,7 +23,7 @@ mod startup;
 pub use clock::{local_time, time_of_day_event};
 pub use console::{request_stop, stop_requested, watch_for_stop};
 pub use paths::socket_path;
-pub use process::{claim_dashboard, claim_session, efficiency_mode, InstanceLock};
+pub use process::{claim_dashboard, claim_session, close_dashboard, efficiency_mode, InstanceLock};
 pub use ready::wait_for_daemon;
 pub use relay::Relay;
 pub use socket::{ask, connect, Client, Incoming, SocketServer};

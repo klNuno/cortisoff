@@ -32,7 +32,7 @@ fn main() -> ExitCode {
             }
             cortisoff_daemon::Options::parse(rest).and_then(cortisoff_daemon::run)
         }
-        Some("--uninstall") => cortisoff_app::uninstall(),
+        Some("--uninstall") => cortisoff_app::uninstall_command(),
         Some("--version" | "-V") => {
             console();
             println!("cortisoff {}", env!("CARGO_PKG_VERSION"));
