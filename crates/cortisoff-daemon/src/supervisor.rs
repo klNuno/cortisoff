@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cortisoff_core::{priority, CapTable, Claims, OwnerId, FADE_TIMER, PREVIEW_FADE_MS};
+use cortisoff_core::{fadeable, priority, CapTable, Claims, OwnerId, FADE_TIMER, PREVIEW_FADE_MS};
 use cortisoff_host::{
     Action, ActuatorError, CapIndex, CapabilityId, CapabilitySet, Dispatcher, Event, Host,
     JournalStore, LogLevel, TimerId, Value,
@@ -259,12 +259,15 @@ impl<J: JournalStore> Supervisor<J> {
         self.run(host, actions);
     }
 
-    /// Where a capability goes once nobody holds it: the baseline captured
-    /// before the first apply, which is exactly what the restore puts back.
-    /// The actuator's own idea of rest before anything was applied.
+    /// Where a release fades to once nobody holds the capability: the
+    /// baseline captured before the first apply when it is a number, the
+    /// actuator's own idea of rest otherwise. A colour temperature captures
+    /// its gamma ramps, which no fade can travel to, so it fades to 6600 K
+    /// and the restore at the end puts the ramps themselves back.
     fn baseline(&self, host: &dyn Host, cap: &CapabilityId) -> Option<Value> {
         self.dispatcher
             .baseline(cap)
+            .filter(|v| fadeable(v, v))
             .cloned()
             .or_else(|| rest_of(host, cap))
     }
@@ -939,6 +942,56 @@ mod tests {
             sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
         }
         assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(6500)));
+        assert!(sup.plugins()[0].holds.is_empty());
+    }
+
+    #[test]
+    fn a_release_fades_even_when_the_baseline_is_no_number() {
+        // A colour temperature captures its gamma ramps. The release still
+        // travels to where the screen rests, then the ramps go back. The
+        // plugin lets go on every clock event, as Night light does after its
+        // morning edge, and every fade frame brings one.
+        let mut host = MockHost::new().with_opaque_actuator(
+            ids::DISPLAY_COLOR_TEMP,
+            Value::Text("ramps".to_owned()),
+            Value::Int(6600),
+        );
+        host.now_ms = 10_000;
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "warm",
+                "return {
+                   start = function(cx) cx:watch('clock') cx:claim('display.color_temp', 3200) end,
+                   on = function(cx) cx:release('display.color_temp', { fade = 1000 }) end,
+                 }",
+            )],
+        );
+        sup.start(&mut host);
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
+        let clock = Event::TimeOfDay {
+            minute: 420,
+            second: 0,
+            millisecond: 0,
+        };
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            sup.handle(&mut host, clock.clone());
+            host.now_ms += 40;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+            if let Some(Value::Int(k)) = host.value(ids::DISPLAY_COLOR_TEMP) {
+                seen.push(k);
+            }
+        }
+        assert!(
+            seen.iter().any(|k| *k > 3300 && *k < 6500),
+            "passes through the middle: {seen:?}"
+        );
+        assert!(host
+            .trace()
+            .events()
+            .iter()
+            .any(|e| e == "apply display.color_temp Text(\"ramps\")"));
         assert!(sup.plugins()[0].holds.is_empty());
     }
 

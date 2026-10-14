@@ -177,6 +177,17 @@ impl Claims {
         now: u64,
         rest: Option<&Value>,
     ) -> Vec<Action> {
+        // Asked again to let go while already on the way out: a plugin that
+        // releases on every clock event must not restart its own fade each
+        // time, or it never leaves its claimed value. A way out that ends
+        // sooner (a fullscreen game during the morning fade) still takes over.
+        if fade_ms > 0
+            && self.fades.iter().any(|f| {
+                f.cap == cap && f.owner == owner && f.release && f.start + f.length <= now + fade_ms
+            })
+        {
+            return Vec::new();
+        }
         self.fades.retain(|f| !(f.cap == cap && f.owner == owner));
         let mut out = Vec::new();
         let Some(held) = self.arbiter.held(cap, owner).cloned() else {
@@ -389,6 +400,43 @@ mod tests {
             cap: CapabilityId::new(TEMP)
         }));
         assert!(c.arbiter().holder(i).is_none());
+    }
+
+    #[test]
+    fn releasing_again_on_the_way_out_keeps_the_fade_going() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
+        c.release(i, P, 1000, 0, Some(&rest));
+        // Every frame, as a plugin watching the clock does.
+        assert!(c.release(i, P, 1000, 250, Some(&rest)).is_empty());
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
+        assert!(c.release(i, P, 1000, 500, Some(&rest)).is_empty());
+        let out = c.tick(1000);
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
+    }
+
+    #[test]
+    fn a_quicker_way_out_takes_over_a_slow_release() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
+        c.release(i, P, 300_000, 0, Some(&rest));
+        c.tick(1000);
+        c.release(i, P, 1000, 1000, Some(&rest));
+        let out = c.tick(2000);
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
+        // And a release with no fade at all is immediate.
+        c.claim(i, P, 0, Value::Int(3200), 0, 3000, Some(&rest));
+        c.release(i, P, 300_000, 3000, Some(&rest));
+        let out = c.release(i, P, 0, 3100, Some(&rest));
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
     }
 
     #[test]
