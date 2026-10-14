@@ -3,7 +3,7 @@
 //! Compiled for this crate's own tests and for dependents that enable the
 //! `test-util` feature. Never part of a shipping binary.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -48,6 +48,10 @@ pub struct MockActuator {
     /// applying it puts the second back on the screen, and `rest` is the
     /// second.
     opaque: Option<(Value, Value)>,
+    /// The host's clock, which a slow capture moves on.
+    clock: Rc<Cell<u64>>,
+    /// How long `capture` takes, as reading a panel over DDC/CI does.
+    capture_ms: Cell<u64>,
 }
 
 impl Actuator for MockActuator {
@@ -57,6 +61,7 @@ impl Actuator for MockActuator {
 
     fn capture(&self) -> Result<Value, ActuatorError> {
         self.trace.push(format!("capture {}", self.id));
+        self.clock.set(self.clock.get() + self.capture_ms.get());
         match &self.opaque {
             Some((baseline, _)) => Ok(baseline.clone()),
             None => Ok(self.state.borrow().clone()),
@@ -182,6 +187,8 @@ pub struct MockHost {
     sources: Vec<CapabilityId>,
     pub installed: Vec<CapabilityId>,
     pub active: bool,
+    /// What `set_fading` said last.
+    pub fading: bool,
     pub idle_thresholds: Vec<u32>,
     pub timers: Vec<(TimerId, Duration, Duration)>,
     pub cancelled: Vec<TimerId>,
@@ -199,6 +206,8 @@ pub struct MockHost {
     pub clipboard_text: String,
     pub open_windows: Vec<WindowInfo>,
     trace: Trace,
+    /// Time the actuators took, added to `now_ms`.
+    spent: Rc<Cell<u64>>,
 }
 
 impl MockHost {
@@ -229,6 +238,8 @@ impl MockHost {
                 trace: self.trace.clone(),
                 grown: RefCell::new(None),
                 opaque: None,
+                clock: self.spent.clone(),
+                capture_ms: Cell::new(0),
             },
         );
         self
@@ -247,6 +258,8 @@ impl MockHost {
                 trace: self.trace.clone(),
                 grown: RefCell::new(None),
                 opaque: Some((baseline, rest)),
+                clock: self.spent.clone(),
+                capture_ms: Cell::new(0),
             },
         );
         self
@@ -258,6 +271,14 @@ impl MockHost {
     pub fn grow_baseline(&self, id: &str, baseline: Value) {
         if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
             *actuator.grown.borrow_mut() = Some(baseline);
+        }
+    }
+
+    /// Capturing this actuator's baseline takes `ms` off the host's clock,
+    /// as reading a panel over DDC/CI does.
+    pub fn slow_capture(&self, id: &str, ms: u64) {
+        if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
+            actuator.capture_ms.set(ms);
         }
     }
 
@@ -280,6 +301,9 @@ impl Host for MockHost {
     }
     fn set_active(&mut self, active: bool) {
         self.active = active;
+    }
+    fn set_fading(&mut self, on: bool) {
+        self.fading = on;
     }
     fn probe(&self) -> CapabilitySet {
         self.actuators
@@ -318,7 +342,7 @@ impl Host for MockHost {
     }
 
     fn monotonic_ms(&self) -> u64 {
-        self.now_ms
+        self.now_ms + self.spent.get()
     }
 
     fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
