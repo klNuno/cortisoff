@@ -2,6 +2,7 @@
 //! the scheduler is concerned. The window borrows the once-per-session part.
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -38,11 +39,38 @@ fn claim(role: &str) -> Option<InstanceLock> {
     claim_at(&layout.lock(role))
 }
 
-/// An exclusive `flock` on `path`, never waited for. `flock` belongs to the
-/// open file, not to the process, so a second claim from the same process is
+/// Ask the open window to quit, for `--uninstall` run from a terminal: left
+/// open, it keeps running from the app the removal deletes and says the
+/// daemon is not running, as if it could simply be started again. The window
+/// has no handler for SIGTERM, so it ends at once and its lock with it.
+/// `false` when no window holds the lock.
+pub fn close_dashboard() -> bool {
+    let path = paths::layout().lock("dashboard");
+    signal_holder(&path)
+}
+
+fn signal_holder(path: &Path) -> bool {
+    if claim_at(path).is_some() {
+        return false;
+    }
+    let pid = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<libc::pid_t>().ok());
+    match pid {
+        // SAFETY: plain integer arguments.
+        Some(pid) if pid > 1 && pid as u32 != std::process::id() => unsafe {
+            libc::kill(pid, libc::SIGTERM) == 0
+        },
+        _ => false,
+    }
+}
+
+/// An exclusive `flock` on `path`, never waited for, with the holder's pid
+/// written in the file for [`close_dashboard`]. `flock` belongs to the open
+/// file, not to the process, so a second claim from the same process is
 /// refused just like one from another.
 pub(crate) fn claim_at(path: &Path) -> Option<InstanceLock> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -52,7 +80,14 @@ pub(crate) fn claim_at(path: &Path) -> Option<InstanceLock> {
         .ok()?;
     // SAFETY: the descriptor is open for as long as `file` lives.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    locked.then_some(InstanceLock { _file: file })
+    if !locked {
+        return None;
+    }
+    // Only the holder writes, and only once it holds the lock.
+    if file.set_len(0).is_ok() {
+        let _ = file.write_all(std::process::id().to_string().as_bytes());
+    }
+    Some(InstanceLock { _file: file })
 }
 
 /// The unix stand-in for EcoQoS: nice 10, so anything a person is doing goes
@@ -128,6 +163,22 @@ mod tests {
     use super::*;
     use crate::scratch::Scratch;
     use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+
+    /// [`claim_at`] on a lock this process just let go of. A test running
+    /// beside this one may be starting a process, and until that process
+    /// execs it shares every descriptor, close-on-exec ones included, so the
+    /// lock lives a moment longer than its drop.
+    fn claim_soon(path: &Path) -> Option<InstanceLock> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let lock = claim_at(path);
+            if lock.is_some() || Instant::now() >= deadline {
+                return lock;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn a_second_claim_is_refused_while_the_first_lives() {
@@ -139,7 +190,33 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
 
         drop(first);
-        assert!(claim_at(&path).is_some(), "claim free again once dropped");
+        assert!(claim_soon(&path).is_some(), "claim free again once dropped");
+    }
+
+    #[test]
+    fn the_lock_holder_is_asked_to_quit_and_nobody_else() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let scratch = Scratch::new("holder");
+        let path = scratch.join("dashboard.lock");
+        assert!(!signal_holder(&path), "a free lock has no holder");
+
+        let held = claim_soon(&path).expect("claim");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        assert!(!signal_holder(&path), "this process never signals itself");
+
+        // Another process as the holder: its pid in the file.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&path, child.id().to_string()).unwrap();
+        assert!(signal_holder(&path));
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        drop(held);
     }
 
     #[test]

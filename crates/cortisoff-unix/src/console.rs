@@ -1,5 +1,5 @@
-//! Stopping on SIGINT and SIGTERM, so the daemon puts the screen back before
-//! it dies.
+//! Stopping on SIGINT, SIGTERM and SIGHUP, so the daemon puts the screen
+//! back before it dies.
 //!
 //! The same contract as `cortisoff_win::console`: a flag the loop reads, and
 //! a wake so the loop reads it now. A signal handler may only call what is
@@ -10,8 +10,10 @@
 //! safe from a signal; the thread is what lets it reach a `Host::poll` that
 //! knows nothing about the pipe.
 //!
-//! SIGHUP is left alone on purpose. A daemon started with `nohup` asked to
-//! outlive its terminal, and catching SIGHUP would undo that.
+//! SIGHUP is a stop like the other two: a closed terminal or a session
+//! going away should hand the screen back, not cut it off. A daemon started
+//! with `nohup` finds SIGHUP already ignored, asked to outlive its terminal,
+//! and keeps it ignored.
 
 use std::fs::File;
 use std::io::Read;
@@ -30,8 +32,8 @@ static PIPE: AtomicI32 = AtomicI32::new(-1);
 /// thread and by `request_stop`.
 static WAKER: Mutex<Option<Waker>> = Mutex::new(None);
 
-/// Stop cleanly on SIGINT and SIGTERM, and hand back whether that is in
-/// place. `false` when the handlers or the pipe could not be set up, which
+/// Stop cleanly on SIGINT, SIGTERM and SIGHUP, and hand back whether that is
+/// in place. `false` when the handlers or the pipe could not be set up, which
 /// means the loop has to be interrupted some other way.
 pub fn watch_for_stop() -> bool {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
@@ -50,6 +52,8 @@ pub fn request_stop() {
     wake();
 }
 
+/// What a stop wakes, in place of the socket's waker: the guard has no
+/// socket and passes the stop on instead.
 pub(crate) fn set_waker(waker: Waker) {
     *WAKER.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker);
 }
@@ -82,7 +86,26 @@ fn install() -> bool {
     PIPE.store(write, Ordering::SeqCst);
     let interrupt = handle(libc::SIGINT);
     let terminate = handle(libc::SIGTERM);
-    interrupt && terminate
+    let hangup = ignored(libc::SIGHUP) || {
+        let caught = handle(libc::SIGHUP);
+        HANGUP.store(caught, Ordering::SeqCst);
+        caught
+    };
+    interrupt && terminate && hangup
+}
+
+/// Whether SIGHUP ends in a clean stop here. False when it was already
+/// ignored, as under `nohup`.
+static HANGUP: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process was started with `signal` ignored.
+fn ignored(signal: libc::c_int) -> bool {
+    // SAFETY: a null new action only reads the current one into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    }
 }
 
 /// Turn every byte the handler wrote into a call to the waker. Several
@@ -173,6 +196,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("SIGTERM woke the loop");
         assert!(stop_requested());
+
+        // A hangup is a stop too, unless this test runs under `nohup`.
+        if HANGUP.load(Ordering::SeqCst) {
+            STOP.store(false, Ordering::SeqCst);
+            // SAFETY: as above, for the SIGHUP handler.
+            assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+            woken
+                .recv_timeout(Duration::from_secs(5))
+                .expect("SIGHUP woke the loop");
+            assert!(stop_requested());
+        }
 
         STOP.store(false, Ordering::SeqCst);
         request_stop();

@@ -9,9 +9,9 @@
 //! cargo run -p cortisoff-app -- --daemon --doctor    # report and exit
 //! ```
 //!
-//! Ctrl-C hands every screen back before exiting. Killing it does not, which
-//! is what the journal is for: the next start restores before any plugin
-//! claims anything.
+//! Ctrl-C, SIGTERM and SIGHUP hand every screen back before exiting. Killing
+//! it does not, which is what the journal is for: the next start restores
+//! before any plugin claims anything.
 //!
 //! An installed release build also checks for updates (`updates.rs`) and,
 //! once a new build is in place, exits with [`RESTART`] for the guard to
@@ -145,6 +145,8 @@ pub fn starts_at_logon() -> bool {
 }
 
 pub fn run(args: Options) -> Result<(), String> {
+    // First, before anything reaches the window server.
+    platform::background_only();
     platform::attach_console();
     if let Some(mode) = &args.autostart {
         return autostart(mode);
@@ -380,7 +382,7 @@ pub fn run(args: Options) -> Result<(), String> {
         if asked {
             "a client asked it to stop, every screen handed back"
         } else {
-            "Ctrl-C or the tray icon, every screen handed back"
+            platform::STOPPED_BY
         },
     );
     Ok(())
@@ -412,13 +414,11 @@ fn watch_for_updates(
 
 /// Run the daemon as a second process and start it again if it crashes. See
 /// `guard.rs`. The guard ends the way the daemon did, so a refusal or a
-/// failed start still reads as a failure to whoever launched it.
+/// failed start still reads as a failure to whoever launched it. A guard
+/// asked to stop ends with 0 once its daemon is gone.
 fn guard(args: &Options, log: Option<&Path>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("could not find this program: {e}"))?;
-    // Ctrl-C in a terminal reaches the worker too, which restores the screens
-    // and ends. Left to the default handler the guard would die first, hand
-    // the shell back early and lose the worker's exit code.
-    let _ = platform::watch_for_stop();
+    let relay = platform::StopRelay::install();
     let status = crate::guard::supervise(
         || {
             std::process::Command::new(&exe)
@@ -428,8 +428,11 @@ fn guard(args: &Options, log: Option<&Path>) -> Result<(), String> {
                 .stdin(std::process::Stdio::null())
                 .spawn()
                 .and_then(|mut daemon| {
+                    relay.track(daemon.id());
                     platform::shed_memory();
-                    daemon.wait()
+                    let status = daemon.wait();
+                    relay.untrack();
+                    status
                 })
         },
         |line| {
@@ -438,8 +441,9 @@ fn guard(args: &Options, log: Option<&Path>) -> Result<(), String> {
             }
         },
         Duration::from_secs(2),
+        || relay.stopped(),
     )?;
-    if status.success() {
+    if relay.stopped() || status.success() {
         Ok(())
     } else {
         // The daemon has already said why, on the same console and in the
@@ -654,6 +658,34 @@ mod platform {
     pub fn stop_requested() -> bool {
         cortisoff_win::stop_requested()
     }
+
+    /// Only the console and the tray stop a daemon here.
+    pub const STOPPED_BY: &str = "Ctrl-C or the tray icon, every screen handed back";
+
+    /// No Dock to stay out of.
+    pub fn background_only() {}
+
+    /// Ctrl-C in a console reaches the worker too, which restores the
+    /// screens and ends. Left to the default handler the guard would die
+    /// first, hand the shell back early and lose the worker's exit code.
+    /// Nothing else signals the guard alone here, so there is nothing to
+    /// pass on.
+    pub struct StopRelay;
+
+    impl StopRelay {
+        pub fn install() -> Self {
+            let _ = watch_for_stop();
+            Self
+        }
+
+        pub fn track(&self, _pid: u32) {}
+
+        pub fn untrack(&self) {}
+
+        pub fn stopped(&self) -> bool {
+            false
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -803,6 +835,49 @@ mod platform {
 
     pub fn stop_requested() -> bool {
         cortisoff_unix::stop_requested()
+    }
+
+    /// A signal is the only stop here that is not a client's: there is no
+    /// tray, and Ctrl-C is one signal among the others.
+    pub const STOPPED_BY: &str = "stop signal, every screen handed back";
+
+    /// Out of the Dock and Cmd-Tab, and never sent loginwindow's quit event.
+    #[cfg(target_os = "macos")]
+    pub fn background_only() {
+        let _ = cortisoff_mac::background_only();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn background_only() {}
+
+    /// How long a worker gets to hand the screens back after the guard
+    /// passed a stop on, before it is killed. Well inside launchd's 20 s.
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// launchd, systemd and `kill` signal the guard alone. It passes the
+    /// stop on to the worker (see `cortisoff_unix::Relay`).
+    pub struct StopRelay(Option<cortisoff_unix::Relay>);
+
+    impl StopRelay {
+        pub fn install() -> Self {
+            Self(cortisoff_unix::Relay::install(GRACE))
+        }
+
+        pub fn track(&self, pid: u32) {
+            if let Some(relay) = &self.0 {
+                relay.track(pid);
+            }
+        }
+
+        pub fn untrack(&self) {
+            if let Some(relay) = &self.0 {
+                relay.untrack();
+            }
+        }
+
+        pub fn stopped(&self) -> bool {
+            self.0.as_ref().is_some_and(cortisoff_unix::Relay::stopped)
+        }
     }
 }
 

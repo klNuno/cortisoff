@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, FILETIME, HANDLE,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, FILETIME, HANDLE, LPARAM, WPARAM,
 };
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, K32EmptyWorkingSet, PROCESS_MEMORY_COUNTERS,
@@ -19,7 +19,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, IsIconic, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
 };
 
 /// Held for as long as this process is the session's daemon, or its dashboard.
@@ -66,6 +66,19 @@ pub fn raise_dashboard() -> bool {
         let _ = SetForegroundWindow(hwnd);
     }
     true
+}
+
+/// Ask the open dashboard to close, for `--uninstall` run from outside it
+/// (Settings > Apps): left open, the window holds the executable the removal
+/// is waiting to delete. `false` when no dashboard window is found.
+pub fn close_dashboard() -> bool {
+    let Ok(hwnd) = (unsafe { FindWindowW(w!("Window Class"), w!("cortisoff")) }) else {
+        return false;
+    };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
 fn claim(what: &str) -> Option<InstanceLock> {

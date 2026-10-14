@@ -873,6 +873,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
+ "libc",
  "minisign",
  "minisign-verify",
  "semver",

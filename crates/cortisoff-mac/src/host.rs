@@ -29,13 +29,14 @@ use objc2_foundation::{
     NSSystemClockDidChangeNotification, NSSystemTimeZoneDidChangeNotification,
 };
 
+use crate::activity::InputWatch;
 use crate::colortemp::ColorTemp;
 use crate::fit::{self, Fit};
 use crate::hotkeys::Hotkeys;
 use crate::mode::DisplayMode;
 use crate::runloop::{Raw, Shared};
 use crate::sources::{self, DisplayWatch, Observers, PowerWatch};
-use crate::timers::{idle_bucket, idle_poll_after, Beat, Timers};
+use crate::timers::{idle_bucket, idle_check_after, Beat, Return, Timers, LAYOUT_AFTER_MS};
 use crate::windows::{self, Placements, Window};
 use crate::{ax, clock, input, notify, screen};
 
@@ -76,6 +77,13 @@ pub struct MacHost {
     _clock_observers: Observers,
     focus_observers: Observers,
     lock_observers: Observers,
+    /// The layout switch, watched while a hotkey is registered.
+    layout_observers: Observers,
+    /// The activity tap, on only while the user is away.
+    input_watch: Option<InputWatch>,
+    /// WindowServer refused the tap during this absence; asked again at the
+    /// next one.
+    input_refused: bool,
     display_watch: Option<DisplayWatch>,
     power_watch: Option<PowerWatch>,
     power_watched: bool,
@@ -138,6 +146,9 @@ impl MacHost {
                 _clock_observers: clock_observers,
                 focus_observers: Observers::default(),
                 lock_observers: Observers::default(),
+                layout_observers: Observers::default(),
+                input_watch: None,
+                input_refused: false,
                 display_watch,
                 power_watch: None,
                 power_watched: false,
@@ -212,30 +223,31 @@ impl MacHost {
     /// Seconds since the last input, or zero while something holds the
     /// screen: a film or a game played with a controller is not an absent
     /// user. The fit is only read once a threshold is reached, so the common
-    /// case costs one call.
-    fn away_seconds(&self) -> u32 {
+    /// case costs one call. The flag says the screen was what held it.
+    fn away_seconds(&self) -> (u32, bool) {
         let seconds = CGEventSource::seconds_since_last_event_type(
             CGEventSourceStateID::CombinedSessionState,
             ANY_INPUT,
         );
         if !seconds.is_finite() || seconds < 1.0 {
-            return 0;
+            return (0, false);
         }
         let seconds = seconds.min(f64::from(u32::MAX)) as u32;
         if idle_bucket(seconds, &self.idle_thresholds) > 0
             && self.front_fit(&windows::on_screen()).fullscreen
         {
-            return 0;
+            return (0, true);
         }
-        seconds
+        (seconds, false)
     }
 
     fn sample_idle(&mut self) -> Event {
-        let seconds = self.away_seconds();
+        let (seconds, held) = self.away_seconds();
         self.idle = u64::from(seconds) >= self.idle_after.as_secs();
         self.idle_seconds = idle_bucket(seconds, &self.idle_thresholds);
         if self.idle_watched {
-            self.arm_idle_at(seconds);
+            self.watch_return(self.idle_seconds > 0);
+            self.arm_idle_at(seconds, held);
         }
         Event::Idle {
             idle: self.idle,
@@ -243,9 +255,49 @@ impl MacHost {
         }
     }
 
-    fn arm_idle_at(&mut self, seconds: u32) {
-        let after = Duration::from_secs(u64::from(idle_poll_after(seconds, &self.idle_thresholds)));
-        self.arm(Beat::Idle, after, Duration::from_millis(100));
+    /// The activity tap goes in when an absence starts and out when it ends,
+    /// so a user at the keyboard costs no tap at all.
+    fn watch_return(&mut self, away: bool) {
+        if !away {
+            self.input_watch = None;
+            self.input_refused = false;
+            return;
+        }
+        if self.input_watch.is_none() && !self.input_refused {
+            self.input_watch = InputWatch::new(Arc::clone(&self.shared));
+            self.input_refused = self.input_watch.is_none();
+        }
+    }
+
+    fn arm_idle_at(&mut self, seconds: u32, held: bool) {
+        let back = match &self.input_watch {
+            Some(watch) if watch.sees_keys() => Return::Tap,
+            Some(_) => Return::MouseTap,
+            None => Return::Sampled,
+        };
+        let after = idle_check_after(seconds, &self.idle_thresholds, held, back);
+        self.arm(
+            Beat::Idle,
+            Duration::from_secs(u64::from(after)),
+            Duration::from_millis(100),
+        );
+    }
+
+    /// Hotkeys sit on key codes picked for the layout active when they were
+    /// registered, so a layout switch registers them again.
+    fn watch_layout(&mut self, on: bool) {
+        match (on, self.layout_observers.is_empty()) {
+            (true, true) => {
+                let center = NSDistributedNotificationCenter::defaultCenter().into_super();
+                let name = NSString::from_str(
+                    "com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged",
+                );
+                self.layout_observers
+                    .observe(center, &name, &self.shared, Raw::Layout);
+            }
+            (false, false) => self.layout_observers = Observers::default(),
+            _ => {}
+        }
     }
 
     /// Arm the next push of a display change, or stop once the last one in
@@ -355,6 +407,29 @@ impl MacHost {
             Raw::ClockMoved => vec![clock::time_of_day()],
             Raw::Power => self.power_event(),
             Raw::Hotkey(id) => vec![Event::Hotkey { id }],
+            // One input ends the absence; the tap has done its job.
+            Raw::Input => {
+                self.input_watch = None;
+                if !self.idle_watched {
+                    return Vec::new();
+                }
+                let before = (self.idle, self.idle_seconds);
+                let event = self.sample_idle();
+                if before == (self.idle, self.idle_seconds) {
+                    Vec::new()
+                } else {
+                    vec![event]
+                }
+            }
+            // Read on a later pass: see `LAYOUT_AFTER_MS`.
+            Raw::Layout => {
+                self.arm(
+                    Beat::Layout,
+                    Duration::from_millis(LAYOUT_AFTER_MS),
+                    Duration::ZERO,
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -400,6 +475,10 @@ impl MacHost {
                 }
                 self.arm(Beat::Power, POWER_EVERY, POWER_SLACK);
                 self.power_event()
+            }
+            Beat::Layout => {
+                self.hotkeys.follow_layout();
+                Vec::new()
             }
         }
     }
@@ -556,10 +635,11 @@ impl Host for MacHost {
 
             self.idle_watched = asked(ids::USER_IDLE);
             if self.idle_watched {
-                let seconds = self.away_seconds();
-                self.arm_idle_at(seconds);
+                let (seconds, held) = self.away_seconds();
+                self.arm_idle_at(seconds, held);
             } else {
                 self.timers.cancel(Beat::Idle);
+                self.input_watch = None;
             }
         });
         Ok(())
@@ -638,7 +718,11 @@ impl Host for MacHost {
     }
 
     fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
-        self.hotkeys.set(wanted)
+        autoreleasepool(|_| {
+            let refused = self.hotkeys.set(wanted);
+            self.watch_layout(self.hotkeys.active());
+            refused
+        })
     }
 
     fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {

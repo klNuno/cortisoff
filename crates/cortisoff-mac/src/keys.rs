@@ -2,21 +2,24 @@
 //! whichever API receives the chord.
 //!
 //! The codes are the `kVK_*` constants of `HIToolbox/Events.h`. A letter or a
-//! digit is a position on an ANSI keyboard, not a character: `kVK_ANSI_A` is
-//! the key left of S, which types Q on an AZERTY layout. Following the
-//! current layout needs `UCKeyTranslate` over the layout data, and is not
-//! written yet.
+//! digit there is a position on an ANSI keyboard, not a character:
+//! `kVK_ANSI_A` is the key left of S, which types Q on an AZERTY layout. So a
+//! letter or a digit goes through the active [`Layout`] first, and the ANSI
+//! position is only the answer for a character the layout does not type.
 
 use cortisoff_host::{Key, Mods, Named};
+
+use crate::layout::Layout;
 
 /// Why a key has no code here, worded for the plugin author who asked.
 pub const SYSTEM_KEY: &str =
     "macOS sends the volume and media keys as system events, not as key codes";
 
-/// The virtual key code for `key`, or `None` when macOS has none for it.
-pub fn code(key: Key) -> Option<u16> {
+/// The virtual key code for `key` on `layout`, or `None` when macOS has none
+/// for it. With no layout, letters and digits are US positions.
+pub fn code(key: Key, layout: Option<&Layout>) -> Option<u16> {
     match key {
-        Key::Char(c) => char_code(c),
+        Key::Char(c) => layout.and_then(|l| l.code(c)).or_else(|| char_code(c)),
         Key::F(n) => function_code(n),
         Key::Named(n) => named_code(n),
     }
@@ -196,21 +199,40 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn code_us(key: Key) -> Option<u16> {
+        code(key, None)
+    }
+
+    /// A layout that types Q on the US A key and A on the US Q key.
+    #[test]
+    fn a_letter_follows_the_layout_and_falls_back_to_its_us_position() {
+        let swapped = Layout::from_translate(|code, mods| match (code, mods) {
+            (0x00, 0) => Some('q'),
+            (0x0C, 0) => Some('a'),
+            _ => None,
+        });
+        assert_eq!(code(Key::Char('a'), Some(&swapped)), Some(0x0C));
+        assert_eq!(code(Key::Char('q'), Some(&swapped)), Some(0x00));
+        // Untouched by the layout: the US position.
+        assert_eq!(code(Key::Char('s'), Some(&swapped)), Some(0x01));
+        assert_eq!(code(Key::F(5), Some(&swapped)), Some(0x60));
+    }
+
     /// Spot checks against `Events.h`, one per block of the table, because a
     /// wrong entry presses a different key without any error.
     #[test]
     fn codes_match_the_header() {
-        assert_eq!(code(Key::Char('a')), Some(0x00));
-        assert_eq!(code(Key::Char('N')), Some(0x2D));
-        assert_eq!(code(Key::Char('5')), Some(0x17));
-        assert_eq!(code(Key::Char('0')), Some(0x1D));
-        assert_eq!(code(Key::F(1)), Some(0x7A));
-        assert_eq!(code(Key::F(12)), Some(0x6F));
-        assert_eq!(code(Key::F(20)), Some(0x5A));
-        assert_eq!(code(Key::Named(Named::Space)), Some(0x31));
-        assert_eq!(code(Key::Named(Named::Backspace)), Some(0x33));
-        assert_eq!(code(Key::Named(Named::Delete)), Some(0x75));
-        assert_eq!(code(Key::Named(Named::Up)), Some(0x7E));
+        assert_eq!(code_us(Key::Char('a')), Some(0x00));
+        assert_eq!(code_us(Key::Char('N')), Some(0x2D));
+        assert_eq!(code_us(Key::Char('5')), Some(0x17));
+        assert_eq!(code_us(Key::Char('0')), Some(0x1D));
+        assert_eq!(code_us(Key::F(1)), Some(0x7A));
+        assert_eq!(code_us(Key::F(12)), Some(0x6F));
+        assert_eq!(code_us(Key::F(20)), Some(0x5A));
+        assert_eq!(code_us(Key::Named(Named::Space)), Some(0x31));
+        assert_eq!(code_us(Key::Named(Named::Backspace)), Some(0x33));
+        assert_eq!(code_us(Key::Named(Named::Delete)), Some(0x75));
+        assert_eq!(code_us(Key::Named(Named::Up)), Some(0x7E));
     }
 
     /// Every letter and digit the chord parser accepts has a code, and no two
@@ -219,22 +241,22 @@ mod tests {
     fn every_letter_and_digit_has_its_own_code() {
         let mut seen = std::collections::HashSet::new();
         for c in ('a'..='z').chain('0'..='9') {
-            let code = code(Key::Char(c)).unwrap_or_else(|| panic!("{c} has no code"));
+            let code = code_us(Key::Char(c)).unwrap_or_else(|| panic!("{c} has no code"));
             assert!(seen.insert(code), "{c} shares code {code:#x}");
         }
         for n in 1..=20 {
-            let code = code(Key::F(n)).unwrap_or_else(|| panic!("f{n} has no code"));
+            let code = code_us(Key::F(n)).unwrap_or_else(|| panic!("f{n} has no code"));
             assert!(seen.insert(code), "f{n} shares code {code:#x}");
         }
     }
 
     #[test]
     fn keys_macos_does_not_have_are_refused_rather_than_guessed() {
-        assert_eq!(code(Key::F(21)), None);
-        assert_eq!(code(Key::F(24)), None);
-        assert_eq!(code(Key::Named(Named::VolumeUp)), None);
-        assert_eq!(code(Key::Named(Named::MediaPlayPause)), None);
-        assert_eq!(code(Key::Char('-')), None);
+        assert_eq!(code_us(Key::F(21)), None);
+        assert_eq!(code_us(Key::F(24)), None);
+        assert_eq!(code_us(Key::Named(Named::VolumeUp)), None);
+        assert_eq!(code_us(Key::Named(Named::MediaPlayPause)), None);
+        assert_eq!(code_us(Key::Char('-')), None);
     }
 
     #[test]

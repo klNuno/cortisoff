@@ -6,8 +6,10 @@
 //! What this machine can do is still probed at runtime, never decided here.
 #![cfg(target_os = "macos")]
 
+mod activity;
 pub mod autostart;
 mod ax;
+mod background;
 mod clock;
 mod color;
 mod colortemp;
@@ -16,6 +18,7 @@ mod host;
 mod hotkeys;
 mod input;
 mod keys;
+mod layout;
 mod mode;
 mod modes;
 mod notify;
@@ -25,4 +28,5 @@ mod sources;
 mod timers;
 mod windows;
 
+pub use background::background_only;
 pub use host::MacHost;

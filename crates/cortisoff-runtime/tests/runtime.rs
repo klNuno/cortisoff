@@ -375,6 +375,36 @@ fn a_plugin_for_another_system_does_not_start() {
     assert!(r.error.unwrap().contains("macos"));
 }
 
+#[test]
+fn enabling_a_plugin_for_another_system_is_refused_with_its_reason() {
+    let manifest = "id = \"w\"
+name = \"W\"
+version = \"1\"
+platforms = [\"windows\"]
+";
+    let mut p = plugin("w", "return {}");
+    p.manifest = Manifest::parse(manifest).unwrap();
+    let mut rig = Rig::new();
+    let mut rt = Runtime::new(vec![p], &Store::in_memory(), None).with_os("macos");
+    let refused = rig.with(|env| rt.set_enabled(env, "w", true)).unwrap_err();
+    assert_eq!(refused, "made for windows, not macos");
+    assert!(!rt.report("w").unwrap().enabled);
+    // Already on from an older build: still refused, and off still works.
+    let mut rt = Runtime::new(
+        vec![{
+            let mut p = plugin("w", "return {}");
+            p.manifest = Manifest::parse(manifest).unwrap();
+            p
+        }],
+        &on(&["w"]),
+        None,
+    )
+    .with_os("macos");
+    assert!(rig.with(|env| rt.set_enabled(env, "w", true)).is_err());
+    rig.with(|env| rt.set_enabled(env, "w", false)).unwrap();
+    assert!(!rt.report("w").unwrap().enabled);
+}
+
 fn night_light() -> Vec<Package> {
     cortisoff_runtime::builtin()
         .into_iter()

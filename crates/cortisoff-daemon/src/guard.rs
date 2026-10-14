@@ -8,6 +8,10 @@
 //! crashed is started again, and so is one that ends with [`RESTART`]: it
 //! has just put a new build in place of the executable.
 //!
+//! A stop sent to the guard itself (launchd at logout, `launchctl bootout`,
+//! systemd, `kill`) is passed on to the daemon on unix, and the daemon it
+//! ends is never started again, however it ended.
+//!
 //! The logon task used to cover crashes by trying to start the daemon every
 //! five minutes. It could not tell a crash from a stop, so every stop the user
 //! asked for was undone within five minutes.
@@ -29,7 +33,8 @@ pub const RESTART: i32 = 75;
 
 /// Run `start` until it ends without crashing, and hand back how it ended.
 /// `note` hears one line per crash, for the daemon's log. `pause` is the
-/// breath between a crash and the next start.
+/// breath between a crash and the next start. Once `stopped` says the guard
+/// was asked to stop, the daemon that ends is the last one.
 ///
 /// A daemon that ends with [`RESTART`] is started again at once: no note, no
 /// pause, and it does not count toward giving up. `start` runs the path it
@@ -38,11 +43,17 @@ pub fn supervise(
     mut start: impl FnMut() -> std::io::Result<ExitStatus>,
     mut note: impl FnMut(&str),
     pause: Duration,
+    stopped: impl Fn() -> bool,
 ) -> Result<ExitStatus, String> {
     let mut quick = 0;
     loop {
         let began = Instant::now();
         let status = start().map_err(|e| format!("could not start the daemon: {e}"))?;
+        // Ended by the stop the guard passed on, or by a crash on its way
+        // out: either way the user wanted it gone.
+        if stopped() {
+            return Ok(status);
+        }
         if status.code() == Some(RESTART) {
             continue;
         }
@@ -64,6 +75,9 @@ pub fn supervise(
         }
         note(&format!("the daemon crashed ({how}), starting it again"));
         std::thread::sleep(pause);
+        if stopped() {
+            return Ok(status);
+        }
     }
 }
 
@@ -84,8 +98,8 @@ pub fn crash(status: &ExitStatus) -> Option<String> {
         .then(|| format!("{code:#010X}"))
 }
 
-/// On unix a crash is a signal the process raised on itself; SIGTERM, SIGINT
-/// and SIGKILL come from someone who wanted it gone.
+/// On unix a crash is a signal the process raised on itself; SIGTERM, SIGINT,
+/// SIGHUP and SIGKILL come from someone who wanted it gone.
 #[cfg(unix)]
 pub fn crash(status: &ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
@@ -152,6 +166,7 @@ mod tests {
             },
             |line| notes.push(line.to_owned()),
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert!(status.success());
@@ -171,6 +186,7 @@ mod tests {
             },
             |line| notes.push(line.to_owned()),
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert!(!status.success());
@@ -190,6 +206,7 @@ mod tests {
                 },
                 |_| {},
                 Duration::ZERO,
+                || false,
             )
             .unwrap();
             assert_eq!(runs, 1, "exit {code}");
@@ -216,6 +233,7 @@ mod tests {
             },
             |line| notes.push(line.to_owned()),
             Duration::ZERO,
+            || false,
         )
         .unwrap();
         assert!(status.success());
@@ -225,6 +243,67 @@ mod tests {
             notes.iter().all(|n| n.contains("starting it again")),
             "{notes:?}"
         );
+    }
+
+    /// A stop passed on to the daemon may end it with a crash code, a kill
+    /// after the grace period or a clean exit: none is started again, and
+    /// neither is a crashed daemon whose pause the stop came in during.
+    #[test]
+    fn nothing_is_started_again_after_a_stop() {
+        for ended in [CRASHED, 0] {
+            let mut runs = 0;
+            let mut notes = Vec::new();
+            supervise(
+                || {
+                    runs += 1;
+                    ending(ended)
+                },
+                |line| notes.push(line.to_owned()),
+                Duration::ZERO,
+                || true,
+            )
+            .unwrap();
+            assert_eq!(runs, 1, "ended with {ended}");
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        let stop = std::cell::Cell::new(false);
+        let mut runs = 0;
+        supervise(
+            || {
+                runs += 1;
+                ending(CRASHED)
+            },
+            |_| stop.set(true),
+            Duration::ZERO,
+            || stop.get(),
+        )
+        .unwrap();
+        assert_eq!(runs, 1, "the stop came in during the pause");
+
+        let mut runs = 0;
+        supervise(
+            || {
+                runs += 1;
+                exiting(RESTART.into())
+            },
+            |_| {},
+            Duration::ZERO,
+            || true,
+        )
+        .unwrap();
+        assert_eq!(runs, 1, "a stop wins over an update restart");
+    }
+
+    /// Someone else's signal ends the daemon: a stop, not a crash.
+    #[cfg(unix)]
+    #[test]
+    fn stop_signals_are_not_crashes() {
+        for signal in [1, 2, 9, 15] {
+            let status = ending(signal).unwrap();
+            assert_eq!(crash(&status), None, "signal {signal}");
+        }
+        assert!(crash(&ending(CRASHED).unwrap()).is_some());
     }
 
     #[test]

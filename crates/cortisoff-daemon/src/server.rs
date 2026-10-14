@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cortisoff_host::{CapabilityId, Host, JournalStore};
+use cortisoff_host::{CapabilityId, Host, JournalStore, LogLevel};
 use cortisoff_ipc::{Frame, Notification, Request, RequestId, Response};
 
 use crate::supervisor::Supervisor;
@@ -59,8 +59,18 @@ impl<J: JournalStore> Server<J> {
         &mut self.updates
     }
 
-    /// What the update thread found, told to every subscriber.
+    /// What the update thread found, told to every subscriber. A warning
+    /// goes to the daemon's log only.
     pub fn found(&mut self, found: Found) {
+        if let Found::Warning(message) = found {
+            if self.log.len() < MAX_LOG {
+                self.log.push(Notification::Log {
+                    level: LogLevel::Warn,
+                    message: format!("update: {message}"),
+                });
+            }
+            return;
+        }
         self.updates.found(found);
         self.announce_updates();
     }
@@ -495,6 +505,20 @@ mod tests {
         };
         let out = server.on_frame(ClientId(1), frame, &mut host);
         assert!(matches!(responses(&out)[0], Response::Error { .. }));
+    }
+
+    #[test]
+    fn an_update_warning_goes_to_the_log_and_changes_nothing_else() {
+        let (mut server, _host) = setup();
+        let before = server.updates_mut().report().last;
+        server.found(Found::Warning("client refused".into()));
+        let log = server.drain_log();
+        assert!(log.iter().any(|n| matches!(
+            n,
+            Notification::Log { level: LogLevel::Warn, message } if message.contains("client refused")
+        )));
+        assert_eq!(server.updates_mut().report().last, before);
+        assert!(server.take_update().is_none());
     }
 
     fn staged(version: &str) -> Found {

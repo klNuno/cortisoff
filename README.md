@@ -45,7 +45,15 @@ It works on X11, and on GNOME under Wayland. There the night light goes through 
 
 ### macOS
 
-`cortisoff-darwin-aarch64` (Apple Silicon) and `cortisoff-darwin-x86_64` (Intel) are on the same release page. They are built and tested on every change but have not run on a real Mac yet, so please report what you find.
+macOS 11 or later:
+
+1. Download `cortisoff-darwin-aarch64.zip` (Apple Silicon) or `cortisoff-darwin-x86_64.zip` (Intel) from the same release page, and open it: it unpacks `Cortisoff.app`.
+2. Open `Cortisoff.app`. The app is not notarised, so macOS says it cannot check it: click Done, then in System Settings > Privacy & Security click Open Anyway next to Cortisoff.
+3. It copies itself to `~/Applications/Cortisoff.app` and starts with your session. The downloaded copy can go.
+
+Plugins that read window titles or send keys ask for Accessibility in System Settings > Privacy & Security. Every release is signed with the same certificate and updates replace the whole app, so macOS should keep that permission across updates. `cortisoff-cli` is inside the app, in `Cortisoff.app/Contents/MacOS`, and updates with it.
+
+The macOS build is built and tested on every change but has not run on a real Mac yet, so please report what you find.
 
 ### Updates
 

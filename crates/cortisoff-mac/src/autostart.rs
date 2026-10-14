@@ -2,7 +2,9 @@
 //!
 //! `~/Library/LaunchAgents/dev.mtsu.cortisoff.plist` with `RunAtLoad`, which
 //! launchd reads at the next login. Writing it needs no permission and no
-//! prompt, and removing it is the whole uninstall.
+//! prompt, and removing it is the whole uninstall. The path is the running
+//! executable's, which for an installed copy is inside
+//! `~/Applications/Cortisoff.app`, so the agent follows the per-user install.
 
 use std::path::{Path, PathBuf};
 
@@ -97,11 +99,11 @@ mod tests {
     #[test]
     fn the_agent_runs_the_daemon_at_login() {
         let text = plist(Path::new(
-            "/Applications/cortisoff.app/Contents/MacOS/cortisoff",
+            "/Users/u/Applications/Cortisoff.app/Contents/MacOS/cortisoff",
         ));
         assert!(text.contains("<string>dev.mtsu.cortisoff</string>"));
         assert!(text.contains(
-            "<array>\n\t\t<string>/Applications/cortisoff.app/Contents/MacOS/cortisoff</string>\n\t\t<string>--daemon</string>\n\t</array>"
+            "<array>\n\t\t<string>/Users/u/Applications/Cortisoff.app/Contents/MacOS/cortisoff</string>\n\t\t<string>--daemon</string>\n\t</array>"
         ));
         assert!(text.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist"));
