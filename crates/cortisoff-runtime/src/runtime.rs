@@ -326,14 +326,11 @@ impl Runtime {
             return Vec::new();
         }
         let id = slot.pkg.manifest.id.clone();
-        if !slot.pkg.manifest.supports(self.os) {
-            slot.error = Some(format!(
-                "made for {}, not {}",
-                slot.pkg.manifest.platforms.join(", "),
-                self.os
-            ));
+        if let Some(reason) = self.unsupported(i) {
+            self.slots[i].error = Some(reason);
             return vec![Command::Changed { id }];
         }
+        let slot = &mut self.slots[i];
         slot.stamp = slot.pkg.files.stamp();
         if let Err(e) = self.load(i) {
             let slot = &mut self.slots[i];
@@ -351,6 +348,18 @@ impl Runtime {
         let mut out = self.invoke(i, env, Call::Named("start"), None);
         out.push(Command::Changed { id });
         out
+    }
+
+    /// Why the plugin cannot run on this system, or `None` when it can.
+    fn unsupported(&self, i: usize) -> Option<String> {
+        let manifest = &self.slots[i].pkg.manifest;
+        (!manifest.supports(self.os)).then(|| {
+            format!(
+                "made for {}, not {}",
+                manifest.platforms.join(", "),
+                self.os
+            )
+        })
     }
 
     fn stop(&mut self, i: usize, env: &mut Env, fade_ms: u64) -> Vec<Command> {
@@ -669,6 +678,13 @@ impl Runtime {
         enabled: bool,
     ) -> Result<Vec<Command>, String> {
         let i = self.index(id)?;
+        // Refused before anything is stored: switched on, it would only sit
+        // in the list as on and not running. Switching it off stays allowed.
+        if enabled {
+            if let Some(reason) = self.unsupported(i) {
+                return Err(reason);
+            }
+        }
         if self.slots[i].enabled == enabled {
             return Ok(Vec::new());
         }
