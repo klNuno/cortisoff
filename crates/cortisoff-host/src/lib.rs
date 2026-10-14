@@ -57,6 +57,11 @@ pub trait Host {
     /// Update the activity indicator when a plugin is enabled or a manual claim is held.
     fn set_active(&mut self, _active: bool) {}
 
+    /// A fade started or ended: frames are due at screen rate until it ends,
+    /// and a platform that runs the daemon as background work lets it keep
+    /// up meanwhile.
+    fn set_fading(&mut self, _on: bool) {}
+
     /// Install only the sources named here. Anything absent must not be
     /// hooked, because an installed hook costs on every system-wide event.
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError>;

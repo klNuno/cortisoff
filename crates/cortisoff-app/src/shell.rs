@@ -21,6 +21,7 @@ use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, Frame, Layout, Margin, RichText, ScrollArea, Ui,
 };
 
+use crate::chrome;
 use crate::client::{Ask, Inbound, Link};
 
 /// What the main area shows.
@@ -36,6 +37,8 @@ pub enum View {
 /// A settings edit is sent once the pointer lets go and the keyboard rests
 /// this long, so a drag or a word typed is one write, not forty.
 const SETTLE: Duration = Duration::from_millis(300);
+/// The sidebar's margin on either side.
+const SIDEBAR_SIDE: f32 = 10.0;
 /// How long a notice stays up.
 const NOTICE_FOR: Duration = Duration::from_secs(6);
 /// Log lines kept for the overview.
@@ -197,15 +200,17 @@ impl Shell {
             .resizable(false)
             .exact_size(248.0)
             .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(theme::SIDEBAR)
-                    .inner_margin(Margin::symmetric(10, 14)),
-            )
+            .frame(Frame::new().fill(theme::SIDEBAR).inner_margin(Margin {
+                left: SIDEBAR_SIDE as i8,
+                right: SIDEBAR_SIDE as i8,
+                top: 0,
+                bottom: 14,
+            }))
             .show(ui, |ui| self.sidebar(ui, now));
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG))
             .show(ui, |ui| {
+                chrome::title_bar(ui);
                 ScrollArea::vertical()
                     .auto_shrink(false)
                     .id_salt(self.view.clone())
@@ -214,7 +219,7 @@ impl Shell {
                             .inner_margin(Margin {
                                 left: 32,
                                 right: 32,
-                                top: 26,
+                                top: 4,
                                 bottom: 32,
                             })
                             .show(ui, |ui| {
@@ -230,6 +235,7 @@ impl Shell {
                     });
             });
         self.notice(ui.ctx());
+        chrome::resize_edges(ui);
 
         // Status lines read the clock to the minute, so the page is drawn again
         // when the minute turns and not before. A pending edit has a deadline,
@@ -597,9 +603,13 @@ impl Shell {
     }
 
     fn sidebar(&mut self, ui: &mut Ui, now: f64) {
+        chrome::sidebar_band(ui, SIDEBAR_SIDE);
+        ui.add_space(chrome::SIDEBAR_TOP);
         ui.spacing_mut().item_spacing.y = 2.0;
         let busy = recent(self.starting) || recent(self.stopping);
-        if switch(ui, self.switched_on(), busy).clicked() {
+        let power = switch(ui, self.switched_on(), busy);
+        chrome::over_band(ui, power.rect);
+        if power.clicked() {
             self.toggle();
         }
         ui.add_space(10.0);
@@ -1769,7 +1779,7 @@ impl Shell {
             (
                 "wallpaper-pause",
                 true,
-                serde_json::json!({ "paused": true, "reason": "an app fills the screen" }),
+                serde_json::json!({ "paused": true, "reason": "nobody is at the machine" }),
             ),
             (
                 "shortcuts",
@@ -1815,8 +1825,8 @@ impl Shell {
                     pid: 4120,
                     started_at_ms: 0,
                 }),
-                fullscreen: true,
                 maximized: true,
+                idle: true,
                 minute_of_day: Some(21 * 60 + 12),
                 ..WorldReport::default()
             },
@@ -1848,7 +1858,7 @@ impl Shell {
         for (time, text) in [
             (
                 "21:12",
-                "Wallpaper pause paused the wallpaper: an app fills the screen",
+                "Wallpaper Engine pause paused the wallpaper: nobody is at the machine",
             ),
             ("21:12", "Display profiles holds vibrance 80 % for cs2.exe"),
             ("20:30", "Night light reached 3400 K"),

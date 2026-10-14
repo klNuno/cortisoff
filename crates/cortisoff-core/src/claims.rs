@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use cortisoff_host::{Action, CapIndex, CapabilityId, Event, TimerId, Value};
+use cortisoff_host::{ids, Action, CapIndex, CapabilityId, Event, TimerId, Value};
 
 use crate::arbiter::{Arbiter, OwnerId};
-use crate::blend::{blend, fadeable};
+use crate::blend::{blend_on, ease, fadeable, peak_rate, Curve, EASE_PEAK};
 use crate::table::CapTable;
 use crate::world::{Signals, World};
 
@@ -21,9 +21,11 @@ pub const FADE_TIMER: TimerId = TimerId(1);
 /// enough to read as a fade, short enough that the slider feels released.
 pub const PREVIEW_FADE_MS: u64 = 800;
 
-/// The shortest step between two frames of a fade. One frame at 25 Hz is
-/// smooth on a colour temperature and still costs nothing measurable.
-const FRAME_MS: u64 = 40;
+/// The shortest step between two frames of a fade, about 60 Hz. At 25 Hz a
+/// one second release crossed 3000 K in 25 visible jumps. 15 and not 16: a
+/// Windows timer fires on the system tick, 15.6 ms unless an app asked for
+/// finer, and 16 ms waited for the second tick, which made it 32 Hz.
+const FRAME_MS: u64 = 15;
 
 /// The longest. A fade of 100 K over an hour changes the screen every 36 s,
 /// and waking every 36 s for it is the point: no frame timer runs for a
@@ -37,6 +39,7 @@ struct Fade {
     priority: i32,
     from: Value,
     to: Value,
+    curve: Curve,
     start: u64,
     length: u64,
     /// The owner lets go at the end, and `to` is what lies underneath.
@@ -82,6 +85,24 @@ impl Claims {
     /// Whether `owner` is still on its way to the value it claimed.
     pub fn fading(&self, cap: CapIndex, owner: OwnerId) -> bool {
         self.fades.iter().any(|f| f.cap == cap && f.owner == owner)
+    }
+
+    /// Whether any fade is under way.
+    pub fn moving(&self) -> bool {
+        !self.fades.is_empty()
+    }
+
+    /// The fade `owner` started at `asked` runs from `now` instead. A claim's
+    /// first frame is applied before its fade moves, and a capability that
+    /// captures its baseline then can take a while: a colour temperature
+    /// reads every panel it drives over DDC/CI, half a second. Timed from the
+    /// request, the next frame would jump by that much of the fade.
+    pub fn begin_at(&mut self, cap: CapIndex, owner: OwnerId, asked: u64, now: u64) {
+        for f in &mut self.fades {
+            if f.cap == cap && f.owner == owner && !f.release && f.start == asked {
+                f.start = now;
+            }
+        }
     }
 
     /// Fold an event from the platform in. Returns which part of the world
@@ -151,6 +172,7 @@ impl Claims {
                     priority,
                     from,
                     to: value,
+                    curve: self.curve(cap),
                     start: now,
                     length: fade_ms,
                     release: false,
@@ -175,6 +197,17 @@ impl Claims {
         now: u64,
         rest: Option<&Value>,
     ) -> Vec<Action> {
+        // Asked again to let go while already on the way out: a plugin that
+        // releases on every clock event must not restart its own fade each
+        // time, or it never leaves its claimed value. A way out that ends
+        // sooner (a fullscreen game during the morning fade) still takes over.
+        if fade_ms > 0
+            && self.fades.iter().any(|f| {
+                f.cap == cap && f.owner == owner && f.release && f.start + f.length <= now + fade_ms
+            })
+        {
+            return Vec::new();
+        }
         self.fades.retain(|f| !(f.cap == cap && f.owner == owner));
         let mut out = Vec::new();
         let Some(held) = self.arbiter.held(cap, owner).cloned() else {
@@ -196,6 +229,7 @@ impl Claims {
                 priority,
                 from: held,
                 to,
+                curve: self.curve(cap),
                 start: now,
                 length: fade_ms,
                 release: true,
@@ -237,7 +271,7 @@ impl Claims {
                     out.extend(self.arbiter.claim(f.cap, f.owner, f.priority, f.to.clone()));
                 }
             } else {
-                let value = blend(&f.from, &f.to, s);
+                let value = blend_on(f.curve, &f.from, &f.to, ease(s));
                 out.extend(self.arbiter.claim(f.cap, f.owner, f.priority, value));
             }
         }
@@ -257,6 +291,15 @@ impl Claims {
         out
     }
 
+    /// A colour temperature fades in mireds, everything else in a line.
+    fn curve(&self, cap: CapIndex) -> Curve {
+        if self.arbiter.table().id(cap).as_str() == ids::DISPLAY_COLOR_TEMP {
+            Curve::Mired
+        } else {
+            Curve::Linear
+        }
+    }
+
     fn beneath(&self, cap: CapIndex, owner: OwnerId, rest: Option<&Value>) -> Option<Value> {
         self.arbiter
             .beneath(cap, owner)
@@ -265,8 +308,9 @@ impl Claims {
     }
 
     /// The next frame, or the end of frames. Only as often as some fade
-    /// actually changes the value: an integer fade of 3400 K over thirty
-    /// minutes needs a frame every half second, not every 40 ms.
+    /// actually changes the value at its steepest: an integer fade of 3400 K
+    /// over thirty minutes needs a frame every few hundred milliseconds, not
+    /// sixty a second.
     fn timer(&mut self) -> Option<Action> {
         if self.fades.is_empty() {
             if self.armed {
@@ -283,7 +327,10 @@ impl Claims {
             .fades
             .iter()
             .map(|f| match (&f.from, &f.to) {
-                (Value::Int(a), Value::Int(b)) if a != b => f.length / a.abs_diff(*b).max(1),
+                (Value::Int(a), Value::Int(b)) if a != b => {
+                    let peak = peak_rate(f.curve, *a as f64, *b as f64) * EASE_PEAK;
+                    (f.length as f64 / (a.abs_diff(*b) as f64 * peak)) as u64
+                }
                 _ => FRAME_MS,
             })
             .min()
@@ -292,7 +339,13 @@ impl Claims {
         Some(Action::SetTimer {
             id: FADE_TIMER,
             after: Duration::from_millis(step),
-            tolerance: Duration::from_millis(if step <= 100 { 10 } else { step / 4 }),
+            // No slack at frame rate: batched with other timers, a frame
+            // waits for a later tick and the fade drops to half its rate.
+            tolerance: Duration::from_millis(match step {
+                FRAME_MS => 0,
+                ..=100 => 10,
+                _ => step / 4,
+            }),
         })
     }
 }
@@ -340,7 +393,8 @@ mod tests {
         assert!(out
             .iter()
             .any(|a| matches!(a, Action::SetTimer { id, .. } if *id == FADE_TIMER)));
-        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4900)]);
+        // Half way in mireds, not in kelvin.
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
         let out = c.tick(1000);
         assert_eq!(applied(&out), vec![Value::Int(3200)]);
         // The timer that fired was the last one: nothing is armed again.
@@ -356,7 +410,7 @@ mod tests {
         c.tick(500);
         let out = c.claim(i, P, 0, Value::Int(6000), 1000, 500, Some(&rest));
         assert!(applied(&out).is_empty(), "{out:?}");
-        assert_eq!(applied(&c.tick(1000)), vec![Value::Int(5450)]);
+        assert_eq!(applied(&c.tick(1000)), vec![Value::Int(5016)]);
     }
 
     #[test]
@@ -366,12 +420,49 @@ mod tests {
         c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
         let out = c.release(i, P, 1000, 0, Some(&rest));
         assert!(applied(&out).is_empty());
-        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4900)]);
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
         let out = c.tick(1000);
         assert!(out.contains(&Action::RestoreBaseline {
             cap: CapabilityId::new(TEMP)
         }));
         assert!(c.arbiter().holder(i).is_none());
+    }
+
+    #[test]
+    fn releasing_again_on_the_way_out_keeps_the_fade_going() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
+        c.release(i, P, 1000, 0, Some(&rest));
+        // Every frame, as a plugin watching the clock does.
+        assert!(c.release(i, P, 1000, 250, Some(&rest)).is_empty());
+        assert_eq!(applied(&c.tick(500)), vec![Value::Int(4310)]);
+        assert!(c.release(i, P, 1000, 500, Some(&rest)).is_empty());
+        let out = c.tick(1000);
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
+    }
+
+    #[test]
+    fn a_quicker_way_out_takes_over_a_slow_release() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        c.claim(i, P, 0, Value::Int(3200), 0, 0, Some(&rest));
+        c.release(i, P, 300_000, 0, Some(&rest));
+        c.tick(1000);
+        c.release(i, P, 1000, 1000, Some(&rest));
+        let out = c.tick(2000);
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
+        // And a release with no fade at all is immediate.
+        c.claim(i, P, 0, Value::Int(3200), 0, 3000, Some(&rest));
+        c.release(i, P, 300_000, 3000, Some(&rest));
+        let out = c.release(i, P, 0, 3100, Some(&rest));
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(TEMP)
+        }));
     }
 
     #[test]
@@ -388,7 +479,7 @@ mod tests {
             None,
         );
         c.release(i, OwnerId::Preview, PREVIEW_FADE_MS, 0, None);
-        assert_eq!(applied(&c.tick(400)), vec![Value::Int(3000)]);
+        assert_eq!(applied(&c.tick(400)), vec![Value::Int(2667)]);
         assert_eq!(applied(&c.tick(800)), vec![Value::Int(4000)]);
         assert_eq!(c.arbiter().holder(i), Some(P));
     }
@@ -420,7 +511,21 @@ mod tests {
             Action::SetTimer { after, .. } => Some(*after),
             _ => None,
         });
-        assert_eq!(after, Some(Duration::from_millis(529)));
+        // 3400 K, twice as fast at the warm end and 1.5 times at the middle
+        // of the easing: a frame every 171 ms.
+        assert_eq!(after, Some(Duration::from_millis(171)));
+    }
+
+    #[test]
+    fn a_short_fade_runs_at_frame_rate_with_no_slack() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        let out = c.claim(i, P, 0, Value::Int(3200), 1000, 0, Some(&rest));
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::SetTimer { after, tolerance, .. }
+                if *after == Duration::from_millis(FRAME_MS) && tolerance.is_zero()
+        )));
     }
 
     #[test]

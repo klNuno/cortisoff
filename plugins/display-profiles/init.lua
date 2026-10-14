@@ -9,7 +9,7 @@ plugin.settings = {
   },
 }
 
-local MODE, VIBRANCE = "display.mode", "display.vibrance"
+local MODE, VIBRANCE, FOCUSED = "display.mode", "display.vibrance", "app.focus"
 -- Above other plugins: the app in front decides.
 local FOCUS = 100
 
@@ -47,6 +47,7 @@ local function apply(cx, s)
     problems = problems,
     can_mode = cx:has(MODE),
     can_vibrance = cx:has(VIBRANCE),
+    can_focus = cx:has(FOCUSED),
   })
 end
 
@@ -66,8 +67,14 @@ end
 
 -- ---- window ---------------------------------------------------------------
 
+-- A GNOME Wayland session tells no application which window is in front.
+local NO_FOCUS = "This session does not say which app is in front, so no profile can follow it."
+
 function plugin.status(s, st)
   st = st or {}
+  if st.can_focus == false then
+    return { line = "Cannot follow apps", detail = NO_FOCUS, state = "failed" }
+  end
   if st.problems and #st.problems > 0 then
     return { line = "Cannot apply", detail = st.problems[1], state = "failed" }
   end
@@ -83,7 +90,10 @@ end
 
 function plugin.page(ui, s, st)
   st = st or {}
-  if st.can_mode == false and st.can_vibrance == false then
+  if st.can_focus == false then
+    ui:card(nil, function(ui) ui:hint(NO_FOCUS) end)
+    ui:space(12)
+  elseif st.can_mode == false and st.can_vibrance == false then
     ui:card(nil, function(ui)
       ui:hint("This machine offers neither refresh rate nor vibrance control, so profiles do nothing here.")
     end)

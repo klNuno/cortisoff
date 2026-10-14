@@ -1,6 +1,6 @@
 id = "night-light"
 name = "Night light"
-version = "0.2.0"
+version = "0.3.0"
 description = "Warms the screen in the evening and gives it back in the morning."
 icon = "moon"
 # Gamma ramps exist on all three; DDC/CI and panel gain are per system.

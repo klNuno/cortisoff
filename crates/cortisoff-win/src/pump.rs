@@ -25,7 +25,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassW, SetCoalescableTimer, MSG,
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WINDOW_STYLE, WNDCLASSW, WS_EX_TOOLWINDOW,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, TIMERV_NO_COALESCING, WINDOW_STYLE, WNDCLASSW,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::audio::Audio;
@@ -121,7 +122,12 @@ pub struct WinHost {
     idle_seconds: u32,
     /// Last state pushed, so a beat that changes nothing pushes nothing.
     idle: bool,
+    /// Exclusive fullscreen or a presentation, from the shell.
     fullscreen: bool,
+    /// The focused window covers its whole monitor without being maximised.
+    borderless: bool,
+    /// What `app.fullscreen` last said: either of the two above.
+    any_fullscreen: bool,
     maximized: bool,
     on_battery: bool,
     audio_active: bool,
@@ -194,6 +200,8 @@ impl WinHost {
             idle_seconds: 0,
             idle: false,
             fullscreen: false,
+            borderless: false,
+            any_fullscreen: false,
             maximized: false,
             on_battery: false,
             audio_active: false,
@@ -225,7 +233,7 @@ impl WinHost {
         let mut out = Vec::new();
         if self.color_temp.is_some() && !crate::screen::gamma_range_unlocked() {
             out.push(
-                r"Windows refuses a gamma ramp below about 3400 K, so a warmer colour temperature is sent as the strongest ramp it accepts: 3200 K loses almost nothing, 2500 K looks like 3400 K. lifting the clamp is one registry value, HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange set to 256, admin once plus a reboot"
+                r"Windows refuses a gamma ramp below about 3400 K, so a warmer colour temperature keeps its red and green and stops its blue at half: 3000 K is close, 2000 K is a strong orange rather than candlelight. Lifting the clamp is one registry value, HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange set to 256, admin once plus a reboot"
                     .to_owned(),
             );
         }
@@ -284,7 +292,10 @@ impl WinHost {
         if seconds == 0 {
             return (0, false);
         }
-        (seconds, self.fullscreen_now() || self.audio.playing())
+        (
+            seconds,
+            self.fullscreen_now() || self.borderless || self.audio.playing(),
+        )
     }
 
     fn sample_idle(&mut self) -> Event {
@@ -386,14 +397,31 @@ impl WinHost {
         self.names.resolve(hwnd).map(Event::AppFocus)
     }
 
-    /// Whether the focused window fills its monitor, pushed only on a change.
-    fn maximized_event(&mut self, hwnd: HWND) -> Option<Event> {
-        let maximized = crate::maximized::covers_monitor(hwnd);
-        if maximized == self.maximized {
+    /// Whether the focused window fills its monitor, and whether anything is
+    /// fullscreen, each pushed only on a change.
+    fn fill_events(&mut self, hwnd: HWND) -> Vec<Event> {
+        let fill = crate::maximized::fill(hwnd);
+        let mut out = Vec::new();
+        if fill.maximized != self.maximized {
+            self.maximized = fill.maximized;
+            out.push(Event::Maximized {
+                maximized: fill.maximized,
+            });
+        }
+        self.borderless = fill.fullscreen;
+        out.extend(self.fullscreen_event());
+        out
+    }
+
+    /// `app.fullscreen`: exclusive, a presentation, or a borderless window
+    /// over its whole monitor. Only on a change.
+    fn fullscreen_event(&mut self) -> Option<Event> {
+        let any = self.fullscreen || self.borderless;
+        if any == self.any_fullscreen {
             return None;
         }
-        self.maximized = maximized;
-        Some(Event::Maximized { maximized })
+        self.any_fullscreen = any;
+        Some(Event::Fullscreen { exclusive: any })
     }
 
     /// Everything a plugin could already be told about, pushed before the first
@@ -403,10 +431,15 @@ impl WinHost {
         let idle_event = self.sample_idle();
         self.on_battery = crate::power::on_battery();
         self.audio_active = self.audio.playing();
+        let hwnd = unsafe { GetForegroundWindow() };
+        let fill = crate::maximized::fill(hwnd);
+        self.maximized = fill.maximized;
+        self.borderless = fill.fullscreen;
+        self.any_fullscreen = self.fullscreen || self.borderless;
         let mut out = vec![
             self.clock(),
             Event::Fullscreen {
-                exclusive: self.fullscreen,
+                exclusive: self.any_fullscreen,
             },
             idle_event,
             Event::SessionLock { locked: false },
@@ -417,8 +450,6 @@ impl WinHost {
                 active: self.audio_active,
             },
         ];
-        let hwnd = unsafe { GetForegroundWindow() };
-        self.maximized = crate::maximized::covers_monitor(hwnd);
         out.push(Event::Maximized {
             maximized: self.maximized,
         });
@@ -438,30 +469,26 @@ impl WinHost {
                     );
                 }
                 let mut out: Vec<Event> = self.foreground_event(hwnd).into_iter().collect();
-                out.extend(self.maximized_event(hwnd));
                 // Cheap one-shot read, and the moment it can change is exactly
                 // an application taking the screen.
-                let fullscreen = self.fullscreen_now();
-                if fullscreen != self.fullscreen {
-                    self.fullscreen = fullscreen;
-                    out.push(Event::Fullscreen {
-                        exclusive: fullscreen,
+                let exclusive = self.fullscreen_now();
+                let crossed = exclusive != self.fullscreen;
+                self.fullscreen = exclusive;
+                out.extend(self.fill_events(hwnd));
+                // The colour backend is chosen per apply, and exclusive
+                // fullscreen is where the magnifier stops reaching the
+                // screen. A tint held across that edge has to be pushed
+                // again through whichever backend works now.
+                if crossed && self.color_temp.is_some() {
+                    out.push(Event::Reapply {
+                        cap: CapabilityId::new(ids::DISPLAY_COLOR_TEMP),
                     });
-                    // The colour backend is chosen per apply, and exclusive
-                    // fullscreen is where the magnifier stops reaching the
-                    // screen. A tint held across that edge has to be pushed
-                    // again through whichever backend works now.
-                    if self.color_temp.is_some() {
-                        out.push(Event::Reapply {
-                            cap: CapabilityId::new(ids::DISPLAY_COLOR_TEMP),
-                        });
-                    }
                 }
                 out
             }
             Raw::Moved => {
                 let hwnd = unsafe { GetForegroundWindow() };
-                self.maximized_event(hwnd).into_iter().collect()
+                self.fill_events(hwnd)
             }
             Raw::Lock(locked) => vec![Event::SessionLock { locked }],
             // Answered now and again as the configuration settles: see SETTLE.
@@ -637,6 +664,9 @@ impl Host for WinHost {
             tray.set_active(active);
         }
     }
+    fn set_fading(&mut self, on: bool) {
+        crate::process::hurry(on);
+    }
     fn probe(&self) -> CapabilitySet {
         let set = CapabilitySet::new()
             .available(CapabilityId::new(ids::APP_FOCUS), Some("winevent"))
@@ -807,7 +837,12 @@ impl Host for WinHost {
 
     fn set_timer(&mut self, id: TimerId, after: Duration, tolerance: Duration) {
         let ms = after.as_millis().min(u128::from(u32::MAX)) as u32;
-        let slack = tolerance.as_millis().min(u128::from(u32::MAX)) as u32;
+        // Zero means none at all: to Windows, a tolerance of 0 asks for its
+        // default coalescing, which held fade frames for a later tick.
+        let slack = match tolerance.as_millis() {
+            0 => TIMERV_NO_COALESCING,
+            ms => ms.min(u128::from(TIMERV_NO_COALESCING - 1)) as u32,
+        };
         unsafe {
             SetCoalescableTimer(
                 self.window,
