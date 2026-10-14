@@ -43,10 +43,20 @@ pub fn legacy_dir() -> PathBuf {
 
 /// Put the app at [`bundle`], from the bundle `exe` runs in or, for a bare
 /// executable, a bundle built around it. Answers the installed executable.
+///
+/// A bundle running from a folder macOS guards (Downloads, for one that
+/// carries no quarantine and so runs where it is) comes from its release
+/// instead: copying it from there would first ask the user for the whole
+/// folder. When that download fails, it is copied after all.
 pub fn install(exe: &Path, app_exe: &str) -> Result<PathBuf, String> {
     let target = bundle();
     let parent = target.parent().unwrap_or(Path::new("/"));
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let guarded = bundle::bundle_of(exe).is_some_and(|from| bundle::guarded(&from, &home()));
+    if guarded && from_release(&target, app_exe).is_ok() {
+        super::remove_legacy();
+        return Ok(bundle::executables(&target).join(app_exe));
+    }
     let (incoming, _) = bundle::staging_names(&target);
     let _ = fs::remove_dir_all(&incoming);
     let built = match bundle::bundle_of(exe) {
@@ -62,6 +72,27 @@ pub fn install(exe: &Path, app_exe: &str) -> Result<PathBuf, String> {
     // from there keeps its open executable until it exits.
     super::remove_legacy();
     Ok(bundle::executables(&target).join(app_exe))
+}
+
+/// Put this version's signed bundle, as its release published it, at
+/// `target`: the zip from the release's own feed, checked like an update
+/// (signature naming the artifact and version, the version in
+/// `Info.plist`, `codesign --verify`), then swapped in.
+fn from_release(target: &Path, app_exe: &str) -> Result<(), String> {
+    let version = env!("CARGO_PKG_VERSION");
+    let key = crate::feed::update_key_for(crate::platform_key(), true)
+        .ok_or("no release is built for this Mac")?;
+    let release = crate::release_of(version, &key)?;
+    let dir = bundle::update_dir(target);
+    let _ = fs::remove_dir_all(&dir);
+    let result = crate::download(&release, &dir).and_then(|zip| {
+        let unpack = dir.join("unpacked");
+        fs::create_dir_all(&unpack)
+            .map_err(|e| format!("cannot create {}: {e}", unpack.display()))?;
+        unpack_and_swap(&zip, &unpack, target, version, app_exe)
+    });
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 /// A bundle around a bare executable, the client beside it when there is

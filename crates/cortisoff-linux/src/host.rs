@@ -288,7 +288,7 @@ impl LinuxHost {
     }
 
     /// Machine facts the user should know that are not failures.
-    pub fn warnings(&self) -> Vec<String> {
+    fn machine_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         match &self.x {
             None => out.push(format!(
@@ -872,6 +872,10 @@ impl LinuxHost {
 }
 
 impl Host for LinuxHost {
+    fn warnings(&self) -> Vec<String> {
+        self.machine_warnings()
+    }
+
     fn probe(&self) -> CapabilitySet {
         let id = CapabilityId::new;
         let mut set = CapabilitySet::new();

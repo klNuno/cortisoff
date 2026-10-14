@@ -215,15 +215,13 @@ pub fn run(args: Options) -> Result<(), String> {
     }
     warnings.extend(log.warnings().iter().cloned());
 
-    let (mut host, host_warnings) =
-        platform::host(!args.doctor && !args.no_tray).inspect_err(|e| {
-            log.line(
-                platform::now(),
-                Mark::Exit,
-                &format!("could not start: {e}"),
-            )
-        })?;
-    warnings.extend(host_warnings);
+    let mut host = platform::host(!args.doctor && !args.no_tray).inspect_err(|e| {
+        log.line(
+            platform::now(),
+            Mark::Exit,
+            &format!("could not start: {e}"),
+        )
+    })?;
     let probed = host.probe();
 
     let journal = FileJournal::open(&journal_path);
@@ -543,15 +541,14 @@ mod platform {
         }
     }
 
-    /// The host, and whatever it wants the user warned about before anything
-    /// is applied.
-    pub fn host(tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
+    /// The host. What it wants the user warned about is asked at each
+    /// `doctor`, through [`Host::warnings`].
+    pub fn host(tray: bool) -> Result<Box<dyn Host>, String> {
         let mut host = cortisoff_win::WinHost::new().map_err(|e| e.to_string())?;
         if tray {
             host = host.with_tray();
         }
-        let warnings = host.warnings();
-        Ok((Box::new(host), warnings))
+        Ok(Box::new(host))
     }
 
     pub fn attach_console() {
@@ -710,21 +707,17 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
-        let host = cortisoff_mac::MacHost::new()?;
-        let warnings = host.warnings();
-        Ok((Box::new(host), warnings))
+    pub fn host(_tray: bool) -> Result<Box<dyn Host>, String> {
+        Ok(Box::new(cortisoff_mac::MacHost::new()?))
     }
 
     #[cfg(target_os = "linux")]
-    pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
-        let host = cortisoff_linux::LinuxHost::new()?;
-        let warnings = host.warnings();
-        Ok((Box::new(host), warnings))
+    pub fn host(_tray: bool) -> Result<Box<dyn Host>, String> {
+        Ok(Box::new(cortisoff_linux::LinuxHost::new()?))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub fn host(_tray: bool) -> Result<(Box<dyn Host>, Vec<String>), String> {
+    pub fn host(_tray: bool) -> Result<Box<dyn Host>, String> {
         Err("cortisoff has no host for this system".to_owned())
     }
 
