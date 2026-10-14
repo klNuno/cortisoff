@@ -52,6 +52,8 @@ pub struct Supervisor<J> {
     plugin_armed: Option<u64>,
     watching: bool,
     stopped: bool,
+    /// What the host was last told about fades.
+    fading: bool,
 }
 
 impl<J: JournalStore> Supervisor<J> {
@@ -77,6 +79,7 @@ impl<J: JournalStore> Supervisor<J> {
             plugin_armed: None,
             watching: false,
             stopped: false,
+            fading: false,
         }
     }
 
@@ -201,17 +204,14 @@ impl<J: JournalStore> Supervisor<J> {
                     };
                     let fade = if self.stopped { 0 } else { fade_ms };
                     let rest = rest_of(host, &cap);
+                    let owner = OwnerId::Plugin(owner);
                     let now = host.monotonic_ms();
-                    let actions = self.claims.claim(
-                        index,
-                        OwnerId::Plugin(owner),
-                        priority,
-                        value,
-                        fade,
-                        now,
-                        rest.as_ref(),
-                    );
+                    let actions =
+                        self.claims
+                            .claim(index, owner, priority, value, fade, now, rest.as_ref());
                     self.run(host, actions);
+                    let shown = host.monotonic_ms();
+                    self.claims.begin_at(index, owner, now, shown);
                 }
                 Command::Release {
                     owner,
@@ -589,6 +589,11 @@ impl<J: JournalStore> Supervisor<J> {
                 Action::Run { program, args } => self.spawn(&program, &args),
                 Action::Apply { .. } | Action::RestoreBaseline { .. } => {}
             }
+        }
+        let fading = self.claims.moving();
+        if fading != self.fading {
+            self.fading = fading;
+            host.set_fading(fading);
         }
     }
 
@@ -993,6 +998,42 @@ mod tests {
             .iter()
             .any(|e| e == "apply display.color_temp Text(\"ramps\")"));
         assert!(sup.plugins()[0].holds.is_empty());
+    }
+
+    #[test]
+    fn a_fade_runs_from_its_first_frame_not_from_the_request() {
+        // A colour temperature reads its panels over DDC/CI before the first
+        // frame, half a second. The fade must not have run on meanwhile, or
+        // the next frame jumps half of it.
+        let mut host = MockHost::new().with_opaque_actuator(
+            ids::DISPLAY_COLOR_TEMP,
+            Value::Text("ramps".to_owned()),
+            Value::Int(6600),
+        );
+        host.slow_capture(ids::DISPLAY_COLOR_TEMP, 500);
+        host.now_ms = 10_000;
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "warm",
+                "return { start = function(cx) cx:claim('display.color_temp', 3200, { fade = 1000 }) end }",
+            )],
+        );
+        sup.start(&mut host);
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(6600)));
+        host.now_ms += 40;
+        sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        let Some(Value::Int(first)) = host.value(ids::DISPLAY_COLOR_TEMP) else {
+            panic!("no number on screen");
+        };
+        assert!(first > 6400, "the first step is a small one: {first}");
+        assert!(host.fading, "the host knows a fade runs");
+        for _ in 0..40 {
+            host.now_ms += 40;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
+        assert!(!host.fading, "and that it ended");
     }
 
     #[test]

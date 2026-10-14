@@ -22,8 +22,10 @@ pub const FADE_TIMER: TimerId = TimerId(1);
 pub const PREVIEW_FADE_MS: u64 = 800;
 
 /// The shortest step between two frames of a fade, about 60 Hz. At 25 Hz a
-/// one second release crossed 3000 K in 25 visible jumps.
-const FRAME_MS: u64 = 16;
+/// one second release crossed 3000 K in 25 visible jumps. 15 and not 16: a
+/// Windows timer fires on the system tick, 15.6 ms unless an app asked for
+/// finer, and 16 ms waited for the second tick, which made it 32 Hz.
+const FRAME_MS: u64 = 15;
 
 /// The longest. A fade of 100 K over an hour changes the screen every 36 s,
 /// and waking every 36 s for it is the point: no frame timer runs for a
@@ -83,6 +85,24 @@ impl Claims {
     /// Whether `owner` is still on its way to the value it claimed.
     pub fn fading(&self, cap: CapIndex, owner: OwnerId) -> bool {
         self.fades.iter().any(|f| f.cap == cap && f.owner == owner)
+    }
+
+    /// Whether any fade is under way.
+    pub fn moving(&self) -> bool {
+        !self.fades.is_empty()
+    }
+
+    /// The fade `owner` started at `asked` runs from `now` instead. A claim's
+    /// first frame is applied before its fade moves, and a capability that
+    /// captures its baseline then can take a while: a colour temperature
+    /// reads every panel it drives over DDC/CI, half a second. Timed from the
+    /// request, the next frame would jump by that much of the fade.
+    pub fn begin_at(&mut self, cap: CapIndex, owner: OwnerId, asked: u64, now: u64) {
+        for f in &mut self.fades {
+            if f.cap == cap && f.owner == owner && !f.release && f.start == asked {
+                f.start = now;
+            }
+        }
     }
 
     /// Fold an event from the platform in. Returns which part of the world
@@ -319,7 +339,13 @@ impl Claims {
         Some(Action::SetTimer {
             id: FADE_TIMER,
             after: Duration::from_millis(step),
-            tolerance: Duration::from_millis(if step <= 100 { 10 } else { step / 4 }),
+            // No slack at frame rate: batched with other timers, a frame
+            // waits for a later tick and the fade drops to half its rate.
+            tolerance: Duration::from_millis(match step {
+                FRAME_MS => 0,
+                ..=100 => 10,
+                _ => step / 4,
+            }),
         })
     }
 }
@@ -488,6 +514,18 @@ mod tests {
         // 3400 K, twice as fast at the warm end and 1.5 times at the middle
         // of the easing: a frame every 171 ms.
         assert_eq!(after, Some(Duration::from_millis(171)));
+    }
+
+    #[test]
+    fn a_short_fade_runs_at_frame_rate_with_no_slack() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        let out = c.claim(i, P, 0, Value::Int(3200), 1000, 0, Some(&rest));
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::SetTimer { after, tolerance, .. }
+                if *after == Duration::from_millis(FRAME_MS) && tolerance.is_zero()
+        )));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -12,9 +13,10 @@ use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, K32EmptyWorkingSet, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenProcess, ProcessPowerThrottling,
-    SetProcessInformation, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexW, GetCurrentProcess, GetCurrentThread, GetProcessTimes, OpenProcess,
+    ProcessPowerThrottling, SetProcessInformation, SetThreadPriority,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
@@ -122,10 +124,40 @@ fn hundred_ns(t: FILETIME) -> u64 {
 /// changes and nothing otherwise, so nothing it does notices, and a laptop
 /// does.
 pub fn efficiency_mode() -> bool {
+    let on = throttle(true);
+    ECO.store(on, Ordering::Relaxed);
+    on
+}
+
+/// Whether [`efficiency_mode`] took.
+static ECO: AtomicBool = AtomicBool::new(false);
+
+/// A fade started, or ended. Its frames are due every 15 ms, and a process
+/// Windows may slow down, started at below-normal priority by its task, loses
+/// them to anything busy: on a loaded machine one frame came 443 ms late. For
+/// as long as a fade lasts, the calling thread runs as a normal application's
+/// would and efficiency mode, if it was on, waits.
+pub fn hurry(on: bool) {
+    if ECO.load(Ordering::Relaxed) {
+        throttle(!on);
+    }
+    let priority = if on {
+        THREAD_PRIORITY_HIGHEST
+    } else {
+        THREAD_PRIORITY_NORMAL
+    };
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+}
+
+fn throttle(on: bool) -> bool {
     let state = PROCESS_POWER_THROTTLING_STATE {
         Version: 1,
         ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: if on {
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        } else {
+            0
+        },
     };
     unsafe {
         SetProcessInformation(

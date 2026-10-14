@@ -25,7 +25,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, KillTimer,
     MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassW, SetCoalescableTimer, MSG,
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WINDOW_STYLE, WNDCLASSW, WS_EX_TOOLWINDOW,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, TIMERV_NO_COALESCING, WINDOW_STYLE, WNDCLASSW,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::audio::Audio;
@@ -663,6 +664,9 @@ impl Host for WinHost {
             tray.set_active(active);
         }
     }
+    fn set_fading(&mut self, on: bool) {
+        crate::process::hurry(on);
+    }
     fn probe(&self) -> CapabilitySet {
         let set = CapabilitySet::new()
             .available(CapabilityId::new(ids::APP_FOCUS), Some("winevent"))
@@ -833,7 +837,12 @@ impl Host for WinHost {
 
     fn set_timer(&mut self, id: TimerId, after: Duration, tolerance: Duration) {
         let ms = after.as_millis().min(u128::from(u32::MAX)) as u32;
-        let slack = tolerance.as_millis().min(u128::from(u32::MAX)) as u32;
+        // Zero means none at all: to Windows, a tolerance of 0 asks for its
+        // default coalescing, which held fade frames for a later tick.
+        let slack = match tolerance.as_millis() {
+            0 => TIMERV_NO_COALESCING,
+            ms => ms.min(u128::from(TIMERV_NO_COALESCING - 1)) as u32,
+        };
         unsafe {
             SetCoalescableTimer(
                 self.window,
