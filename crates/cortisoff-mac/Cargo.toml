@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[test]]
+name = "background"
+harness = false
+
 [dependencies]
 cortisoff-host = { path = "../cortisoff-host" }
 
@@ -43,7 +47,9 @@ default-features = false
 features = [
     "std",
     "libc",
+    "NSApplication",
     "NSPasteboard",
+    "NSResponder",
     "NSRunningApplication",
     "NSScreen",
     "NSWorkspace",

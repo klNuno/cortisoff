@@ -9,6 +9,7 @@
 mod activity;
 pub mod autostart;
 mod ax;
+mod background;
 mod clock;
 mod color;
 mod colortemp;
@@ -27,4 +28,5 @@ mod sources;
 mod timers;
 mod windows;
 
+pub use background::background_only;
 pub use host::MacHost;
