@@ -14,7 +14,7 @@ cortisoff-host = { path = "../cortisoff-host" }
 # build time: x11rb speaks the protocol over the socket itself and rustix
 # makes its system calls directly.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", default-features = false, features = [
+x11rb = { version = "0.14", default-features = false, features = [
     "randr",
     "screensaver",
     "xinput",
