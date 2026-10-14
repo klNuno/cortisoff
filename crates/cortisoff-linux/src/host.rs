@@ -4,9 +4,16 @@
 //! Nothing here polls on a beat for something that has an event. Focus and
 //! window state are property changes, monitors are RandR notifications,
 //! hotkeys are key events on a grab, and the end of an idle period is the
-//! first raw input event. What has no event on X11 without D-Bus, the power
-//! source and the sound card, is read on a thirty second timer with fifteen
-//! seconds of slack, only while a plugin reads it.
+//! first raw input event. What has no event here, the power source and the
+//! sound card, is read on a thirty second timer with fifteen seconds of
+//! slack, only while a plugin reads it.
+//!
+//! One host for X11 and Wayland, the backends picked at runtime. Under a
+//! Wayland session the D-Bus services stand in where XWayland cannot see:
+//! logind for the lock, Mutter's idle monitor for idle, GNOME's Night Light
+//! for the colour, the desktop portal for global shortcuts. Their signals
+//! arrive on threads (`dbus.rs`) that wake the same poll through the wake
+//! pipe.
 
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -28,11 +35,14 @@ use x11rb::protocol::Event as XEvent;
 
 use crate::clipboard::{self, Owner};
 use crate::clock;
+use crate::dbus::{self, Buses, IdleMonitor, Logind, Signal};
 use crate::gamma::ColorTemp;
 use crate::input::{self, Hotkeys};
 use crate::keymap::Keymap;
 use crate::mode::DisplayMode;
+use crate::nightlight::NightLight;
 use crate::procfs;
+use crate::shortcuts::Shortcuts;
 use crate::timers::{Key, Timers};
 use crate::wake::{Alarm, ClockWatch, WakePipe};
 use crate::wm;
@@ -78,6 +88,51 @@ const DAY_S: i64 = 86_400;
 
 const NO_KEYMAP: &str = "the X server would not send its keyboard mapping";
 
+const WAYLAND_FOCUS: &str = "this is a Wayland session, where no protocol tells a client which window has the focus or whether it fills the screen. GNOME keeps that to the shell, and XWayland only sees X11 windows, so its answer would be wrong for every native one";
+const WAYLAND_INPUT: &str = "this is a Wayland session, where an application cannot press keys in another one: keys sent through XWayland only reach X11 windows. The desktop's RemoteDesktop portal would allow it, after asking the user, and this host does not speak it yet";
+
+/// A Wayland session: XWayland stands in for X, or there is no X at all and
+/// the compositor announced itself. Keys and shortcuts then belong to the
+/// compositor, not to any X server.
+fn wayland_session(x: Option<&Display>) -> bool {
+    match x {
+        Some(x) => x.xwayland,
+        None => std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+    }
+}
+
+/// Which of the two colour backends this session has.
+enum Colour {
+    Gamma(ColorTemp),
+    Gnome(NightLight),
+}
+
+impl Colour {
+    fn actuator(&self) -> &dyn Actuator {
+        match self {
+            Self::Gamma(a) => a,
+            Self::Gnome(a) => a,
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Gamma(a) => a.backend_name(),
+            Self::Gnome(a) => a.backend_name(),
+        }
+    }
+}
+
+/// Where the idle time comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleWay {
+    /// MIT-SCREEN-SAVER on a real X server, XInput for the return.
+    X11,
+    /// Mutter's idle monitor: a watch per threshold and one for the return.
+    Mutter,
+    None,
+}
+
 pub struct LinuxHost {
     x: Option<Rc<Display>>,
     /// Why there is no X display, or why the one there was went away.
@@ -112,10 +167,17 @@ pub struct LinuxHost {
     audio_active: bool,
     /// How far through [`SETTLE`] the current display change is.
     settling: Option<usize>,
-    color_temp: Result<ColorTemp, String>,
+    buses: Buses,
+    logind: Result<Logind, String>,
+    locked: bool,
+    mutter: Result<IdleMonitor, String>,
+    color_temp: Result<Colour, String>,
     display_mode: Result<DisplayMode, String>,
     keymap: Option<Keymap>,
     hotkeys: Hotkeys,
+    /// Global shortcuts through the desktop portal, for a Wayland session.
+    /// `Err` holds why there are none.
+    shortcuts: Result<Shortcuts, String>,
     /// The last key release on a grab. X sends an auto-repeat as a release
     /// and a press with the same timestamp, and a held hotkey must fire once.
     last_release: Option<(u8, u32)>,
@@ -133,15 +195,43 @@ impl LinuxHost {
             Ok(display) => (Some(Rc::new(display)), String::new()),
             Err(reason) => (None, reason),
         };
+        let buses = Buses::connect(wake.waker());
+        // A real X server keeps its RandR ramps. Under XWayland, or with no
+        // X at all, GNOME's Night Light is the one colour the compositor
+        // shows.
         let color_temp = match &x {
-            Some(d) => ColorTemp::new(Rc::clone(d)),
+            Some(d) => ColorTemp::new(Rc::clone(d)).map(Colour::Gamma),
             None => Err(no_x.clone()),
+        }
+        .or_else(|x_why| {
+            NightLight::new(&buses)
+                .map(Colour::Gnome)
+                .map_err(|gnome_why| format!("{x_why}; and {gnome_why}"))
+        });
+        let x11_idle = x.as_ref().is_some_and(|d| d.screensaver && !d.xwayland);
+        let mutter = if x11_idle {
+            Err("the X server answers for idle".to_owned())
+        } else {
+            IdleMonitor::new(&buses)
         };
+        let logind = Logind::new(&buses);
+        let locked = logind
+            .as_ref()
+            .ok()
+            .and_then(|l| l.locked().ok())
+            .unwrap_or(false);
+        // Without timedated a zone change still reaches the next clock event.
+        let _ = dbus::watch_zone(&buses);
         let display_mode = match &x {
             Some(d) => DisplayMode::new(Rc::clone(d)),
             None => Err(no_x.clone()),
         };
         let keymap = x.as_deref().and_then(input::load_keymap);
+        let shortcuts = if wayland_session(x.as_deref()) {
+            Shortcuts::new(&buses)
+        } else {
+            Err("an X11 session grabs its keys".to_owned())
+        };
         if let Some(d) = &x {
             // Always on, as `WM_DISPLAYCHANGE` is on Windows: the colour
             // tint needs to hear about a monitor change whatever the plugins
@@ -180,10 +270,15 @@ impl LinuxHost {
             audio_watched: false,
             audio_active: false,
             settling: None,
+            buses,
+            logind,
+            locked,
+            mutter,
             color_temp,
             display_mode,
             keymap,
             hotkeys: Hotkeys::default(),
+            shortcuts,
             last_release: None,
             clipboard: None,
             snapshot_sent: false,
@@ -201,7 +296,7 @@ impl LinuxHost {
                 self.no_x
             )),
             Some(x) if x.xwayland => out.push(
-                "this session is Wayland with XWayland: app.focus, app.maximized and app.fullscreen only see X11 applications, and a native Wayland window leaves the last X11 one reported as focused"
+                "this session is Wayland: the clipboard and the window list go through XWayland, which sees X11 applications only (the clipboard is shared with Wayland ones), no window is reported as focused, text cannot be typed or keys sent into another application, and global shortcuts go through the desktop portal, which asks the user to allow them"
                     .to_owned(),
             ),
             Some(_) => {}
@@ -219,10 +314,28 @@ impl LinuxHost {
         self.x.clone().ok_or_else(|| self.no_x.clone())
     }
 
-    fn idle_supported(&self) -> bool {
-        self.x
+    fn idle_way(&self) -> IdleWay {
+        if self
+            .x
             .as_ref()
             .is_some_and(|x| x.screensaver && !x.xwayland)
+        {
+            IdleWay::X11
+        } else if self.mutter.is_ok() {
+            IdleWay::Mutter
+        } else {
+            IdleWay::None
+        }
+    }
+
+    fn idle_supported(&self) -> bool {
+        self.idle_way() != IdleWay::None
+    }
+
+    /// The X server is real, not XWayland: its focus and window state are
+    /// the truth.
+    fn x11_session(&self) -> bool {
+        self.x.as_ref().is_some_and(|x| !x.xwayland)
     }
 
     /// The X server is gone: the session ended or the server crashed. The
@@ -230,7 +343,10 @@ impl LinuxHost {
     /// report the same error on every poll.
     fn lose_x(&mut self, reason: String) {
         self.x = None;
-        self.color_temp = Err(reason.clone());
+        // GNOME's Night Light does not go through X and stays.
+        if matches!(self.color_temp, Ok(Colour::Gamma(_))) {
+            self.color_temp = Err(reason.clone());
+        }
         self.display_mode = Err(reason.clone());
         self.no_x = reason;
         self.clipboard = None;
@@ -247,6 +363,7 @@ impl LinuxHost {
     }
 
     fn arm_dst(&mut self) {
+        clock::refresh_zone();
         let now = clock::wall_s();
         match clock::next_offset_change(now, DAY_S, DST_HORIZON_DAYS, clock::utc_offset) {
             // A second past the edge, so the clock pushed there already
@@ -345,7 +462,18 @@ impl LinuxHost {
     /// idle at zero: a mouse that has not moved during a film is not an
     /// absent user.
     fn idle_reading(&self) -> (u64, bool) {
-        let Some(x) = self.x.as_ref().filter(|_| self.idle_supported()) else {
+        if self.idle_way() == IdleWay::Mutter {
+            let raw = self
+                .mutter
+                .as_ref()
+                .ok()
+                .and_then(IdleMonitor::idle_ms)
+                .unwrap_or(0);
+            // No fullscreen to read on Wayland: sound is the one gate.
+            let gated = raw >= 1_000 && procfs::playing(Path::new(procfs::ASOUND));
+            return (raw, gated);
+        }
+        let Some(x) = self.x.as_ref().filter(|_| self.idle_way() == IdleWay::X11) else {
             return (0, false);
         };
         let raw = x.idle_ms().map_or(0, u64::from);
@@ -370,7 +498,17 @@ impl LinuxHost {
         if self.idle_watched && self.idle_supported() {
             let away = self.idle_seconds > 0;
             let raw_input = self.listen_for_input(away);
-            match idle_check(away_ms, gated, raw_input, &self.idle_thresholds) {
+            let plan = if self.idle_way() == IdleWay::Mutter {
+                // Mutter's watches announce each threshold and the return;
+                // only the gates are looked at again.
+                (gated || away).then_some((
+                    Duration::from_millis(RECHECK_MS),
+                    Duration::from_millis(RECHECK_SLACK_MS),
+                ))
+            } else {
+                idle_check(away_ms, gated, raw_input, &self.idle_thresholds)
+            };
+            match plan {
                 Some((after, slack)) => self.timers.set(Key::Idle, clock::boot_ms(), after, slack),
                 None => self.timers.cancel(Key::Idle),
             }
@@ -392,6 +530,9 @@ impl LinuxHost {
     /// only the first one after an absence means anything. Returns whether
     /// raw input is what will announce the user's return.
     fn listen_for_input(&mut self, on: bool) -> bool {
+        if self.idle_way() == IdleWay::Mutter {
+            return self.mutter.as_mut().is_ok_and(|m| m.listen_for_return(on));
+        }
         let Some(x) = self.x.clone().filter(|x| x.xinput) else {
             return false;
         };
@@ -454,7 +595,9 @@ impl LinuxHost {
             exclusive: self.fullscreen,
         });
         out.push(self.sample_idle());
-        out.push(Event::SessionLock { locked: false });
+        out.push(Event::SessionLock {
+            locked: self.locked,
+        });
         self.on_battery = Self::read_power();
         out.push(Event::PowerSource {
             on_battery: self.on_battery,
@@ -616,10 +759,60 @@ impl LinuxHost {
         slept
     }
 
+    /// What the D-Bus threads heard since the last look.
+    fn drain_dbus(&mut self, out: &mut Vec<Event>) {
+        for signal in self.buses.inbox.drain() {
+            match signal {
+                Signal::Locked(locked) => {
+                    if locked != self.locked {
+                        self.locked = locked;
+                        out.push(Event::SessionLock { locked });
+                    }
+                }
+                Signal::IdleWatch(id) => {
+                    let ours = self.mutter.as_mut().is_ok_and(|m| m.fired(id));
+                    if ours && self.idle_watched {
+                        out.extend(self.idle_changed());
+                    }
+                }
+                Signal::Zone => {
+                    out.extend(clock::time_of_day());
+                    self.arm_dst();
+                }
+                Signal::Shortcut(name) => {
+                    if let Some(id) = self.shortcuts.as_ref().ok().and_then(|s| s.hotkey(&name)) {
+                        out.push(Event::Hotkey { id });
+                    }
+                }
+                Signal::Bound(generation, outcome) => {
+                    if let Ok(portal) = &mut self.shortcuts {
+                        for (id, why) in portal.bound_late(generation, outcome) {
+                            eprintln!("warning: hotkey {id} is not bound: {why}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mutter's watches follow the thresholds while a plugin reads idle.
+    fn sync_idle_watches(&mut self) {
+        let on = self.idle_watched && self.idle_way() == IdleWay::Mutter;
+        let thresholds = self.idle_thresholds.clone();
+        if let Ok(m) = &mut self.mutter {
+            if on {
+                m.watch(&thresholds);
+            } else {
+                m.unwatch();
+            }
+        }
+    }
+
     /// Everything ready without blocking. Returns whether another thread
     /// woke the host, which must end the poll even with no event.
     fn gather(&mut self, out: &mut Vec<Event>) -> bool {
         let woken = self.wake.drain();
+        self.drain_dbus(out);
         if let Some(alarm) = &self.alarm {
             alarm.drain();
         }
@@ -686,18 +879,20 @@ impl Host for LinuxHost {
             Some(x) => {
                 let ewmh = x.supports(x.atoms._NET_ACTIVE_WINDOW);
                 for cap in [ids::APP_FOCUS, ids::APP_MAXIMIZED, ids::APP_FULLSCREEN] {
-                    set = if ewmh {
+                    set = if x.xwayland {
+                        set.missing(id(cap), WAYLAND_FOCUS)
+                    } else if ewmh {
                         set.available(id(cap), Some("ewmh"))
                     } else {
                         set.missing(id(cap), "the window manager does not publish _NET_ACTIVE_WINDOW, which is how an X11 client learns the focused window")
                     };
                 }
-                set = if !x.screensaver {
-                    set.missing(id(ids::USER_IDLE), "the X server has no MIT-SCREEN-SAVER extension, which is how the time since the last input is read")
-                } else if x.xwayland {
-                    set.missing(id(ids::USER_IDLE), "XWayland only hears input sent to X11 windows, so someone typing in a Wayland window would read as away. the compositor knows, over D-Bus, which this host does not link")
-                } else {
-                    set.available(id(ids::USER_IDLE), Some("mit-screen-saver"))
+                set = match (self.idle_way(), &self.mutter) {
+                    (IdleWay::X11, _) => set.available(id(ids::USER_IDLE), Some("mit-screen-saver")),
+                    (IdleWay::Mutter, _) => set.available(id(ids::USER_IDLE), Some("mutter-idle-monitor")),
+                    (IdleWay::None, Err(why)) if x.xwayland => set.missing(id(ids::USER_IDLE), format!("XWayland only hears input sent to X11 windows, so someone typing in a Wayland window would read as away; and {why}")),
+                    (IdleWay::None, Err(why)) => set.missing(id(ids::USER_IDLE), format!("the X server has no MIT-SCREEN-SAVER extension, which is how the time since the last input is read; and {why}")),
+                    (IdleWay::None, Ok(_)) => unreachable!("a working idle monitor is an idle way"),
                 };
                 set = if x.randr {
                     set.available(id(ids::DISPLAY_CONFIG), Some("randr"))
@@ -713,17 +908,22 @@ impl Host for LinuxHost {
                     ids::APP_FOCUS,
                     ids::APP_MAXIMIZED,
                     ids::APP_FULLSCREEN,
-                    ids::USER_IDLE,
                     ids::DISPLAY_CONFIG,
                 ] {
                     set = set.missing(id(cap), self.no_x.clone());
                 }
+                set = match &self.mutter {
+                    Ok(_) => set.available(id(ids::USER_IDLE), Some("mutter-idle-monitor")),
+                    Err(why) => {
+                        set.missing(id(ids::USER_IDLE), format!("{}; and {why}", self.no_x))
+                    }
+                };
             }
         }
-        set = set.missing(
-            id(ids::SESSION_LOCK),
-            "X11 has no lock event: logind and the screen lockers announce it over D-Bus, which this host does not link",
-        );
+        set = match &self.logind {
+            Ok(_) => set.available(id(ids::SESSION_LOCK), Some("logind")),
+            Err(why) => set.missing(id(ids::SESSION_LOCK), why.clone()),
+        };
         set = if Path::new(procfs::POWER_SUPPLIES).is_dir() {
             set.available(id(ids::POWER_SOURCE), Some("sysfs"))
         } else {
@@ -763,6 +963,7 @@ impl Host for LinuxHost {
         self.idle_thresholds.push(DEFAULT_IDLE_AFTER);
         self.idle_thresholds.sort_unstable();
         self.idle_thresholds.dedup();
+        self.sync_idle_watches();
         if self.idle_watched {
             let changed = self.idle_changed();
             if self.snapshot_sent {
@@ -779,7 +980,8 @@ impl Host for LinuxHost {
         let mut owed = Vec::new();
 
         if let Some(x) = self.x.clone() {
-            let ewmh = x.supports(x.atoms._NET_ACTIVE_WINDOW);
+            // XWayland's focus is not the session's: see `WAYLAND_FOCUS`.
+            let ewmh = !x.xwayland && x.supports(x.atoms._NET_ACTIVE_WINDOW);
             let focus = ewmh
                 && (asked(ids::APP_FOCUS)
                     || asked(ids::APP_MAXIMIZED)
@@ -808,6 +1010,7 @@ impl Host for LinuxHost {
         let idle = asked(ids::USER_IDLE) && self.idle_supported();
         if idle != self.idle_watched {
             self.idle_watched = idle;
+            self.sync_idle_watches();
             if idle {
                 owed.extend(self.idle_changed());
             } else {
@@ -852,7 +1055,7 @@ impl Host for LinuxHost {
 
     fn actuator(&self, cap: &CapabilityId) -> Option<&dyn Actuator> {
         match cap.as_str() {
-            ids::DISPLAY_COLOR_TEMP => self.color_temp.as_ref().ok().map(|a| a as &dyn Actuator),
+            ids::DISPLAY_COLOR_TEMP => self.color_temp.as_ref().ok().map(Colour::actuator),
             ids::DISPLAY_MODE => self.display_mode.as_ref().ok().map(|a| a as &dyn Actuator),
             _ => None,
         }
@@ -900,6 +1103,17 @@ impl Host for LinuxHost {
     }
 
     fn set_hotkeys(&mut self, wanted: &[Hotkey]) -> Vec<(u32, String)> {
+        if wayland_session(self.x.as_deref()) {
+            return match &mut self.shortcuts {
+                Ok(portal) => portal.set(wanted),
+                // Nothing wanted, nothing to refuse.
+                Err(_) if wanted.is_empty() => Vec::new(),
+                Err(why) => Self::refuse_all(
+                    wanted,
+                    &format!("this is a Wayland session, where a global shortcut goes through the desktop portal, and {why}"),
+                ),
+            };
+        }
         let x = match self.display() {
             Ok(x) => x,
             Err(why) => return Self::refuse_all(wanted, &why),
@@ -911,12 +1125,18 @@ impl Host for LinuxHost {
     }
 
     fn send_keys(&mut self, chord: &Chord) -> Result<(), String> {
+        if wayland_session(self.x.as_deref()) {
+            return Err(WAYLAND_INPUT.to_owned());
+        }
         let x = self.display()?;
         let map = self.keymap.as_ref().ok_or(NO_KEYMAP)?;
         input::send_chord(&x, map, chord)
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), String> {
+        if wayland_session(self.x.as_deref()) {
+            return Err(WAYLAND_INPUT.to_owned());
+        }
         let x = self.display()?;
         let map = self.keymap.as_ref().ok_or(NO_KEYMAP)?;
         input::type_text(&x, map, text)
@@ -964,8 +1184,17 @@ impl Host for LinuxHost {
         self.clipboard.insert(owner).set(&x, text)
     }
 
+    /// Under XWayland the list holds X11 windows only, and the last one that
+    /// had the focus keeps `_NET_ACTIVE_WINDOW` while a Wayland window is in
+    /// front, so none is reported as focused there.
     fn windows(&self) -> Vec<WindowInfo> {
-        self.x.as_deref().map(wm::windows).unwrap_or_default()
+        let mut list = self.x.as_deref().map(wm::windows).unwrap_or_default();
+        if !self.x11_session() {
+            for w in &mut list {
+                w.focused = false;
+            }
+        }
+        list
     }
 
     fn window_action(&mut self, id: u64, action: WindowAction) -> Result<(), String> {
