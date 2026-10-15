@@ -417,6 +417,24 @@ impl<J: JournalStore> Supervisor<J> {
         self.claims.index_of(cap)
     }
 
+    /// Start with every plugin held back, until [`Supervisor::resume`].
+    /// Called before [`Supervisor::start`]: recovery still runs, nothing
+    /// claims.
+    pub fn hold(&mut self) {
+        self.runtime.hold();
+    }
+
+    /// Start the plugins a hold kept back, and tell every client.
+    pub fn resume(&mut self, host: &mut dyn Host) {
+        if !self.runtime.held() {
+            return;
+        }
+        let commands = self.call(host, |rt, env| rt.release(env));
+        self.apply(host, commands);
+        self.settle(host);
+        self.note(Notification::Resumed);
+    }
+
     pub fn set_enabled(&mut self, host: &mut dyn Host, id: &str, on: bool) -> Result<(), String> {
         let commands = self.call(host, |rt, env| rt.set_enabled(env, id, on))?;
         self.apply(host, commands);
@@ -761,6 +779,7 @@ impl<J: JournalStore> Supervisor<J> {
             .collect();
         StateReport {
             active: self.active(),
+            held: self.runtime.held(),
             world: WorldReport {
                 app: w.app.clone(),
                 fullscreen: w.fullscreen,

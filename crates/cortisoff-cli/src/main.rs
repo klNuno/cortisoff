@@ -193,6 +193,7 @@ fn line(notification: &Notification) {
         ),
         Notification::Plugins => println!("plugins the list changed"),
         Notification::Updates(report) => println!("updates {}", describe(report)),
+        Notification::Resumed => println!("plugins the held ones started"),
         Notification::Closing => println!("the daemon is going down"),
     }
 }
@@ -260,8 +261,14 @@ fn parse_set(args: &[String]) -> Result<Request, String> {
 /// installer puts both in the same folder, and so does Cargo.
 fn start() -> Result<(), String> {
     if transport::connect().is_ok() {
-        println!("already running");
-        return Ok(());
+        // A daemon started held (Shift at logon) starts its plugins now.
+        return match transport::ask(Request::Resume)? {
+            Response::Error { message } => Err(message),
+            _ => {
+                println!("running");
+                Ok(())
+            }
+        };
     }
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let app = me
@@ -324,7 +331,7 @@ const USAGE: &str = "cortisoff-cli, the command line client for cortisoff
     clear <cap>               drop the override
     update                    whether a new version is out
     update auto <on|off>      install new versions without asking, or not
-    start                     start the daemon
+    start                     start the daemon, or the plugins it holds
     stop                      exit cleanly, restoring every baseline";
 
 const NOT_RUNNING: &str = "cortisoff is not running. `cortisoff-cli start` starts it";

@@ -22,6 +22,8 @@ fn capture_every_page() {
     let pages = [
         ("overview", View::Overview, SIZE),
         ("stopped", View::Overview, SIZE),
+        ("held", View::Overview, SIZE),
+        ("held-hover", View::Overview, SIZE),
         ("logo-hover", View::Overview, SIZE),
         ("close-hover", View::Overview, SIZE),
         ("night-light", plugin("night-light"), SIZE),
@@ -39,13 +41,17 @@ fn capture_every_page() {
             .wgpu()
             .build_eframe(|_| {
                 let shell = Shell::demo(view.clone());
-                App(if name == "stopped" {
-                    shell.stopped()
-                } else {
-                    shell
+                App(match name {
+                    "stopped" => shell.stopped(),
+                    "held" | "held-hover" => shell.held(),
+                    _ => shell,
                 })
             });
         harness.run_steps(4);
+        if name == "held-hover" {
+            harness.get_by_label("cortison").hover();
+            harness.run_steps(4);
+        }
         if name == "logo-hover" {
             // The logo is the on and off switch; this is how it answers the
             // pointer.

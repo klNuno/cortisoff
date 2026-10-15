@@ -44,6 +44,9 @@ pub struct Paths {
     /// Why the daemon is or is not running, kept next to the journal because
     /// it describes this machine's runs and nothing the user authored.
     pub log: PathBuf,
+    /// Left by a logon start that Shift turned away, read by the window to
+    /// start the daemon held. Any daemon that starts removes it.
+    pub held: PathBuf,
 }
 
 /// Missing environment, named so the message can say which variable.
@@ -115,6 +118,7 @@ impl Paths {
             plugins: data.join("cortisoff").join("plugins"),
             journal: state.join("cortisoff").join("journal.json"),
             log: state.join("cortisoff").join("cortisoffd.log"),
+            held: state.join("cortisoff").join("held"),
         })
     }
 }
@@ -149,6 +153,7 @@ mod tests {
         // The log describes this machine's runs, so it sits with the journal
         // rather than with the roaming settings.
         assert!(p.log.ends_with("cortisoff/cortisoffd.log"));
+        assert_eq!(p.held.parent(), p.log.parent());
         assert!(p.log.starts_with(r"C:\Users\x\AppData\Local"));
     }
 

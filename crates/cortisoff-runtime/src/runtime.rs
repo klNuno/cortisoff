@@ -185,6 +185,9 @@ pub struct Runtime {
     shared: Shared,
     next_key: u32,
     os: &'static str,
+    /// No plugin starts, however it is asked to, until [`Runtime::release`]:
+    /// the safe start Shift asks for at logon, for a plugin that misbehaves.
+    held: bool,
 }
 
 impl Runtime {
@@ -207,6 +210,7 @@ impl Runtime {
             },
             next_key: 1,
             os: std::env::consts::OS,
+            held: false,
         };
         for pkg in packages {
             rt.add(pkg, store);
@@ -283,6 +287,23 @@ impl Runtime {
         out
     }
 
+    /// Keep every plugin from starting. Switches and settings still change
+    /// and are stored, so the plugin at fault can be turned off before
+    /// anything runs.
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// Start every enabled plugin a hold kept back.
+    pub fn release(&mut self, env: &mut Env) -> Vec<Command> {
+        self.held = false;
+        self.start_all(env)
+    }
+
     /// Stops every plugin, for a clean exit. Nothing fades: the daemon is
     /// about to restore every baseline at once.
     pub fn shutdown(&mut self, env: &mut Env) -> Vec<Command> {
@@ -321,6 +342,9 @@ impl Runtime {
     }
 
     fn start(&mut self, i: usize, env: &mut Env) -> Vec<Command> {
+        if self.held {
+            return Vec::new();
+        }
         let slot = &mut self.slots[i];
         if !slot.enabled || slot.live.is_some() {
             return Vec::new();

@@ -120,6 +120,8 @@ pub struct Shell {
     starting: Option<Instant>,
     /// When the daemon was asked to stop from here, so the logo turns at once.
     stopping: Option<Instant>,
+    /// The daemon runs with every plugin held back (Shift at logon).
+    held: bool,
     /// Open this plugin as soon as the list carries it: one just added.
     open_when_listed: Option<String>,
     /// A linked folder was sent; open whichever plugin is new in the next
@@ -163,6 +165,7 @@ impl Shell {
             state_asked: false,
             starting: None,
             stopping: None,
+            held: false,
             open_when_listed: None,
             open_new: None,
             add_text: String::new(),
@@ -282,6 +285,7 @@ impl Shell {
                 Inbound::Disconnected => {
                     self.daemon = Daemon::Down;
                     self.stopping = None;
+                    self.held = false;
                     self.updates = None;
                     self.state = None;
                     self.state_asked = false;
@@ -307,8 +311,13 @@ impl Shell {
             Notification::Event(_) | Notification::Action(_) => self.state_stale = true,
             Notification::Log { level, message } => self.log(level, message),
             Notification::Updates(report) => self.take_updates(*report),
+            Notification::Resumed => {
+                self.held = false;
+                self.state_stale = true;
+            }
             Notification::Closing => {
                 self.daemon = Daemon::Down;
+                self.held = false;
                 self.state = None;
             }
         }
@@ -318,6 +327,7 @@ impl Shell {
         match (ask, response) {
             (Ask::State, Response::State(state)) => {
                 self.state_asked = false;
+                self.held = state.held;
                 for report in &state.plugins {
                     self.adopt(report.clone());
                 }
@@ -453,6 +463,12 @@ impl Shell {
         }
     }
 
+    /// Starts the plugins a held daemon kept back.
+    fn resume(&mut self) {
+        self.ask(Ask::Do("start the plugins".to_owned()), Request::Resume);
+        self.starting = Some(Instant::now());
+    }
+
     /// Stops the daemon, which releases every claim on the way out.
     fn stop_daemon(&mut self) {
         self.ask(Ask::Do("stop cortisoff".to_owned()), Request::Shutdown);
@@ -470,7 +486,7 @@ impl Shell {
         }
         match self.daemon {
             Daemon::Unknown => None,
-            Daemon::Up => Some(true),
+            Daemon::Up => Some(!self.held),
             Daemon::Down => Some(false),
         }
     }
@@ -482,6 +498,7 @@ impl Shell {
         }
         match self.switched_on() {
             Some(true) => self.stop_daemon(),
+            Some(false) if self.daemon == Daemon::Up => self.resume(),
             Some(false) => self.start_daemon(),
             None => {}
         }
@@ -607,7 +624,7 @@ impl Shell {
         ui.add_space(chrome::SIDEBAR_TOP);
         ui.spacing_mut().item_spacing.y = 2.0;
         let busy = recent(self.starting) || recent(self.stopping);
-        let power = switch(ui, self.switched_on(), busy);
+        let power = switch(ui, self.switched_on(), busy, self.held);
         chrome::over_band(ui, power.rect);
         if power.clicked() {
             self.toggle();
@@ -710,6 +727,9 @@ impl Shell {
         if self.daemon == Daemon::Down {
             return ("Not running".to_owned(), theme::WAITING);
         }
+        if self.held {
+            return ("Held".to_owned(), theme::WAITING);
+        }
         if r.error.is_some() && !r.running {
             return ("Failed".to_owned(), theme::FAILED);
         }
@@ -722,7 +742,7 @@ impl Shell {
     fn status(&mut self, i: usize, now: f64) -> Status {
         let (line, colour) = self.line(i, now);
         let r = &self.entries[i].report;
-        let enabled = r.enabled && r.supported && self.daemon != Daemon::Down;
+        let enabled = r.enabled && r.supported && self.daemon != Daemon::Down && !self.held;
         let status = if enabled {
             self.entries[i].page.status(now)
         } else {
@@ -739,13 +759,25 @@ impl Shell {
         })
     }
 
-    /// Above every page while no daemon answers: the window shows the last
-    /// thing it knew and says so.
+    /// Above every page while no daemon answers, the window showing the last
+    /// thing it knew, or while one holds every plugin back.
     fn daemon_banner(&mut self, ui: &mut Ui) {
-        if self.daemon != Daemon::Down {
+        let held = self.daemon == Daemon::Up && self.held;
+        if self.daemon != Daemon::Down && !held {
             return;
         }
         let starting = recent(self.starting);
+        let (title, detail) = match (held, starting) {
+            (_, true) => ("Starting cortisoff", "Plugins do nothing until it runs."),
+            (true, false) => (
+                "Every plugin is held",
+                "Shift was held, so none started. Turn off the one at fault, then start.",
+            ),
+            (false, false) => (
+                "cortisoff is not running",
+                "Plugins do nothing until it runs.",
+            ),
+        };
         let mut start = false;
         Frame::new()
             .fill(theme::CARD)
@@ -758,16 +790,12 @@ impl Shell {
                     widgets::dot(ui, theme::PAUSED);
                     ui.add_space(2.0);
                     ui.label(
-                        RichText::new(if starting {
-                            "Starting cortisoff"
-                        } else {
-                            "cortisoff is not running"
-                        })
-                        .font(theme::strong(14.0))
-                        .color(theme::TEXT),
+                        RichText::new(title)
+                            .font(theme::strong(14.0))
+                            .color(theme::TEXT),
                     );
                     ui.label(
-                        RichText::new("Plugins do nothing until it runs.")
+                        RichText::new(detail)
                             .font(theme::body(13.0))
                             .color(theme::MUTED),
                     );
@@ -779,7 +807,9 @@ impl Shell {
                 });
             });
         ui.add_space(14.0);
-        if start {
+        if start && held {
+            self.resume();
+        } else if start {
             self.start_daemon();
         }
     }
@@ -792,6 +822,7 @@ impl Shell {
             .count();
         let summary = match (self.daemon, on) {
             (Daemon::Down, _) => "Nothing runs right now.".to_owned(),
+            _ if self.held => "Every plugin held.".to_owned(),
             (_, 0) => "No plugin is on.".to_owned(),
             (_, 1) => "1 plugin on.".to_owned(),
             (_, n) => format!("{n} plugins on."),
@@ -1667,7 +1698,7 @@ fn until_next_minute() -> Duration {
 /// a green "cortisoff" while it runs and a red "cortison" while it does not.
 /// The needle swings from calm to stressed as it goes off. Grey and calm
 /// before the daemon has answered.
-fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
+fn switch(ui: &mut Ui, on: Option<bool>, busy: bool, held: bool) -> egui::Response {
     let t =
         ui.ctx()
             .animate_bool_with_time(egui::Id::new("cortisoff-switch"), on.unwrap_or(true), 0.3);
@@ -1731,6 +1762,7 @@ fn switch(ui: &mut Ui, on: Option<bool>, busy: bool) -> egui::Response {
         (Some(true), true) => "Starting",
         (Some(false), true) => "Stopping",
         (Some(true), false) => "Running. Click to stop every plugin.",
+        (Some(false), false) if held => "Every plugin held. Click to start them.",
         (Some(false), false) => "Stopped. Click to start.",
     };
     let response = if !live {
@@ -1818,6 +1850,7 @@ impl Shell {
         let cap = |id: &str| CapabilityId::new(id);
         shell.state = Some(StateReport {
             active: true,
+            held: false,
             world: WorldReport {
                 app: Some(cortisoff_host::AppRef {
                     exe: r"C:\Games\Counter-Strike\game\bin\win64\cs2.exe".into(),
@@ -1915,6 +1948,20 @@ impl Shell {
             last: Some(UpdateCheck::Current),
         });
         shell
+    }
+
+    /// The same, started held: Shift was held at logon.
+    pub fn held(mut self) -> Shell {
+        self.held = true;
+        self.recent.clear();
+        for entry in &mut self.entries {
+            entry.report.running = false;
+        }
+        if let Some(state) = &mut self.state {
+            state.held = true;
+            state.claims.clear();
+        }
+        self
     }
 
     /// The same, as it looks once the daemon has gone away.

@@ -82,6 +82,9 @@ pub enum Request {
     Windows,
     /// Exit cleanly, restoring every baseline on the way out.
     Shutdown,
+    /// Start the plugins a held daemon kept back (`--held`, Shift at
+    /// logon). Nothing to do on a daemon that holds nothing back.
+    Resume,
     /// What the daemon knows about updates, after switching automatic
     /// installs on or off when `auto` is given.
     Updates {
@@ -140,6 +143,8 @@ pub enum Notification {
     Plugins,
     /// The update setting changed, or a check found something.
     Updates(Box<UpdateReport>),
+    /// The plugins a held daemon kept back have started.
+    Resumed,
     /// The daemon is going down. No further notification follows.
     Closing,
 }
@@ -285,6 +290,9 @@ pub struct StateReport {
     /// An enabled plugin or an unblocked manual claim; not a hardware readback.
     #[serde(default)]
     pub active: bool,
+    /// Started held: no plugin runs until [`Request::Resume`].
+    #[serde(default)]
+    pub held: bool,
     pub world: WorldReport,
     pub plugins: Vec<PluginReport>,
     pub claims: Vec<ClaimReport>,

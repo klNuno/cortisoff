@@ -49,7 +49,10 @@ pub const USAGE: &str = "cortisoff --daemon, the part that runs the plugins
     --no-tray         no icon in the notification area
     --no-eco          do not ask the system to schedule it as background work
     --no-guard        run in this process only, with no second process that
-                      starts it again after a crash";
+                      starts it again after a crash
+    --held            list every plugin but start none until a client resumes
+    --logon           what the logon task passes: Shift held in the next
+                      seconds means do not start at all";
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Options {
@@ -64,6 +67,8 @@ pub struct Options {
     pub no_tray: bool,
     pub no_eco: bool,
     pub no_guard: bool,
+    pub held: bool,
+    pub logon: bool,
     /// What was parsed, as given, for the guard to hand on.
     pub raw: Vec<String>,
 }
@@ -94,6 +99,8 @@ impl Options {
                 "--no-tray" => out.no_tray = true,
                 "--no-eco" => out.no_eco = true,
                 "--no-guard" => out.no_guard = true,
+                "--held" => out.held = true,
+                "--logon" => out.logon = true,
                 other => return Err(format!("{other} is not a daemon option\n\n{USAGE}")),
             }
         }
@@ -105,7 +112,20 @@ impl Options {
 /// one already answers. Returns once the process is started, not once it
 /// listens.
 pub fn spawn_detached(exe: &Path) -> Result<(), String> {
-    platform::spawn_detached(exe, "--daemon")
+    platform::spawn_detached(exe, &["--daemon"])
+}
+
+/// The same, with every plugin held back until a client resumes them.
+pub fn spawn_held(exe: &Path) -> Result<(), String> {
+    platform::spawn_detached(exe, &["--daemon", "--held"])
+}
+
+/// Whether a daemon started by hand now should hold its plugins: Shift
+/// turned the logon start away and nothing has started since, or Shift is
+/// down right now.
+pub fn start_held() -> bool {
+    let marked = Paths::from_env().is_ok_and(|paths| paths.held.exists());
+    marked || platform::shift_held()
 }
 
 /// `--autostart on|off|status`: starting the daemon at logon, from this
@@ -161,6 +181,25 @@ pub fn run(args: Options) -> Result<(), String> {
     let plugins_dir = args.plugins.clone().unwrap_or(paths.plugins);
     let store_path = args.store.clone().unwrap_or(paths.store);
 
+    // The guard watches; the worker it starts has `--logon` too, and must
+    // not wait a second time.
+    if args.logon && !args.no_guard && !args.doctor && turned_away_at_logon() {
+        if let Some(folder) = paths.held.parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        let _ = std::fs::write(&paths.held, b"");
+        if !args.no_log {
+            crate::append(
+                &log_path,
+                platform::now(),
+                Mark::Info,
+                "Shift was held at logon, so cortisoff did not start. Opening it starts the \
+                 daemon with every plugin held",
+            );
+        }
+        return Ok(());
+    }
+
     // A verbose run or a report needs no one to start it again.
     if !args.no_guard && !args.doctor && !args.verbose {
         return guard(&args, (!args.no_log).then_some(log_path.as_path()));
@@ -192,6 +231,10 @@ pub fn run(args: Options) -> Result<(), String> {
     };
     if !args.doctor && !args.no_eco {
         platform::efficiency_mode();
+    }
+    // This start is the one that counts now, held or not.
+    if !args.doctor {
+        let _ = std::fs::remove_file(&paths.held);
     }
 
     let mut warnings = Vec::new();
@@ -237,6 +280,15 @@ pub fn run(args: Options) -> Result<(), String> {
         .with_plugins_dir(&plugins_dir);
     for warning in warnings {
         supervisor.warn(warning);
+    }
+    if args.held && !args.doctor {
+        supervisor.hold();
+        log.line(
+            platform::now(),
+            Mark::Info,
+            "started held: plugins are listed, none runs until the window or \
+             `cortisoff-cli start` resumes them",
+        );
     }
 
     if args.doctor {
@@ -351,7 +403,7 @@ pub fn run(args: Options) -> Result<(), String> {
         // shortcut and the entry in Settings > Apps, as an update from the
         // window does.
         if let Some(exe) = &exe {
-            let _ = platform::spawn_detached(exe, "--register");
+            let _ = platform::spawn_detached(exe, &["--register"]);
         }
         // The new build takes the session lock and the pipe as it starts.
         drop(transport);
@@ -384,6 +436,17 @@ pub fn run(args: Options) -> Result<(), String> {
         },
     );
     Ok(())
+}
+
+/// `--logon`: watch Shift for a few seconds, where the system can read it.
+fn turned_away_at_logon() -> bool {
+    platform::READS_SHIFT
+        && crate::logon::shift_held_through(
+            crate::logon::WATCH,
+            crate::logon::HOLD,
+            platform::shift_held,
+            std::thread::sleep,
+        )
 }
 
 /// Start the thread that checks for updates. It wakes the loop through the
@@ -581,12 +644,19 @@ mod platform {
         cortisoff_win::autostart::enabled()
     }
 
-    pub fn spawn_detached(exe: &Path, arg: &str) -> Result<(), String> {
+    /// Read through `GetAsyncKeyState`.
+    pub const READS_SHIFT: bool = true;
+
+    pub fn shift_held() -> bool {
+        cortisoff_win::autostart::shift_held()
+    }
+
+    pub fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         std::process::Command::new(exe)
-            .arg(arg)
+            .args(args)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -764,10 +834,18 @@ mod platform {
         false
     }
 
-    pub fn spawn_detached(exe: &Path, arg: &str) -> Result<(), String> {
+    /// Not read here yet: macOS and Linux have their own login items, and
+    /// a logon start never waits for a key it cannot see.
+    pub const READS_SHIFT: bool = false;
+
+    pub fn shift_held() -> bool {
+        false
+    }
+
+    pub fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         std::process::Command::new(exe)
-            .arg(arg)
+            .args(args)
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -887,6 +965,15 @@ mod tests {
         let o = parse(&["--plugins", "/p", "--doctor", "--no-tray"]).unwrap();
         assert_eq!(o.plugins, Some(PathBuf::from("/p")));
         assert!(o.doctor && o.no_tray);
+    }
+
+    #[test]
+    fn the_logon_and_held_flags_parse() {
+        let o = parse(&["--logon"]).unwrap();
+        assert!(o.logon && !o.held);
+        let o = parse(&["--held", "--no-guard"]).unwrap();
+        assert!(o.held && o.no_guard && !o.logon);
+        assert_eq!(o.raw, ["--held", "--no-guard"]);
     }
 
     #[test]

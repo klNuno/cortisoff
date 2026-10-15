@@ -37,6 +37,8 @@ Windows 10 and 11:
 
 Closing the window leaves cortisoff running in the background; the window only shows and edits what it does. To remove it, use Uninstall in the settings page, or Settings > Apps. Your plugins and their settings stay, in case you come back.
 
+A plugin that misbehaves from the moment you log in: hold Shift while your session opens, until the desktop shows. cortisoff does not start. Open it from the Start Menu and it lists every plugin with none running and the logo off, so you can switch the culprit off first, then click the logo to start the rest. Holding Shift while you open the window does the same.
+
 ### Linux
 
 Download `cortisoff-linux-x86_64` from the same release page, make it executable with `chmod +x cortisoff-linux-x86_64`, and run it. It installs itself into `~/.local/bin`, adds an entry to the applications menu and starts with your session. `cortisoff --uninstall` removes it.
@@ -84,7 +86,7 @@ cortisoff-cli trace                   everything the daemon sees and does, live
 cortisoff-cli doctor                  what this machine can do, and what it cannot
 cortisoff-cli set <cap> <value>       a manual override, above every plugin
 cortisoff-cli clear <cap>             drop the override
-cortisoff-cli start | stop            start the daemon, or stop it and restore everything
+cortisoff-cli start | stop            start the daemon (or the plugins it holds), or stop it and restore everything
 cortisoff-cli update                  whether a new version is out
 cortisoff-cli update auto <on|off>    install new versions on its own, or not
 ```
