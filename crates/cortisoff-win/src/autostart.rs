@@ -10,6 +10,8 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+
 /// The name the task shows in Task Scheduler.
 pub const TASK_NAME: &str = "cortisoff";
 
@@ -51,6 +53,14 @@ fn disable_named(name: &str) -> Result<(), String> {
     schtasks(&["/Delete", "/TN", name, "/F"])
 }
 
+/// Whether either Shift key is down right now. Reads zero while another
+/// desktop has the input, the sign-in screen included, so a logon start
+/// watches for a while rather than looking once.
+pub fn shift_held() -> bool {
+    // The high bit is the key's state at this instant.
+    unsafe { GetAsyncKeyState(i32::from(VK_SHIFT.0)) < 0 }
+}
+
 fn exists(name: &str) -> bool {
     Command::new("schtasks")
         .args(["/Query", "/TN", name])
@@ -81,9 +91,12 @@ fn current_user() -> Option<String> {
     })
 }
 
-/// The task, as Task Scheduler's own schema. Ten seconds after logon, this
-/// user's token, no time limit, never a second copy, and nothing that stops it
-/// on battery.
+/// The task, as Task Scheduler's own schema. At logon, this user's token, no
+/// time limit, never a second copy, and nothing that stops it on battery.
+///
+/// `--logon` makes the daemon watch for Shift for ten seconds before it
+/// starts anything (`cortisoff-daemon`, `logon.rs`). That wait is also the
+/// one the desktop gets to settle, which used to be the task's own delay.
 ///
 /// One trigger, the logon. A crash in between is the guard's to answer
 /// (`cortisoff-daemon`, `guard.rs`): `--daemon` waits on the process that
@@ -108,7 +121,6 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
     <LogonTrigger>
       <Enabled>true</Enabled>
       <UserId>{user}</UserId>
-      <Delay>PT10S</Delay>
     </LogonTrigger>
   </Triggers>
   <Principals>
@@ -143,7 +155,7 @@ pub fn task_xml(daemon: &Path, user: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{command}</Command>
-      <Arguments>--daemon</Arguments>
+      <Arguments>--daemon --logon</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -167,7 +179,7 @@ mod tests {
     fn the_task_names_the_user_and_the_daemon_escaped() {
         let xml = task_xml(Path::new(r"C:\Tom & Jerry\cortisoff.exe"), r"PC\tom");
         assert!(xml.contains(r"<Command>C:\Tom &amp; Jerry\cortisoff.exe</Command>"));
-        assert!(xml.contains("<Arguments>--daemon</Arguments>"));
+        assert!(xml.contains("<Arguments>--daemon --logon</Arguments>"));
         assert_eq!(xml.matches(r"<UserId>PC\tom</UserId>").count(), 2);
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
     }

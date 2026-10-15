@@ -130,8 +130,17 @@ pub fn window(launch: Launch) -> Result<(), String> {
         return Ok(());
     };
 
+    // Shift held at logon kept the daemon from starting; held now, it keeps
+    // the plugins from starting. Either way the window opens on a daemon
+    // that lists every plugin and runs none, so the one at fault can be
+    // turned off first.
     if !client::daemon_running() {
-        if let Err(e) = cortisoff_daemon::spawn_detached(&exe) {
+        let started = if cortisoff_daemon::start_held() {
+            cortisoff_daemon::spawn_held(&exe)
+        } else {
+            cortisoff_daemon::spawn_detached(&exe)
+        };
+        if let Err(e) = started {
             problem = Some(format!("Could not start cortisoff: {e}"));
         }
     }

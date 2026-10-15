@@ -273,6 +273,10 @@ impl<J: JournalStore> Server<J> {
                 self.stopping = true;
                 Response::Ok
             }
+            Request::Resume => {
+                s.resume(host);
+                Response::Ok
+            }
         }
     }
 
@@ -401,6 +405,47 @@ mod tests {
         };
         let out = server.on_frame(ClientId(1), request(3, wrong), &mut host);
         assert!(matches!(responses(&out)[0], Response::Error { .. }));
+    }
+
+    /// Shift at logon: every plugin listed, none running, the one at fault
+    /// switched off before anything runs, then a resume starts the rest.
+    #[test]
+    fn a_held_daemon_runs_no_plugin_until_resumed() {
+        let (mut server, mut host) = setup();
+        server.supervisor_mut().hold();
+        server.supervisor_mut().start(&mut host);
+        let plugins = server.supervisor().plugins();
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].enabled && !plugins[0].running);
+        assert!(server.supervisor().state().held);
+
+        for (id, enabled) in [(1, false), (2, true)] {
+            let switch = Request::Enable {
+                id: "game".into(),
+                enabled,
+            };
+            let out = server.on_frame(ClientId(1), request(id, switch), &mut host);
+            assert_eq!(responses(&out), vec![&Response::Ok]);
+            let plugin = &server.supervisor().plugins()[0];
+            assert_eq!(plugin.enabled, enabled);
+            assert!(!plugin.running, "a switch never starts a held plugin");
+        }
+
+        server.on_frame(ClientId(1), request(3, Request::Subscribe), &mut host);
+        let out = server.on_frame(ClientId(1), request(4, Request::Resume), &mut host);
+        assert!(responses(&out).contains(&&Response::Ok));
+        assert!(out.iter().any(|o| matches!(
+            &o.frame,
+            Frame::Notification {
+                notification: Notification::Resumed
+            }
+        )));
+        assert!(server.supervisor().plugins()[0].running);
+        assert!(!server.supervisor().state().held);
+
+        // A second resume has nothing left to start and says nothing.
+        let out = server.on_frame(ClientId(1), request(5, Request::Resume), &mut host);
+        assert_eq!(responses(&out), vec![&Response::Ok]);
     }
 
     #[test]
