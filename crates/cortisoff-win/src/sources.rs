@@ -15,11 +15,11 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{NIN_BALLOONTIMEOUT, NIN_BALLOONUSERCLICK, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetForegroundWindow, GetWindowThreadProcessId, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_SYSTEM_FOREGROUND, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_INPUT,
-    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
-    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    DefWindowProcW, GetForegroundWindow, GetWindowThreadProcessId, EVENT_OBJECT_DESTROY,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, PBT_APMRESUMEAUTOMATIC,
+    PBT_POWERSETTINGCHANGE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_INPUT, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+    WM_TIMECHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 /// The keyboard twin of `NIN_SELECT`, Enter on a focused tray icon.
@@ -31,6 +31,7 @@ pub enum Raw {
     Foreground(isize),
     /// The foreground window moved or resized, which is where a maximise, a
     /// restore and a switch to borderless happen without the focus moving.
+    /// Also a window still filling another monitor changing at all.
     Moved,
     Lock(bool),
     DisplayChanged,
@@ -62,6 +63,9 @@ thread_local! {
     /// is the whole synchronisation story. No lock is taken inside a callback,
     /// which is the property that matters.
     static QUEUE: RefCell<Vec<Raw>> = const { RefCell::new(Vec::new()) };
+    /// The windows [`hook_filled`] listens for: the ones still filling a
+    /// monitor. Set from the pump, read in the callback.
+    static FILLED: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
 }
 
 pub fn push(raw: Raw) {
@@ -140,11 +144,7 @@ unsafe extern "system" fn on_foreground(
 ///
 /// `None` for no window, or when Windows refuses both.
 pub fn hook_location(foreground: HWND) -> Option<HWINEVENTHOOK> {
-    if foreground.is_invalid() {
-        return None;
-    }
-    let mut process = 0u32;
-    unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+    let process = process_of(foreground);
     if process == 0 {
         return None;
     }
@@ -183,6 +183,65 @@ unsafe extern "system" fn on_location(
         return;
     }
     push_once(Raw::Moved);
+}
+
+/// The process owning `hwnd`, 0 for no window.
+pub fn process_of(hwnd: HWND) -> u32 {
+    if hwnd.is_invalid() {
+        return 0;
+    }
+    let mut process = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
+    process
+}
+
+/// Tell the fullscreen hooks which windows they are listening for.
+pub fn listen_filled(hwnds: Vec<isize>) {
+    FILLED.with(|f| *f.borrow_mut() = hwnds);
+}
+
+/// A window still filling a monitor without the focus closed, hid,
+/// minimised, moved or resized. The location hook follows the focus, so a game
+/// left fullscreen on one monitor while the user types on another is heard
+/// through this one, scoped to its process: destroy, show, hide, state and
+/// location in one range, every other window of that process filtered out in
+/// the callback.
+pub fn hook_filled(process: u32) -> Option<HWINEVENTHOOK> {
+    if process == 0 {
+        return None;
+    }
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(on_filled),
+            process,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    (!hook.is_invalid()).then_some(hook)
+}
+
+unsafe extern "system" fn on_filled(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    const OBJID_WINDOW: i32 = 0;
+    const CHILDID_SELF: i32 = 0;
+    if id_object != OBJID_WINDOW || id_child != CHILDID_SELF || hwnd.is_invalid() {
+        return;
+    }
+    let ours = FILLED.with(|f| f.borrow().contains(&(hwnd.0 as isize)));
+    if ours {
+        push_once(Raw::Moved);
+    }
 }
 
 pub fn watch_session(window: HWND) -> bool {

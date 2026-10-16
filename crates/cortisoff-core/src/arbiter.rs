@@ -60,6 +60,14 @@ impl Arbiter {
         &self.table
     }
 
+    /// The index of `id`, given a stack of its own when it is new: one output
+    /// of a capability, the first time anyone claims it.
+    pub fn intern(&mut self, id: cortisoff_host::CapabilityId) -> CapIndex {
+        let i = self.table.intern(id);
+        self.slots.resize_with(self.table.len(), Slot::default);
+        i
+    }
+
     /// Who currently drives this capability, for `cortisoff trace`.
     pub fn holder(&self, cap: CapIndex) -> Option<OwnerId> {
         self.top(cap).map(|c| c.owner)

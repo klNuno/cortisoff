@@ -443,6 +443,7 @@ impl LinuxHost {
             self.fullscreen = state.fullscreen;
             out.push(Event::Fullscreen {
                 exclusive: state.fullscreen,
+                outputs: Vec::new(),
             });
             // Fullscreen holds idle at zero, so its edge moves idle too.
             if self.idle_watched {
@@ -593,6 +594,7 @@ impl LinuxHost {
         self.maximized = state.maximized;
         out.push(Event::Fullscreen {
             exclusive: self.fullscreen,
+            outputs: Vec::new(),
         });
         out.push(self.sample_idle());
         out.push(Event::SessionLock {

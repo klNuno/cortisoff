@@ -52,6 +52,10 @@ pub struct MockActuator {
     clock: Rc<Cell<u64>>,
     /// How long `capture` takes, as reading a panel over DDC/CI does.
     capture_ms: Cell<u64>,
+    /// Set for an actuator that holds outputs apart, with what each one holds.
+    outputs: Option<RefCell<BTreeMap<String, Value>>>,
+    /// The last baseline captured, which an apply recognises as a restore.
+    captured: RefCell<Option<Value>>,
 }
 
 impl Actuator for MockActuator {
@@ -62,18 +66,55 @@ impl Actuator for MockActuator {
     fn capture(&self) -> Result<Value, ActuatorError> {
         self.trace.push(format!("capture {}", self.id));
         self.clock.set(self.clock.get() + self.capture_ms.get());
-        match &self.opaque {
-            Some((baseline, _)) => Ok(baseline.clone()),
-            None => Ok(self.state.borrow().clone()),
-        }
+        let value = match &self.opaque {
+            Some((baseline, _)) => baseline.clone(),
+            None => self.state.borrow().clone(),
+        };
+        *self.captured.borrow_mut() = Some(value.clone());
+        Ok(value)
     }
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError> {
         self.trace.push(format!("apply {} {:?}", self.id, value));
+        // The baseline back lets go of every output, as a real one does.
+        if let Some(outputs) = &self.outputs {
+            let baseline = match &self.opaque {
+                Some((baseline, _)) => baseline == value,
+                None => self.captured.borrow().as_ref() == Some(value),
+            };
+            if baseline {
+                outputs.borrow_mut().clear();
+            }
+        }
         *self.state.borrow_mut() = match &self.opaque {
             Some((baseline, rest)) if baseline == value => rest.clone(),
             _ => value.clone(),
         };
+        Ok(())
+    }
+
+    fn per_output(&self) -> bool {
+        self.outputs.is_some()
+    }
+
+    fn apply_output(&self, output: &str, value: &Value) -> Result<(), ActuatorError> {
+        let Some(outputs) = &self.outputs else {
+            return Err(ActuatorError::on(self.id.clone(), "no outputs"));
+        };
+        self.trace
+            .push(format!("apply {} on {output} {:?}", self.id, value));
+        outputs
+            .borrow_mut()
+            .insert(output.to_owned(), value.clone());
+        Ok(())
+    }
+
+    fn release_output(&self, output: &str) -> Result<(), ActuatorError> {
+        let Some(outputs) = &self.outputs else {
+            return Err(ActuatorError::on(self.id.clone(), "no outputs"));
+        };
+        self.trace.push(format!("release {} on {output}", self.id));
+        outputs.borrow_mut().remove(output);
         Ok(())
     }
 
@@ -243,6 +284,8 @@ impl MockHost {
                 opaque: None,
                 clock: self.spent.clone(),
                 capture_ms: Cell::new(0),
+                outputs: None,
+                captured: RefCell::new(None),
             },
         );
         self
@@ -263,6 +306,8 @@ impl MockHost {
                 opaque: Some((baseline, rest)),
                 clock: self.spent.clone(),
                 capture_ms: Cell::new(0),
+                outputs: None,
+                captured: RefCell::new(None),
             },
         );
         self
@@ -283,6 +328,25 @@ impl MockHost {
         if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
             actuator.capture_ms.set(ms);
         }
+    }
+
+    /// This actuator holds outputs apart, as a colour temperature does
+    /// monitor by monitor.
+    pub fn with_outputs(mut self, id: &str) -> Self {
+        if let Some(actuator) = self.actuators.get_mut(&CapabilityId::new(id)) {
+            actuator.outputs = Some(RefCell::default());
+        }
+        self
+    }
+
+    /// What one output shows: its own value, else the whole actuator's.
+    pub fn output_value(&self, id: &str, output: &str) -> Option<Value> {
+        let actuator = self.actuators.get(&CapabilityId::new(id))?;
+        let own = actuator
+            .outputs
+            .as_ref()
+            .and_then(|o| o.borrow().get(output).cloned());
+        Some(own.unwrap_or_else(|| actuator.state.borrow().clone()))
     }
 
     /// Queue an event for the next `poll`, as a platform would.

@@ -64,6 +64,13 @@ impl Rig {
         }
     }
 
+    /// A colour temperature that holds one monitor apart, as on Windows.
+    fn apart() -> Self {
+        let mut rig = Self::new();
+        rig.host = std::mem::take(&mut rig.host).with_outputs("display.color_temp");
+        rig
+    }
+
     fn with<R>(&mut self, f: impl FnOnce(&mut Env) -> R) -> R {
         let probed = self.host.probe();
         let now = self.host.monotonic_ms();
@@ -480,9 +487,17 @@ fn night_light_fades_in_seconds_and_zero_is_instant() {
     assert_eq!(fade_for(serde_json::json!({ "fade": 30 })), Some(300_000));
 }
 
-/// A fullscreen game sends the colour away and its end brings it back within
-/// a second, whatever the evening fade. A maximised window changes nothing:
-/// a browser maximised all evening is not a film.
+fn fullscreen(exclusive: bool, outputs: &[&str]) -> Event {
+    Event::Fullscreen {
+        exclusive,
+        outputs: outputs.iter().map(|o| o.to_string()).collect(),
+    }
+}
+
+/// A fullscreen game with no screen named sends the colour away everywhere,
+/// and its end brings it back, both in a quick fade whatever the evening one
+/// is. A maximised window changes nothing: a browser maximised all evening
+/// is not a film.
 #[test]
 fn night_light_stands_aside_for_fullscreen_only_and_comes_back_quickly() {
     let mut rig = Rig::new();
@@ -500,20 +515,103 @@ fn night_light_stands_aside_for_fullscreen_only_and_comes_back_quickly() {
     );
     assert_eq!(rt.report("night-light").unwrap().state["holding"], true);
 
-    let full = Event::Fullscreen { exclusive: true };
+    let full = fullscreen(true, &[]);
     rig.world.absorb(&full);
     let out = rig.with(|env| rt.on_event(env, &full));
     assert!(
         out.iter()
-            .any(|c| matches!(c, Command::Release { fade_ms: 1000, .. })),
+            .any(|c| matches!(c, Command::Release { cap, fade_ms: 800, .. } if cap.as_str() == "display.color_temp")),
         "{out:?}"
     );
     assert_eq!(rt.report("night-light").unwrap().state["reason"], "filled");
 
-    let back = Event::Fullscreen { exclusive: false };
+    let back = fullscreen(false, &[]);
     rig.world.absorb(&back);
     let out = rig.with(|env| rt.on_event(env, &back));
-    assert_eq!(night_fade(&out), Some(1000));
+    assert_eq!(night_fade(&out), Some(800));
+}
+
+/// Even set to instant, a fullscreen game fades the colour away: a snap from
+/// 3200 K to daylight as a game opens reads as a glitch.
+#[test]
+fn night_light_fades_out_of_the_way_even_when_set_to_instant() {
+    let mut rig = Rig::new();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 0 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let full = fullscreen(true, &[]);
+    rig.world.absorb(&full);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter()
+            .any(|c| matches!(c, Command::Release { fade_ms: 800, .. })),
+        "{out:?}"
+    );
+}
+
+/// A game fullscreen on one monitor takes the warmth off that monitor only.
+/// It stays off while the focus is on another monitor, and comes back when
+/// the game leaves.
+#[test]
+fn night_light_spares_only_the_screen_a_game_fills() {
+    let mut rig = Rig::apart();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let one = r"display.color_temp@\\.\DISPLAY3";
+
+    let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&full);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+    assert!(
+        !out.iter().any(|c| matches!(c, Command::Release { .. })),
+        "the other screens stay warm: {out:?}"
+    );
+    let state = rt.report("night-light").unwrap().state;
+    assert_eq!(state["holding"], true);
+    assert_eq!(state["spared"], 1);
+
+    // The focus goes to another monitor, the game stays on its own.
+    let away = fullscreen(false, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&away);
+    let out = rig.with(|env| rt.on_event(env, &away));
+    assert!(
+        !out.iter().any(|c| matches!(c, Command::Release { .. })),
+        "{out:?}"
+    );
+
+    let gone = fullscreen(false, &[]);
+    rig.world.absorb(&gone);
+    let out = rig.with(|env| rt.on_event(env, &gone));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 800, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+    assert_eq!(rt.report("night-light").unwrap().state["spared"], 0);
+}
+
+/// Where one monitor cannot be held apart, a fullscreen game pauses every
+/// screen, as it always did.
+#[test]
+fn night_light_pauses_every_screen_where_one_cannot_be_spared() {
+    let mut rig = Rig::new();
+    let mut rt = Runtime::new(night_light(), &on(&["night-light"]), None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let full = fullscreen(true, &["A"]);
+    rig.world.absorb(&full);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 800, .. } if cap.as_str() == "display.color_temp")),
+        "{out:?}"
+    );
+    assert_eq!(rt.report("night-light").unwrap().state["reason"], "filled");
 }
 
 /// Display profiles says so when the session never names the app in front,
