@@ -147,24 +147,46 @@ impl<J: JournalStore> Dispatcher<J> {
         cap: &CapabilityId,
         value: &Value,
     ) -> Result<(), ActuatorError> {
+        // One output of a capability shares the whole capability's actuator
+        // and baseline: the journal entry covers every output at once.
+        let output = cap.output();
+        let whole = output
+            .as_ref()
+            .map_or_else(|| cap.clone(), |(p, _)| p.clone());
         let actuator = host
-            .actuator(cap)
+            .actuator(&whole)
             .ok_or_else(|| ActuatorError::on(cap.clone(), "no actuator for this capability"))?;
-        if !self.captured.contains_key(cap) {
+        if !self.captured.contains_key(&whole) {
             let baseline = actuator.capture()?;
             if !actuator.volatile() {
                 // Durable before the apply, or a crash between the two leaves
                 // no way back. A failing journal therefore aborts the apply:
                 // a screen that keeps its colour is better than one that
                 // cannot get it back.
-                self.journal.record(cap, &baseline)?;
+                self.journal.record(&whole, &baseline)?;
             }
-            self.captured.insert(cap.clone(), baseline);
+            self.captured.insert(whole, baseline);
         }
-        actuator.apply(value)
+        match output {
+            Some((_, output)) => actuator.apply_output(output, value),
+            None => actuator.apply(value),
+        }
     }
 
     fn restore(&mut self, host: &dyn Host, cap: &CapabilityId) -> Result<(), ActuatorError> {
+        // Nobody holds one output any more: it shows the whole capability
+        // again. The baseline stays captured, since it covers the others, and
+        // goes only with the whole capability's own restore. When that came
+        // first, everything is back already.
+        if let Some((whole, output)) = cap.output() {
+            if !self.captured.contains_key(&whole) {
+                return Ok(());
+            }
+            let actuator = host
+                .actuator(&whole)
+                .ok_or_else(|| ActuatorError::on(cap.clone(), "no actuator for this capability"))?;
+            return actuator.release_output(output);
+        }
         // Nothing captured means nothing was ever applied. The arbiter does
         // not emit that, but tolerating it costs nothing.
         let Some(baseline) = self.captured.get(cap).cloned() else {
@@ -206,6 +228,93 @@ mod tests {
 
     fn restore_action(cap_id: &str) -> Action {
         Action::RestoreBaseline { cap: cap(cap_id) }
+    }
+
+    const SCREEN: &str = r"\\.\DISPLAY3";
+
+    /// One output held first, before anything holds the whole capability:
+    /// the whole baseline is captured and journaled under the capability's
+    /// own name, then only that output is touched.
+    #[test]
+    fn one_output_journals_the_whole_baseline_first() {
+        let host = MockHost::new()
+            .with_actuator(TEMP, Value::Int(6600), false)
+            .with_outputs(TEMP);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        let one = cap(TEMP).on_output(SCREEN);
+
+        let out = d.execute(
+            &host,
+            vec![Action::Apply {
+                cap: one.clone(),
+                value: Value::Int(5000),
+            }],
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            host.trace().events(),
+            vec![
+                format!("capture {TEMP}"),
+                format!("journal {TEMP}"),
+                format!("apply {TEMP} on {SCREEN} Int(5000)"),
+            ]
+        );
+        assert_eq!(host.output_value(TEMP, SCREEN), Some(Value::Int(5000)));
+        assert_eq!(host.output_value(TEMP, "other"), Some(Value::Int(6600)));
+
+        // Letting the output go keeps the baseline: it covers the others.
+        d.execute(&host, vec![Action::RestoreBaseline { cap: one }]);
+        assert_eq!(host.output_value(TEMP, SCREEN), Some(Value::Int(6600)));
+        assert!(d.baseline(&cap(TEMP)).is_some());
+        assert_eq!(
+            host.trace().events().last().unwrap(),
+            &format!("release {TEMP} on {SCREEN}")
+        );
+    }
+
+    /// The whole capability went back first, a shutdown releasing in table
+    /// order: the output's own release has nothing left to do.
+    #[test]
+    fn an_output_released_after_the_whole_restore_is_a_no_op() {
+        let host = MockHost::new()
+            .with_actuator(TEMP, Value::Int(6600), false)
+            .with_outputs(TEMP);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        let one = cap(TEMP).on_output(SCREEN);
+        d.execute(
+            &host,
+            vec![
+                apply_action(TEMP, 3000),
+                Action::Apply {
+                    cap: one.clone(),
+                    value: Value::Int(6600),
+                },
+            ],
+        );
+        let out = d.execute(
+            &host,
+            vec![restore_action(TEMP), Action::RestoreBaseline { cap: one }],
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(!host
+            .trace()
+            .events()
+            .iter()
+            .any(|e| e.starts_with("release")));
+    }
+
+    #[test]
+    fn an_actuator_without_outputs_refuses_one() {
+        let host = MockHost::new().with_actuator(TEMP, Value::Int(6600), false);
+        let mut d = Dispatcher::new(MemJournal::new(host.trace()));
+        let out = d.execute(
+            &host,
+            vec![Action::Apply {
+                cap: cap(TEMP).on_output(SCREEN),
+                value: Value::Int(5000),
+            }],
+        );
+        assert_eq!(out.errors.len(), 1);
     }
 
     #[test]

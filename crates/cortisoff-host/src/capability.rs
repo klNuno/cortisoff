@@ -18,7 +18,39 @@ impl CapabilityId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The same capability held on one output only, `display.color_temp` on
+    /// `\\.\DISPLAY3` being `display.color_temp@\\.\DISPLAY3`.
+    ///
+    /// Such a capability is a stack of its own in the arbiter, layered over
+    /// its parent: whatever it holds wins on that one output, and with nothing
+    /// held there the output shows the parent's value again. It shares the
+    /// parent's actuator, baseline and journal entry; see
+    /// [`crate::Actuator::apply_output`].
+    pub fn on_output(&self, output: &str) -> Self {
+        Self(format!("{}{OUTPUT_MARK}{output}", self.parent_str()))
+    }
+
+    /// The capability and the output an id names, `None` for a whole one.
+    pub fn output(&self) -> Option<(CapabilityId, &str)> {
+        self.0
+            .split_once(OUTPUT_MARK)
+            .map(|(parent, output)| (CapabilityId::new(parent), output))
+    }
+
+    /// The whole capability, itself when it is one.
+    pub fn parent(&self) -> CapabilityId {
+        CapabilityId::new(self.parent_str())
+    }
+
+    fn parent_str(&self) -> &str {
+        self.0.split_once(OUTPUT_MARK).map_or(&self.0, |(p, _)| p)
+    }
 }
+
+/// Separates a capability from the output it is held on. No capability id
+/// and no output name on any platform contains it.
+const OUTPUT_MARK: char = '@';
 
 impl std::fmt::Display for CapabilityId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,8 +58,9 @@ impl std::fmt::Display for CapabilityId {
     }
 }
 
-/// Index into the engine's capability table. Valid only for the set it came
-/// from, which is built once at load and never mutated afterwards.
+/// Index into the engine's capability table. Valid only for the table it
+/// came from, which only ever grows: every probed capability at load, then
+/// each capability held on one output the first time a plugin asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapIndex(pub u16);
 
@@ -154,4 +187,22 @@ pub mod ids {
     pub const DISPLAY_COLOR_TEMP: &str = "display.color_temp";
     pub const DISPLAY_MODE: &str = "display.mode";
     pub const WALLPAPER_PLAYBACK: &str = "wallpaper.playback";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_output_names_its_capability_and_back() {
+        let whole = CapabilityId::new(ids::DISPLAY_COLOR_TEMP);
+        let one = whole.on_output(r"\\.\DISPLAY3");
+        assert_eq!(one.as_str(), r"display.color_temp@\\.\DISPLAY3");
+        assert_eq!(one.output(), Some((whole.clone(), r"\\.\DISPLAY3")));
+        assert_eq!(one.parent(), whole);
+        assert_eq!(whole.output(), None);
+        assert_eq!(whole.parent(), whole);
+        // Asking an output for another output moves it, never nests.
+        assert_eq!(one.on_output("b").as_str(), "display.color_temp@b");
+    }
 }

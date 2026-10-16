@@ -335,6 +335,7 @@ impl MacHost {
             self.fullscreen = fit.fullscreen;
             out.push(Event::Fullscreen {
                 exclusive: fit.fullscreen,
+                outputs: Vec::new(),
             });
             // A game taking the screen is where a display's tables are most
             // likely to be rewritten under a held tint, by the game or by
@@ -362,6 +363,7 @@ impl MacHost {
             clock::time_of_day(),
             Event::Fullscreen {
                 exclusive: self.fullscreen,
+                outputs: Vec::new(),
             },
             idle,
             Event::SessionLock {

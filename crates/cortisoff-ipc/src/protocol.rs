@@ -277,6 +277,9 @@ pub struct ClaimReport {
 pub struct WorldReport {
     pub app: Option<AppRef>,
     pub fullscreen: bool,
+    /// The outputs a fullscreen app covers, by the platform's own names.
+    #[serde(default)]
+    pub filled: Vec<String>,
     pub maximized: bool,
     pub idle: bool,
     pub locked: bool,

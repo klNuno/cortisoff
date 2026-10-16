@@ -32,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::Audio;
 use crate::colortemp::ColorTemp;
 use crate::hotkeys::Hotkeys;
+use crate::maximized::Filled;
 use crate::mode::DisplayMode;
 use crate::names::Names;
 use crate::notice::Notice;
@@ -128,6 +129,13 @@ pub struct WinHost {
     borderless: bool,
     /// What `app.fullscreen` last said: either of the two above.
     any_fullscreen: bool,
+    /// Windows still filling a monitor, focused or not.
+    filled: Filled,
+    /// The monitors `app.fullscreen` last listed.
+    outputs: Vec<String>,
+    /// One hook per process holding a filled window other than the focused
+    /// one, with its pid, so closing or shrinking it is heard without a poll.
+    filled_hooks: Vec<(u32, HWINEVENTHOOK)>,
     maximized: bool,
     on_battery: bool,
     audio_active: bool,
@@ -202,6 +210,9 @@ impl WinHost {
             fullscreen: false,
             borderless: false,
             any_fullscreen: false,
+            filled: Filled::default(),
+            outputs: Vec::new(),
+            filled_hooks: Vec::new(),
             maximized: false,
             on_battery: false,
             audio_active: false,
@@ -233,7 +244,7 @@ impl WinHost {
         let mut out = Vec::new();
         if self.color_temp.is_some() && !crate::screen::gamma_range_unlocked() {
             out.push(
-                r"Windows refuses a gamma ramp below about 3400 K, so a warmer colour temperature keeps its red and green and stops its blue at half: 3000 K is close, 2000 K is a strong orange rather than candlelight. Lifting the clamp is one registry value, HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange set to 256, admin once plus a reboot"
+                r"Windows refuses a gamma ramp warmer than about 3250 K, so a warmer colour temperature is held there on every monitor, the HDR one included so they all match: 3000 K shows as about 3250 K, 2000 K as a light orange rather than candlelight. Lifting the clamp is one registry value, HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange set to 256, admin once plus a reboot"
                     .to_owned(),
             );
         }
@@ -367,6 +378,9 @@ impl WinHost {
         if let Some(hook) = self.location_hook.take() {
             sources::unhook_foreground(hook);
         }
+        if !self.location_wanted {
+            self.unhook_filled();
+        }
         if !self.location_wanted || hwnd.is_invalid() {
             return true;
         }
@@ -398,7 +412,7 @@ impl WinHost {
     }
 
     /// Whether the focused window fills its monitor, and whether anything is
-    /// fullscreen, each pushed only on a change.
+    /// fullscreen and where, each pushed only on a change.
     fn fill_events(&mut self, hwnd: HWND) -> Vec<Event> {
         let fill = crate::maximized::fill(hwnd);
         let mut out = Vec::new();
@@ -409,19 +423,98 @@ impl WinHost {
             });
         }
         self.borderless = fill.fullscreen;
+        self.filled
+            .refresh(hwnd, self.fullscreen || self.borderless);
+        self.listen_filled(hwnd);
         out.extend(self.fullscreen_event());
         out
     }
 
+    /// Hook the processes holding a filled window other than the focused
+    /// one, and only those, dropping the hooks of windows that left the list.
+    ///
+    /// The location hook follows the focus and keeps only the focused
+    /// window, so without these a game left fullscreen on one monitor would
+    /// stay listed after it closed, until the next focus change. Keyed on the
+    /// window rather than on its process differing from the focused one: a
+    /// browser playing a film on one monitor while another of its windows has
+    /// the focus is one process, and the location hook would miss the film.
+    fn listen_filled(&mut self, foreground: HWND) {
+        let others: Vec<isize> = if self.location_wanted {
+            self.filled
+                .windows()
+                .filter(|hwnd| *hwnd != foreground.0 as isize)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut wanted: Vec<u32> = others
+            .iter()
+            .map(|hwnd| sources::process_of(HWND(*hwnd as *mut _)))
+            .filter(|process| *process != 0)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.filled_hooks.retain(|(process, hook)| {
+            let keep = wanted.contains(process);
+            if !keep {
+                sources::unhook_foreground(*hook);
+            }
+            keep
+        });
+        for process in wanted {
+            if self.filled_hooks.iter().any(|(p, _)| *p == process) {
+                continue;
+            }
+            match sources::hook_filled(process) {
+                Some(hook) => self.filled_hooks.push((process, hook)),
+                None => eprintln!(
+                    "warning: SetWinEventHook refused the fullscreen hook for process {process}, its monitor stays listed until the next focus change"
+                ),
+            }
+        }
+        sources::listen_filled(others);
+    }
+
+    fn unhook_filled(&mut self) {
+        for (_, hook) in self.filled_hooks.drain(..) {
+            sources::unhook_foreground(hook);
+        }
+        sources::listen_filled(Vec::new());
+    }
+
+    /// Read exclusive fullscreen again. A cheap one-shot call, made when the
+    /// focus moves or the focused window changes shape, which is exactly when
+    /// an application takes the screen or gives it back.
+    ///
+    /// The colour backend is chosen per apply, and exclusive fullscreen is
+    /// where the magnifier stops reaching the screen and where a game may
+    /// load a ramp of its own. A tint held across that edge is pushed again
+    /// through whichever backend works now.
+    fn read_exclusive(&mut self) -> Option<Event> {
+        let exclusive = self.fullscreen_now();
+        let crossed = exclusive != self.fullscreen;
+        self.fullscreen = exclusive;
+        (crossed && self.color_temp.is_some()).then(|| Event::Reapply {
+            cap: CapabilityId::new(ids::DISPLAY_COLOR_TEMP),
+        })
+    }
+
     /// `app.fullscreen`: exclusive, a presentation, or a borderless window
-    /// over its whole monitor. Only on a change.
+    /// over its whole monitor, with every monitor showing one. Only on a
+    /// change of either.
     fn fullscreen_event(&mut self) -> Option<Event> {
         let any = self.fullscreen || self.borderless;
-        if any == self.any_fullscreen {
+        let outputs = self.filled.outputs();
+        if any == self.any_fullscreen && outputs == self.outputs {
             return None;
         }
         self.any_fullscreen = any;
-        Some(Event::Fullscreen { exclusive: any })
+        self.outputs.clone_from(&outputs);
+        Some(Event::Fullscreen {
+            exclusive: any,
+            outputs,
+        })
     }
 
     /// Everything a plugin could already be told about, pushed before the first
@@ -436,10 +529,14 @@ impl WinHost {
         self.maximized = fill.maximized;
         self.borderless = fill.fullscreen;
         self.any_fullscreen = self.fullscreen || self.borderless;
+        self.filled.refresh(hwnd, self.any_fullscreen);
+        self.listen_filled(hwnd);
+        self.outputs = self.filled.outputs();
         let mut out = vec![
             self.clock(),
             Event::Fullscreen {
                 exclusive: self.any_fullscreen,
+                outputs: self.outputs.clone(),
             },
             idle_event,
             Event::SessionLock { locked: false },
@@ -469,26 +566,22 @@ impl WinHost {
                     );
                 }
                 let mut out: Vec<Event> = self.foreground_event(hwnd).into_iter().collect();
-                // Cheap one-shot read, and the moment it can change is exactly
-                // an application taking the screen.
-                let exclusive = self.fullscreen_now();
-                let crossed = exclusive != self.fullscreen;
-                self.fullscreen = exclusive;
+                let crossed = self.read_exclusive();
                 out.extend(self.fill_events(hwnd));
-                // The colour backend is chosen per apply, and exclusive
-                // fullscreen is where the magnifier stops reaching the
-                // screen. A tint held across that edge has to be pushed
-                // again through whichever backend works now.
-                if crossed && self.color_temp.is_some() {
-                    out.push(Event::Reapply {
-                        cap: CapabilityId::new(ids::DISPLAY_COLOR_TEMP),
-                    });
-                }
+                out.extend(crossed);
                 out
             }
+            // The focused window moved or resized in place: F11, a film's
+            // fullscreen button, a game switching its own mode. None of them
+            // moves the focus, so this is the only way to see them. Also a
+            // window left fullscreen on another monitor closing, hiding,
+            // minimising or resizing, heard through `hook_filled`.
             Raw::Moved => {
                 let hwnd = unsafe { GetForegroundWindow() };
-                self.fill_events(hwnd)
+                let crossed = self.read_exclusive();
+                let mut out = self.fill_events(hwnd);
+                out.extend(crossed);
+                out
             }
             Raw::Lock(locked) => vec![Event::SessionLock { locked }],
             // Answered now and again as the configuration settles: see SETTLE.
@@ -744,10 +837,11 @@ impl Host for WinHost {
     fn install_sources(&mut self, wanted: &[CapabilityId]) -> Result<(), ActuatorError> {
         let asked = |id: &str| wanted.iter().any(|c| c.as_str() == id);
 
-        // A plugin reading only whether something is maximised still needs to
-        // know when the focus moves to a window that is, so the foreground
-        // hook serves both.
-        let foreground = asked(ids::APP_FOCUS) || asked(ids::APP_MAXIMIZED);
+        // A plugin reading only whether something is maximised or fullscreen
+        // still needs to know when the focus moves to a window that is, so
+        // the foreground hook serves all three.
+        let shape = asked(ids::APP_MAXIMIZED) || asked(ids::APP_FULLSCREEN);
+        let foreground = asked(ids::APP_FOCUS) || shape;
         match (foreground, self.foreground_hook) {
             (true, None) => {
                 self.foreground_hook = Some(sources::hook_foreground().ok_or_else(|| {
@@ -764,10 +858,13 @@ impl Host for WinHost {
             _ => {}
         }
 
-        let maximized = asked(ids::APP_MAXIMIZED);
-        if maximized != self.location_wanted {
-            self.location_wanted = maximized;
-            let foreground = if maximized {
+        // Until 0.3.0 only `app.maximized` asked for the location hook, and
+        // Night light watches `app.fullscreen`: a window going fullscreen in
+        // place, or leaving it, was only seen at the next focus change, and
+        // the tint then switched at some random later click.
+        if shape != self.location_wanted {
+            self.location_wanted = shape;
+            let foreground = if shape {
                 unsafe { GetForegroundWindow() }
             } else {
                 HWND::default()
@@ -947,6 +1044,7 @@ impl Drop for WinHost {
         if let Some(hook) = self.location_hook.take() {
             sources::unhook_foreground(hook);
         }
+        self.unhook_filled();
         if self.session_watched {
             sources::unwatch_session(self.window);
         }

@@ -21,7 +21,9 @@ local CAP = "display.color_temp"
 local MAX_FADE = 300
 -- A fullscreen game starting, an exception or a pause: the colour gets out of
 -- the way quickly whatever the evening fade is, and comes back as quickly.
-local QUICK_MS = 1000
+-- Always a fade, even with the evening one set to instant: a screen that
+-- snaps from 3200 K to daylight as a game opens reads as a glitch.
+local QUICK_MS = 800
 
 local function clock(minute)
   minute = math.floor(minute + 0.5) % 1440
@@ -92,18 +94,55 @@ local paused_until, resume_timer, edge_timer
 -- The next change is quick rather than a whole evening fade: the way back
 -- from a reason to stand aside, or a setting just edited.
 local quick_next = false
+-- Outputs a fullscreen app covers, given their own colours while the others
+-- stay warm. False once the platform said it cannot hold one output apart:
+-- then a fullscreen app pauses every screen, as before.
+local spared, apart = {}, true
 
 local settle
+
+-- Give the outputs in `keep` back to the night, quickly. Every one when
+-- `keep` is empty.
+local function unspare(cx, keep)
+  for output in pairs(spared) do
+    if not keep[output] then
+      cx:release(CAP, { output = output, fade = QUICK_MS })
+      spared[output] = nil
+    end
+  end
+end
+
+-- Hold each filled output at the colour it has with nothing on it. False when
+-- that cannot be done here, after letting go of any already held.
+local function spare(cx, outputs)
+  local rest = cx:rest(CAP)
+  for output in pairs(outputs) do
+    if not spared[output] then
+      local ok = rest and cx:claim(CAP, rest, { output = output, fade = QUICK_MS })
+      if not ok then
+        apart = false
+        unspare(cx, {})
+        return false
+      end
+      spared[output] = true
+    end
+  end
+  return true
+end
 
 function settle(cx, s)
   local minute, mono = cx:now()
   local world = cx:world()
   local night = minute and phase(s, minute)
   local fade = fade_s(s) * 1000
+  local filled = {}
+  for _, output in ipairs(world.filled or {}) do filled[output] = true end
+  local some_filled = next(filled) ~= nil
   local reason
   if paused_until and mono < paused_until then
     reason = "paused"
-  elseif s.pause_when_filled and world.fullscreen then
+  elseif s.pause_when_filled and world.fullscreen and not (apart and some_filled) then
+    -- Fullscreen with no output named, or outputs that cannot be held apart.
     reason = "filled"
   elseif excepted(s, world.app) then
     reason = "except"
@@ -111,20 +150,33 @@ function settle(cx, s)
     reason = "no clock"
   end
 
-  local quick = math.min(fade, QUICK_MS)
+  local keep = {}
   if reason then
-    cx:release(CAP, { fade = quick })
+    cx:release(CAP, { fade = QUICK_MS })
   elseif night then
-    local ok, err = cx:claim(CAP, round(s.night), { fade = quick_next and quick or fade })
-    if not ok then reason = err end
+    local ok, err = cx:claim(CAP, round(s.night), { fade = quick_next and QUICK_MS or fade })
+    if not ok then
+      reason = err
+    elseif s.pause_when_filled and some_filled and apart then
+      if spare(cx, filled) then
+        keep = filled
+      elseif world.fullscreen then
+        reason = "filled"
+        cx:release(CAP, { fade = QUICK_MS })
+      end
+    end
   else
-    cx:release(CAP, { fade = quick_next and quick or fade })
+    cx:release(CAP, { fade = quick_next and QUICK_MS or fade })
   end
+  unspare(cx, keep)
   quick_next = reason ~= nil
 
+  local count = 0
+  for _ in pairs(spared) do count = count + 1 end
   cx:publish({
     kelvin = round(minute and kelvin_at(s, minute) or s.day),
     holding = reason == nil and night == true,
+    spared = count,
     reason = reason,
     paused_until = paused_until and minute and clock(minute + (paused_until - mono) / 60000),
   })
@@ -142,6 +194,7 @@ end
 
 function plugin.start(cx, s)
   edge_timer, quick_next = nil, false
+  spared, apart = {}, true
   cx:watch("app.focus")
   cx:watch("app.fullscreen")
   cx:watch("clock")
@@ -168,6 +221,7 @@ function plugin.on(cx, s, ev)
 end
 
 function plugin.stop(cx)
+  unspare(cx, {})
   cx:release(CAP, { fade = QUICK_MS })
 end
 
@@ -257,11 +311,11 @@ function plugin.status(s, st)
   elseif st.reason then
     return { line = "Cannot tint", detail = st.reason, state = "failed" }
   elseif st.holding then
-    return {
-      line = string.format("%d K", st.kelvin),
-      detail = string.format("Warm until %s", clock(s.morning)),
-      state = "holding",
-    }
+    local detail = string.format("Warm until %s", clock(s.morning))
+    if (st.spared or 0) > 0 then
+      detail = detail .. ", except the fullscreen screen"
+    end
+    return { line = string.format("%d K", st.kelvin), detail = detail, state = "holding" }
   end
   return { line = "Daylight", detail = "Warms at " .. clock(s.evening), state = "waiting" }
 end
@@ -326,7 +380,7 @@ function plugin.page(ui, s, st)
   ui:space(12)
 
   ui:card("Exceptions", function(ui)
-    ui:row("Pause while an app is fullscreen", "Games and films keep their colours.",
+    ui:row("Pause while an app is fullscreen", "Games and films keep their colours on their screen.",
       function(ui) s.pause_when_filled = ui:switch(s.pause_when_filled) end)
     ui:divider()
     ui:row("Never in these apps", nil, function(ui)

@@ -141,6 +141,20 @@ impl Cx<'_, '_> {
         Ok(id)
     }
 
+    /// `cap` held on one output only, an output named in `world().filled`.
+    fn output(&self, cap: &CapabilityId, output: &str) -> Result<CapabilityId, String> {
+        let per_output = self.env.host.actuator(cap).is_some_and(|a| a.per_output());
+        if !per_output {
+            return Err(format!(
+                "{cap} cannot be held on one output apart from the others here"
+            ));
+        }
+        if output.is_empty() || output.contains('@') {
+            return Err(format!("{cap}: {output:?} is not an output"));
+        }
+        Ok(cap.on_output(output))
+    }
+
     fn world(&self, lua: &Lua) -> mlua::Result<Table> {
         let w = self.env.world;
         let t = lua.create_table()?;
@@ -153,6 +167,10 @@ impl Cx<'_, '_> {
             t.set("app", a)?;
         }
         t.set("fullscreen", w.fullscreen)?;
+        t.set(
+            "filled",
+            lua.create_sequence_from(w.filled.iter().cloned())?,
+        )?;
         t.set("maximized", w.maximized)?;
         t.set("idle", w.idle)?;
         t.set("idle_seconds", w.idle_seconds)?;
@@ -254,6 +272,13 @@ impl UserData for Cx<'_, '_> {
                     Ok(id) => id,
                     Err(e) => return refuse(e),
                 };
+                let id = match opt::<String>(&opts, "output")? {
+                    Some(output) => match this.output(&id, &output) {
+                        Ok(id) => id,
+                        Err(e) => return refuse(e),
+                    },
+                    None => id,
+                };
                 let value = match sandbox::to_host(&value) {
                     Ok(v) => v,
                     Err(e) => return refuse(format!("{cap}: {e}")),
@@ -276,9 +301,14 @@ impl UserData for Cx<'_, '_> {
         m.add_method_mut(
             "release",
             |_, this, (cap, opts): (String, Option<Table>)| {
+                let cap = CapabilityId::new(cap);
+                let cap = match opt::<String>(&opts, "output")? {
+                    Some(output) => cap.on_output(&output),
+                    None => cap,
+                };
                 this.out.push(Command::Release {
                     owner: this.key,
-                    cap: CapabilityId::new(cap),
+                    cap,
                     fade_ms: fade_of(&opts)?,
                 });
                 Ok(())

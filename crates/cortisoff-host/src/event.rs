@@ -31,6 +31,12 @@ pub enum Event {
     /// the name it had when only the exclusive case was seen.
     Fullscreen {
         exclusive: bool,
+        /// Every output showing a fullscreen application right now, focused
+        /// or not, named the way the colour actuator names its outputs. A game
+        /// on one monitor stays fullscreen while the user clicks into a chat on
+        /// another. Empty on a platform that cannot tell which output it is.
+        #[serde(default)]
+        outputs: Vec<String>,
     },
     /// The focused window fills its monitor, or stopped doing so: maximised,
     /// borderless fullscreen or exclusive fullscreen alike. What a person

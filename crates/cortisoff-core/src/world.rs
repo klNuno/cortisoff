@@ -54,6 +54,9 @@ pub struct World {
     /// An application is fullscreen: exclusive, or a borderless window over
     /// its whole monitor such as a game or a film. A maximised window is not.
     pub fullscreen: bool,
+    /// Every output showing a fullscreen application, focused or not, in the
+    /// colour actuator's names. Empty where the platform cannot tell.
+    pub filled: Vec<String>,
     /// The focused window fills its monitor: maximised, borderless or
     /// exclusive fullscreen. Where the wallpaper cannot be seen.
     pub maximized: bool,
@@ -87,10 +90,12 @@ impl World {
                 let next = Some(app.clone());
                 self.changed(next != self.app, Signals::APP, |w| w.app = next)
             }
-            Event::Fullscreen { exclusive } => {
+            Event::Fullscreen { exclusive, outputs } => {
                 let v = *exclusive;
-                self.changed(v != self.fullscreen, Signals::FULLSCREEN, |w| {
-                    w.fullscreen = v
+                let moved = v != self.fullscreen || *outputs != self.filled;
+                self.changed(moved, Signals::FULLSCREEN, |w| {
+                    w.fullscreen = v;
+                    w.filled = outputs.clone();
                 })
             }
             Event::Maximized { maximized } => {

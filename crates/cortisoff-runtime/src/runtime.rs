@@ -1051,7 +1051,13 @@ fn event_table(lua: &Lua, kind: &str, e: &Event) -> mlua::Result<Table> {
             t.set("title", app.title.clone())?;
             t.set("pid", app.pid)?;
         }
-        Event::Fullscreen { exclusive } => t.set("exclusive", *exclusive)?,
+        Event::Fullscreen { exclusive, outputs } => {
+            t.set("exclusive", *exclusive)?;
+            t.set(
+                "outputs",
+                lua.create_sequence_from(outputs.iter().cloned())?,
+            )?;
+        }
         Event::Maximized { maximized } => t.set("maximized", *maximized)?,
         Event::Idle { idle, seconds } => {
             t.set("idle", *idle)?;
