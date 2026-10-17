@@ -15,7 +15,8 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    GetClassNameW, GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+    GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 
 /// The shell's own surfaces cover a monitor without anyone having maximised
@@ -34,10 +35,10 @@ const SHELL_CLASSES: &[&str] = &[
 pub struct Fill {
     /// Maximised, or covering the whole monitor.
     pub maximized: bool,
-    /// Covering the whole monitor, taskbar included, without being
-    /// maximised: a borderless game, a film or a browser in fullscreen. A
-    /// maximised window is not this: it leaves the taskbar, and a browser
-    /// maximised all evening is not a film.
+    /// Covering the whole monitor, taskbar included, without a maximised
+    /// frame: a borderless game, a film or a browser in fullscreen. A
+    /// maximised window with its frame is not this: it leaves the taskbar,
+    /// and a browser maximised all evening is not a film.
     pub fullscreen: bool,
 }
 
@@ -47,11 +48,39 @@ pub fn fill(hwnd: HWND) -> Fill {
     if hwnd.is_invalid() || is_shell(hwnd) {
         return Fill::default();
     }
-    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
-    let covers = covers(hwnd);
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    classify(Window {
+        zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
+        covers: covers(hwnd),
+        framed: style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0,
+        tool: ex & WS_EX_TOOLWINDOW.0 != 0,
+    })
+}
+
+/// What [`fill`] reads off a window, so its rule runs in a test.
+#[derive(Debug, Clone, Copy, Default)]
+struct Window {
+    zoomed: bool,
+    covers: bool,
+    /// A title bar or a sizing border. Chromium and Firefox drop both when
+    /// they go fullscreen and keep the maximised state they came from.
+    framed: bool,
+    /// Kept out of the taskbar and alt-tab: an overlay such as the
+    /// screenshot tool's, one per monitor, not an app.
+    tool: bool,
+}
+
+/// Fullscreen is covering the monitor while not maximised, or maximised
+/// with the frame gone. With the taskbar set to hide, a plain maximised
+/// window covers its monitor too, and is still not a film.
+fn classify(w: Window) -> Fill {
+    if w.tool {
+        return Fill::default();
+    }
     Fill {
-        maximized: zoomed || covers,
-        fullscreen: covers && !zoomed,
+        maximized: w.zoomed || w.covers,
+        fullscreen: w.covers && (!w.zoomed || !w.framed),
     }
 }
 
@@ -241,6 +270,42 @@ mod tests {
         assert!(!contains(&rect(100, 100, 2000, 1200), &monitor));
         // A window filling the second monitor covers nothing of the first.
         assert!(!contains(&rect(2560, 0, 5120, 1440), &monitor));
+    }
+
+    fn window(zoomed: bool, covers: bool, framed: bool, tool: bool) -> Fill {
+        classify(Window {
+            zoomed,
+            covers,
+            framed,
+            tool,
+        })
+    }
+
+    #[test]
+    fn a_borderless_game_is_fullscreen() {
+        assert!(window(false, true, false, false).fullscreen);
+    }
+
+    /// Helium on a video: maximised still, frame gone, exactly the monitor.
+    #[test]
+    fn a_browser_fullscreen_from_maximised_is_fullscreen() {
+        let fill = window(true, true, false, false);
+        assert!(fill.fullscreen && fill.maximized);
+    }
+
+    /// With the taskbar hidden a maximised window hangs over the whole
+    /// monitor, frame and all.
+    #[test]
+    fn a_maximised_window_over_a_hidden_taskbar_is_not() {
+        let fill = window(true, true, true, false);
+        assert!(!fill.fullscreen && fill.maximized);
+    }
+
+    /// The screenshot tool lays one topmost tool window over each monitor
+    /// while a region is picked.
+    #[test]
+    fn a_tool_window_over_the_monitor_is_neither() {
+        assert_eq!(window(false, true, false, true), Fill::default());
     }
 
     const GAME: isize = 10;
