@@ -301,19 +301,25 @@ impl Writer {
         q.busy = true;
         drop(q);
         let wire = &self.shared.wire;
-        // Nothing known, as after a crash: without a read the channels go out
-        // in the order for falling ones, and a panel coming back from the
-        // night has its blue raised before its green, which is pink.
+        // Nothing known, as after a crash: read first, so the channels go out
+        // in an order that is never pink.
         if known.is_none() {
-            known = wire.get(key);
+            known = read_patiently(wire.as_ref(), key);
         }
         let mut landed = Landed::Missed;
         for _ in 0..MISSES {
-            if !wire.set(key, &order(known, values, true)) {
+            let channels = match known {
+                Some(_) => order(known, values, true),
+                // Still nothing: the panel is most likely coming back from a
+                // tint, a crash recovery or a restore, so the channels rise,
+                // green before blue.
+                None => vec![(0, values[0]), (1, values[1]), (2, values[2])],
+            };
+            if !wire.set(key, &channels) {
                 known = None;
                 break;
             }
-            match wire.get(key) {
+            match read_patiently(wire.as_ref(), key) {
                 Some(held) => {
                     known = Some(held);
                     if held == values {
@@ -497,6 +503,23 @@ fn run(shared: &Shared) {
         }
         shared.changed.notify_all();
     }
+}
+
+/// How long a read that went unanswered waits before it is tried again.
+const REREAD: Duration = Duration::from_millis(100);
+
+/// What the panel holds, asked up to [`MISSES`] times: one of three channels
+/// not answering fails the whole read, and a single miss is common on DDC/CI.
+fn read_patiently(wire: &dyn Wire, key: &str) -> Option<[u32; 3]> {
+    for attempt in 0..MISSES {
+        if attempt > 0 {
+            std::thread::sleep(REREAD);
+        }
+        if let Some(held) = wire.get(key) {
+            return Some(held);
+        }
+    }
+    None
 }
 
 /// The gains a colour temperature asks of one panel. Always scaled from the
@@ -1068,7 +1091,7 @@ mod tests {
         let writer = Writer::with(fake.clone());
         writer.read_back(&[("p#0".to_owned(), calibrated())]);
         *fake.0.lose.lock().unwrap() = 1;
-        *fake.0.blind.lock().unwrap() = 1;
+        *fake.0.blind.lock().unwrap() = MISSES as usize;
         assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Unread);
         assert_eq!(fake.held("p#0"), Some([100, 64, 41]), "lost");
         eventually(|| fake.held("p#0") == Some([100, 92, 96]));
@@ -1084,6 +1107,28 @@ mod tests {
         let writer = Writer::with(fake.clone());
         assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
         assert_eq!(fake.sets()[0].1, [(0, 100), (1, 92), (2, 96)]);
+    }
+
+    /// The same panel not answering that first read: green still goes back
+    /// before blue.
+    #[test]
+    fn a_direct_write_with_nothing_readable_raises_green_before_blue() {
+        let fake = Fake::holding("p#0", [100, 64, 41]);
+        *fake.0.blind.lock().unwrap() = MISSES as usize;
+        let writer = Writer::with(fake.clone());
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(fake.sets()[0].1, [(0, 100), (1, 92), (2, 96)]);
+    }
+
+    /// A read that misses once is asked again before the write counts as
+    /// unread.
+    #[test]
+    fn one_missed_read_is_asked_again() {
+        let fake = Fake::holding("p#0", [100, 64, 41]);
+        let writer = Writer::with(fake.clone());
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
+        *fake.0.blind.lock().unwrap() = 1;
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
     }
 
     /// A posted write lost at the end of a fade is found once the panel has

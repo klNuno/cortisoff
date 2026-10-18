@@ -382,14 +382,15 @@ impl ColorTemp {
             }
             match write_panel(&key, ddc::currents(&gains)) {
                 Landed::Verified => self.memory.forget(&key),
-                // Taken and not read back: the writer reads it again, and the
-                // panel stays remembered so a capture before a read proves it
-                // back never takes the night for its own gains.
-                Landed::Unread => {}
-                Landed::Missed if here(ddc::device_of(&key)) => {
+                // Taken and never read back, it may still show the night. It
+                // stays remembered, so no capture takes the night for its own
+                // gains, and the restore fails, so the journal keeps it for
+                // the next start: a check posted to the writer does not
+                // outlive the process.
+                _ if here(ddc::device_of(&key)) => {
                     failures.push(format!("panel gains on {key}"));
                 }
-                Landed::Missed => {}
+                _ => {}
             }
         }
         if !failures.is_empty() {
@@ -822,8 +823,9 @@ mod tests {
     }
 
     /// A panel that took its baseline back and could not be read is not
-    /// failed, and not proven either: its remembered gains stay, so a capture
-    /// made while it still shows the night takes them instead.
+    /// proven: the restore fails, so the journal keeps it, and its remembered
+    /// gains stay, so a capture made while it still shows the night takes
+    /// them instead.
     #[test]
     fn a_restore_that_cannot_be_read_keeps_the_panel_remembered() {
         let (actuator, encoded) = restoration_fixture(true);
@@ -850,7 +852,7 @@ mod tests {
                 |_, _| true,
                 |_, _| Landed::Unread,
             )
-            .expect("taken is not failed");
+            .expect_err("not read back is not restored");
         assert_eq!(remembered(&actuator), [42; 3]);
 
         let (actuator, encoded) = restoration_fixture(true);

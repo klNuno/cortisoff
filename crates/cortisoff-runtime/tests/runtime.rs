@@ -596,6 +596,8 @@ fn night_light_spares_only_the_screen_a_game_fills() {
     assert_eq!(rt.report("night-light").unwrap().state["spared"], 0);
 }
 
+/// `minute` of the day on the wall clock, with the monotonic clock moved in
+/// step. Later in the test means later in the day.
 fn at(rig: &mut Rig, minute: u16) -> Event {
     let clock = Event::TimeOfDay {
         minute,
@@ -603,6 +605,7 @@ fn at(rig: &mut Rig, minute: u16) -> Event {
         millisecond: 0,
     };
     rig.host.clock = Some(clock.clone());
+    rig.host.now_ms = minute as u64 * 60_000;
     clock
 }
 
@@ -666,6 +669,47 @@ fn night_light_keeps_the_game_spared_through_the_morning() {
     assert!(
         !out.iter()
             .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+}
+
+/// The PC slept through the morning edge: the night lets go when it wakes,
+/// so a game opened a minute later still has a warm whole to be spared from,
+/// whatever the schedule says. Once that fade is over, a game is left alone.
+#[test]
+fn night_light_spares_a_game_during_a_morning_fade_that_started_late() {
+    let mut rig = Rig::apart();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let one = r"display.color_temp@\\.\DISPLAY3";
+    let two = r"display.color_temp@\\.\DISPLAY1";
+
+    let wake = at(&mut rig, 8 * 60);
+    let out = rig.with(|env| rt.on_event(env, &wake));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 300_000, .. } if cap.as_str() == "display.color_temp")),
+        "{out:?}"
+    );
+
+    let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&full);
+    at(&mut rig, 8 * 60 + 1);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+
+    let other = fullscreen(true, &[r"\\.\DISPLAY3", r"\\.\DISPLAY1"]);
+    rig.world.absorb(&other);
+    at(&mut rig, 8 * 60 + 10);
+    let out = rig.with(|env| rt.on_event(env, &other));
+    assert!(
+        !out.iter()
+            .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == two)),
         "{out:?}"
     );
 }
