@@ -12,10 +12,12 @@ on:
     paths:
       - Cargo.lock
       - "**/Cargo.toml"
+      - deny.toml
   pull_request:
     paths:
       - Cargo.lock
       - "**/Cargo.toml"
+      - deny.toml
   workflow_dispatch:
 
 permissions:

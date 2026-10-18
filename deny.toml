@@ -1,0 +1,10 @@
+[advisories]
+# zvariant, zvariant_derive and zbus_names were folded into zbus 6. They come
+# in through eframe's Linux accessibility (accesskit_unix, atspi), whose
+# newest releases still require zbus 5. Unmaintained, no vulnerability: drop
+# these once accesskit moves to zbus 6, and move cortisoff-linux with it.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant, through accesskit and atspi on zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names, through accesskit and atspi on zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, through accesskit and atspi on zbus 5" },
+]
