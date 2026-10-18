@@ -512,14 +512,26 @@ fn run(shared: &Shared) {
             };
             continue;
         };
+        // Nothing known of the panel, as after a refusal: read it first, as
+        // a direct write does. A guess may hold channels the panel took
+        // without applying them.
+        let mut read = read;
+        if read.is_none() && !q.known.contains_key(&key) {
+            q.busy = true;
+            drop(q);
+            let found = read_patiently(shared.wire.as_ref(), &key);
+            q = lock();
+            q.busy = false;
+            shared.changed.notify_all();
+            read = Some(found);
+        }
         // After a read, every channel goes out, ordered from what it found,
         // or from what was last believed when the panel did not answer. A
         // guess is not trusted to skip a channel.
         let guess = q.guessed.get(&key).copied();
         let (known, all) = match (read, q.known.get(&key).copied()) {
             (Some(found), known) => (found.or(known).or(guess), true),
-            (None, Some(known)) => (Some(known), false),
-            (None, None) => (guess, true),
+            (None, known) => (known, false),
         };
         q.busy = true;
         drop(q);
@@ -1232,6 +1244,27 @@ mod tests {
         assert_eq!(landed, Landed::Verified);
     }
 
+    /// The same refusal on a posted write, then a lighter target posted
+    /// before the caller hears of it: the panel is read before that write
+    /// too, so blue goes down before green from what it really holds.
+    #[test]
+    fn a_posted_write_after_a_partial_refusal_reads_the_panel_first() {
+        let fake = Fake::holding("p#0", [100, 92, 96]);
+        let writer = Writer::with(fake.clone());
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
+        *fake.0.refuse_once.lock().unwrap() = vec![0];
+        *fake.0.lose.lock().unwrap() = 1;
+        writer.post("p#0", [100, 64, 41]);
+        writer.settle();
+        assert_eq!(writer.take_refused(), ["p#0"]);
+        let reads = *fake.0.reads.lock().unwrap();
+        writer.post("p#0", [100, 80, 70]);
+        writer.settle();
+        assert!(*fake.0.reads.lock().unwrap() > reads, "read first");
+        assert_eq!(fake.sets()[1].1, [(2, 70), (1, 80), (0, 100)]);
+        assert_eq!(fake.held("p#0"), Some([100, 80, 70]));
+    }
+
     /// A read that misses once is asked again before the write counts as
     /// unread.
     #[test]
@@ -1280,6 +1313,7 @@ mod tests {
     fn a_panel_still_fading_is_not_read() {
         let fake = Fake::holding("p#0", [100, 92, 96]);
         let writer = Writer::with(fake.clone());
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
         for b in (80..96).rev() {
             writer.post("p#0", [100, 92, b]);
             writer.settle();
