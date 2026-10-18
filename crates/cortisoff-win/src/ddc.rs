@@ -279,7 +279,7 @@ impl Writer {
                 let pending = std::mem::take(&mut q.pending);
                 drop(q);
                 for (key, values) in pending {
-                    self.write_now(&key, values);
+                    self.write_now(&key, values, None);
                 }
                 return;
             }
@@ -291,8 +291,11 @@ impl Writer {
     /// never cross on the wire, and read it back. For the first write to a
     /// panel, whose answer decides its path, and for putting a baseline back,
     /// which must land: every channel is sent whatever the panel is believed
-    /// to hold, and sent again while a read finds something else.
-    pub fn write_now(&self, key: &str, values: [u32; 3]) -> Landed {
+    /// to hold, and sent again while a read finds something else. `likely`
+    /// is what the panel holds when nothing known of it can be read: its own
+    /// gains before a first tint. Without it the panel is taken to be coming
+    /// back from a tint, a crash recovery or a restore, so the channels rise.
+    pub fn write_now(&self, key: &str, values: [u32; 3], likely: Option<[u32; 3]>) -> Landed {
         let mut q = self.settled();
         // This is the target from now on: nothing older goes out after it.
         q.pending.remove(key);
@@ -308,13 +311,8 @@ impl Writer {
         }
         let mut landed = Landed::Missed;
         for _ in 0..MISSES {
-            let channels = match known {
-                Some(_) => order(known, values, true),
-                // Still nothing: the panel is most likely coming back from a
-                // tint, a crash recovery or a restore, so the channels rise,
-                // green before blue.
-                None => vec![(0, values[0]), (1, values[1]), (2, values[2])],
-            };
+            let from = known.or(likely).unwrap_or([0; 3]);
+            let channels = order(Some(from), values, true);
             if !wire.set(key, &channels) {
                 known = None;
                 break;
@@ -1029,7 +1027,7 @@ mod tests {
         let writer = Writer::with(fake.clone());
         writer.post("p#0", [1, 1, 1]);
         writer.post("q#0", [2, 2, 2]);
-        assert_eq!(writer.write_now("p#0", [9, 9, 9]), Landed::Verified);
+        assert_eq!(writer.write_now("p#0", [9, 9, 9], None), Landed::Verified);
         let order: Vec<(String, [u32; 3])> = fake
             .sets()
             .iter()
@@ -1066,7 +1064,10 @@ mod tests {
                 max: 100,
             }; 3],
         )]);
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(
+            writer.write_now("p#0", [100, 92, 96], None),
+            Landed::Verified
+        );
         assert_eq!(fake.held("p#0"), Some([100, 92, 96]));
         assert_eq!(fake.sets().len(), 2);
         // Sent whole both times, whatever it was believed to hold.
@@ -1078,7 +1079,7 @@ mod tests {
         let fake = Fake::holding("p#0", [100, 64, 41]);
         *fake.0.lose.lock().unwrap() = usize::MAX;
         let writer = Writer::with(fake.clone());
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Missed);
+        assert_eq!(writer.write_now("p#0", [100, 92, 96], None), Landed::Missed);
         assert_eq!(fake.sets().len(), MISSES as usize);
     }
 
@@ -1092,7 +1093,7 @@ mod tests {
         writer.read_back(&[("p#0".to_owned(), calibrated())]);
         *fake.0.lose.lock().unwrap() = 1;
         *fake.0.blind.lock().unwrap() = MISSES as usize;
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Unread);
+        assert_eq!(writer.write_now("p#0", [100, 92, 96], None), Landed::Unread);
         assert_eq!(fake.held("p#0"), Some([100, 64, 41]), "lost");
         eventually(|| fake.held("p#0") == Some([100, 92, 96]));
         assert!(writer.take_refused().is_empty());
@@ -1105,7 +1106,10 @@ mod tests {
     fn a_direct_write_with_nothing_known_reads_the_panel_first() {
         let fake = Fake::holding("p#0", [100, 64, 41]);
         let writer = Writer::with(fake.clone());
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(
+            writer.write_now("p#0", [100, 92, 96], None),
+            Landed::Verified
+        );
         assert_eq!(fake.sets()[0].1, [(0, 100), (1, 92), (2, 96)]);
     }
 
@@ -1116,8 +1120,23 @@ mod tests {
         let fake = Fake::holding("p#0", [100, 64, 41]);
         *fake.0.blind.lock().unwrap() = MISSES as usize;
         let writer = Writer::with(fake.clone());
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(
+            writer.write_now("p#0", [100, 92, 96], None),
+            Landed::Verified
+        );
         assert_eq!(fake.sets()[0].1, [(0, 100), (1, 92), (2, 96)]);
+    }
+
+    /// A first tint after a refusal, the panel answering sets again but not
+    /// reads: taken to be at its own gains, blue goes down before green.
+    #[test]
+    fn a_first_tint_with_nothing_readable_lowers_blue_before_green() {
+        let fake = Fake::holding("p#0", [100, 92, 96]);
+        *fake.0.blind.lock().unwrap() = MISSES as usize;
+        let writer = Writer::with(fake.clone());
+        let landed = writer.write_now("p#0", [100, 64, 41], Some([100, 92, 96]));
+        assert_eq!(landed, Landed::Verified);
+        assert_eq!(fake.sets()[0].1, [(2, 41), (1, 64), (0, 100)]);
     }
 
     /// A read that misses once is asked again before the write counts as
@@ -1128,7 +1147,10 @@ mod tests {
         let writer = Writer::with(fake.clone());
         writer.read_back(&[("p#0".to_owned(), calibrated())]);
         *fake.0.blind.lock().unwrap() = 1;
-        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(
+            writer.write_now("p#0", [100, 92, 96], None),
+            Landed::Verified
+        );
     }
 
     /// A posted write lost at the end of a fade is found once the panel has

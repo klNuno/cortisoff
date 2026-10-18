@@ -323,6 +323,13 @@ impl UserData for Cx<'_, '_> {
             Ok(())
         });
 
+        // Still held by this plugin, a release fading out included: the
+        // claim stack's own clock, which waits out the hardware, not the
+        // plugin's guess of when its fade ends.
+        m.add_method("holds", |_, this, cap: String| {
+            Ok((this.env.holds)(this.key, &CapabilityId::new(cap)))
+        });
+
         m.add_method("has", |_, this, cap: String| {
             Ok(this.env.probed.has(&CapabilityId::new(cap)))
         });

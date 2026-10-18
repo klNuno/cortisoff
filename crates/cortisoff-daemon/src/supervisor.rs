@@ -184,10 +184,17 @@ impl<J: JournalStore> Supervisor<J> {
     /// world and probe.
     fn call<R>(&mut self, host: &mut dyn Host, f: impl FnOnce(&mut Runtime, &mut Env) -> R) -> R {
         let now = host.monotonic_ms();
+        let claims = &self.claims;
+        let holds = |owner: u32, cap: &CapabilityId| {
+            claims
+                .index_of(cap)
+                .is_ok_and(|i| claims.arbiter().held(i, OwnerId::Plugin(owner)).is_some())
+        };
         let mut env = Env {
             host,
-            world: self.claims.world(),
+            world: claims.world(),
             probed: &self.probed,
+            holds: &holds,
             now,
         };
         f(&mut self.runtime, &mut env)

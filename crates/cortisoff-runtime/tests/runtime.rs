@@ -1,6 +1,8 @@
 //! The runtime against a mock host: what plugins ask for comes back as
 //! commands, and what the host says reaches the plugins that listen.
 
+use std::collections::HashMap;
+
 use cortisoff_core::World;
 use cortisoff_host::mock::MockHost;
 use cortisoff_host::{CapabilityId, Event, Host, Value as HostValue};
@@ -43,6 +45,10 @@ fn on(ids: &[&str]) -> Store {
 struct Rig {
     host: MockHost,
     world: World,
+    /// What the plugins hold, as the claim stack would answer `cx:holds`:
+    /// each capability with the monotonic time its claim ends, `u64::MAX`
+    /// while claimed. Kept from the commands [`Rig::run`] sees.
+    held: HashMap<String, u64>,
 }
 
 impl Rig {
@@ -61,6 +67,7 @@ impl Rig {
         Rig {
             host,
             world: World::default(),
+            held: HashMap::new(),
         }
     }
 
@@ -74,13 +81,44 @@ impl Rig {
     fn with<R>(&mut self, f: impl FnOnce(&mut Env) -> R) -> R {
         let probed = self.host.probe();
         let now = self.host.monotonic_ms();
+        let held = &self.held;
+        let holds =
+            |_: u32, cap: &CapabilityId| held.get(cap.as_str()).is_some_and(|&end| now < end);
         let mut env = Env {
             host: &mut self.host,
             world: &self.world,
             probed: &probed,
+            holds: &holds,
             now,
         };
         f(&mut env)
+    }
+
+    /// A call whose commands the rig keeps track of, as the claim stack
+    /// would: a release fades out over its length, unless one already under
+    /// way ends sooner.
+    fn run(&mut self, f: impl FnOnce(&mut Env) -> Vec<Command>) -> Vec<Command> {
+        let out = self.with(f);
+        self.track(&out);
+        out
+    }
+
+    fn track(&mut self, out: &[Command]) {
+        let now = self.host.monotonic_ms();
+        for c in out {
+            match c {
+                Command::Claim { cap, .. } => {
+                    self.held.insert(cap.to_string(), u64::MAX);
+                }
+                Command::Release { cap, fade_ms, .. } => {
+                    if let Some(end) = self.held.get_mut(cap.as_str()) {
+                        *end = (*end).min(now + fade_ms);
+                    }
+                }
+                Command::ReleaseAll { .. } => self.held.clear(),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -618,15 +656,15 @@ fn night_light_keeps_the_game_spared_through_the_morning() {
     let mut rig = Rig::apart();
     let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
     let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
-    rig.with(|env| rt.start_all(env));
+    rig.run(|env| rt.start_all(env));
     let one = r"display.color_temp@\\.\DISPLAY3";
     let two = r"display.color_temp@\\.\DISPLAY1";
     let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
     rig.world.absorb(&full);
-    rig.with(|env| rt.on_event(env, &full));
+    rig.run(|env| rt.on_event(env, &full));
 
     let morning = at(&mut rig, 7 * 60);
-    let out = rig.with(|env| rt.on_event(env, &morning));
+    let out = rig.run(|env| rt.on_event(env, &morning));
     assert!(
         out.iter().any(|c| matches!(c,
             Command::Release { cap, fade_ms: 300_000, .. } if cap.as_str() == "display.color_temp")),
@@ -643,7 +681,7 @@ fn night_light_keeps_the_game_spared_through_the_morning() {
     let both = fullscreen(true, &[r"\\.\DISPLAY3", r"\\.\DISPLAY1"]);
     rig.world.absorb(&both);
     at(&mut rig, 7 * 60 + 2);
-    let out = rig.with(|env| rt.on_event(env, &both));
+    let out = rig.run(|env| rt.on_event(env, &both));
     assert!(
         out.iter().any(|c| matches!(c,
             Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == two)),
@@ -654,7 +692,7 @@ fn night_light_keeps_the_game_spared_through_the_morning() {
     let gone = fullscreen(false, &[]);
     rig.world.absorb(&gone);
     at(&mut rig, 8 * 60);
-    let out = rig.with(|env| rt.on_event(env, &gone));
+    let out = rig.run(|env| rt.on_event(env, &gone));
     for cap in [one, two] {
         assert!(
             out.iter().any(|c| matches!(c,
@@ -665,7 +703,7 @@ fn night_light_keeps_the_game_spared_through_the_morning() {
 
     // In the middle of the day a game is left alone: nothing to spare it from.
     rig.world.absorb(&full);
-    let out = rig.with(|env| rt.on_event(env, &full));
+    let out = rig.run(|env| rt.on_event(env, &full));
     assert!(
         !out.iter()
             .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == one)),
@@ -681,12 +719,12 @@ fn night_light_spares_a_game_during_a_morning_fade_that_started_late() {
     let mut rig = Rig::apart();
     let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
     let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
-    rig.with(|env| rt.start_all(env));
+    rig.run(|env| rt.start_all(env));
     let one = r"display.color_temp@\\.\DISPLAY3";
     let two = r"display.color_temp@\\.\DISPLAY1";
 
     let wake = at(&mut rig, 8 * 60);
-    let out = rig.with(|env| rt.on_event(env, &wake));
+    let out = rig.run(|env| rt.on_event(env, &wake));
     assert!(
         out.iter().any(|c| matches!(c,
             Command::Release { cap, fade_ms: 300_000, .. } if cap.as_str() == "display.color_temp")),
@@ -696,7 +734,7 @@ fn night_light_spares_a_game_during_a_morning_fade_that_started_late() {
     let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
     rig.world.absorb(&full);
     at(&mut rig, 8 * 60 + 1);
-    let out = rig.with(|env| rt.on_event(env, &full));
+    let out = rig.run(|env| rt.on_event(env, &full));
     assert!(
         out.iter().any(|c| matches!(c,
             Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == one)),
@@ -706,7 +744,50 @@ fn night_light_spares_a_game_during_a_morning_fade_that_started_late() {
     let other = fullscreen(true, &[r"\\.\DISPLAY3", r"\\.\DISPLAY1"]);
     rig.world.absorb(&other);
     at(&mut rig, 8 * 60 + 10);
-    let out = rig.with(|env| rt.on_event(env, &other));
+    let out = rig.run(|env| rt.on_event(env, &other));
+    assert!(
+        !out.iter()
+            .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == two)),
+        "{out:?}"
+    );
+}
+
+/// The hardware held the morning fade up, so it ends later than the plugin
+/// asked: a game opened after the asked length, while the others are still
+/// warm, is spared all the same. Once the fade is over, it is not.
+#[test]
+fn night_light_spares_a_game_while_a_held_up_morning_fade_goes_on() {
+    let mut rig = Rig::apart();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 10 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    rig.run(|env| rt.start_all(env));
+    let one = r"display.color_temp@\\.\DISPLAY3";
+    let two = r"display.color_temp@\\.\DISPLAY1";
+
+    let wake = at(&mut rig, 8 * 60);
+    let out = rig.run(|env| rt.on_event(env, &wake));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 10_000, .. } if cap.as_str() == "display.color_temp")),
+        "{out:?}"
+    );
+    // Ten seconds of a batch stuck in the hardware: the fade waits as long.
+    *rig.held.get_mut("display.color_temp").unwrap() += 10_000;
+
+    let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&full);
+    rig.host.now_ms += 11_050;
+    let out = rig.run(|env| rt.on_event(env, &full));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+
+    let other = fullscreen(true, &[r"\\.\DISPLAY3", r"\\.\DISPLAY1"]);
+    rig.world.absorb(&other);
+    rig.host.now_ms += 9_000;
+    let out = rig.run(|env| rt.on_event(env, &other));
     assert!(
         !out.iter()
             .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == two)),
@@ -721,11 +802,11 @@ fn night_light_spares_a_game_during_a_morning_fade_that_started_late() {
 fn night_light_pauses_around_the_game_without_warming_it() {
     let mut rig = Rig::apart();
     let mut rt = Runtime::new(night_light(), &on(&["night-light"]), None).with_os("windows");
-    rig.with(|env| rt.start_all(env));
+    rig.run(|env| rt.start_all(env));
     let one = r"display.color_temp@\\.\DISPLAY3";
     let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
     rig.world.absorb(&full);
-    rig.with(|env| rt.on_event(env, &full));
+    rig.run(|env| rt.on_event(env, &full));
     let out = rig
         .with(|env| {
             rt.message(

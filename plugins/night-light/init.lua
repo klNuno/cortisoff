@@ -98,11 +98,6 @@ local quick_next = false
 -- stay warm. False once the platform said it cannot hold one output apart:
 -- then a fullscreen app pauses every screen, as before.
 local spared, apart = {}, true
--- Whether the night is claimed, and until when, on the monotonic clock, the
--- others may still be warm once it is let go. Its own clock, not the
--- schedule: a PC that slept through the morning edge starts the fade when
--- it wakes.
-local claimed, warm_until = false, 0
 
 local settle
 
@@ -168,39 +163,31 @@ function settle(cx, s)
     return out
   end
 
-  local function let_go(ms)
-    cx:release(CAP, { fade = ms })
-    if claimed then
-      -- A second of slack: a fade held up by the hardware ends later.
-      warm_until = mono + ms + 1000
-      claimed = false
-    end
-  end
-
   local keep = {}
   if reason then
-    let_go(QUICK_MS)
+    cx:release(CAP, { fade = QUICK_MS })
     keep = still_filled()
   elseif night then
     local ok, err = cx:claim(CAP, round(s.night), { fade = quick_next and QUICK_MS or fade })
     if not ok then
       reason = err
     else
-      claimed = true
       if s.pause_when_filled and some_filled and apart then
         if spare(cx, filled) then
           keep = filled
         elseif world.fullscreen then
           reason = "filled"
-          let_go(QUICK_MS)
+          cx:release(CAP, { fade = QUICK_MS })
         end
       end
     end
   else
-    let_go(quick_next and QUICK_MS or fade)
+    cx:release(CAP, { fade = quick_next and QUICK_MS or fade })
     keep = still_filled()
     -- A game opened while the morning still fades: the others are warm yet.
-    if s.pause_when_filled and apart and some_filled and mono < warm_until
+    -- Asked of the claim stack, not timed here: a PC that slept through the
+    -- edge starts the fade when it wakes, and the hardware can hold it up.
+    if s.pause_when_filled and apart and some_filled and cx:holds(CAP)
       and spare(cx, filled) then
       keep = filled
     end
@@ -232,7 +219,6 @@ end
 function plugin.start(cx, s)
   edge_timer, quick_next = nil, false
   spared, apart = {}, true
-  claimed, warm_until = false, 0
   cx:watch("app.focus")
   cx:watch("app.fullscreen")
   cx:watch("clock")

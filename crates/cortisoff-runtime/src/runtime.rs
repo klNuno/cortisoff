@@ -25,6 +25,9 @@ pub struct Env<'a> {
     pub host: &'a mut dyn Host,
     pub world: &'a World,
     pub probed: &'a CapabilitySet,
+    /// Whether a plugin, by its key, still holds a capability: claimed, or
+    /// on its way out of it over a release fade.
+    pub holds: &'a dyn Fn(u32, &CapabilityId) -> bool,
     /// [`Host::monotonic_ms`] when the batch started.
     pub now: u64,
 }

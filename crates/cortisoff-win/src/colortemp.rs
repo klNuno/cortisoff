@@ -223,7 +223,7 @@ impl ColorTemp {
             .collect();
         for key in leaving {
             if let Some(base) = gains_of(captured.as_ref(), &key) {
-                if self.panels.write_now(&key, ddc::currents(base)) == Landed::Verified {
+                if self.panels.write_now(&key, ddc::currents(base), None) == Landed::Verified {
                     self.memory.forget(&key);
                 }
             }
@@ -261,7 +261,11 @@ impl ColorTemp {
                 self.panels.post(key, gains);
                 live.panel.insert(key.clone(), gains);
                 carried = true;
-            } else if self.panels.write_now(key, gains).took() {
+            } else if self
+                .panels
+                .write_now(key, gains, Some(ddc::currents(base)))
+                .took()
+            {
                 self.proven.borrow_mut().insert(key.clone());
                 live.panel.insert(key.clone(), gains);
                 carried = true;
@@ -341,7 +345,7 @@ impl ColorTemp {
             &screen::device_names(),
             set_magnifier,
             screen::write,
-            |key, values| self.panels.write_now(key, values),
+            |key, values| self.panels.write_now(key, values, None),
         )
     }
 
