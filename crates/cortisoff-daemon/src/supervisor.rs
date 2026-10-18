@@ -36,6 +36,12 @@ const WATCH_MS: u64 = 1000;
 /// `cortisoff-cli trace` costs a bounded amount of memory.
 const MAX_PENDING: usize = 4096;
 
+/// A batch that takes longer than this to apply was held up by the hardware,
+/// and the fades wait for it. A normal frame writes three ramps in a few
+/// milliseconds; right after a display mode change one takes up to 40, and
+/// those still count as time passing.
+const HELD_UP_MS: u64 = 50;
+
 pub struct Supervisor<J> {
     claims: Claims,
     runtime: Runtime,
@@ -598,7 +604,13 @@ impl<J: JournalStore> Supervisor<J> {
                 self.note(Notification::Action(action.clone()));
             }
         }
+        let started = host.monotonic_ms();
         let outcome = self.dispatcher.execute(&*host, allowed);
+        // Stuck in the hardware rather than slow at it: the fades wait.
+        let done = host.monotonic_ms();
+        if done.saturating_sub(started) > HELD_UP_MS {
+            self.claims.hold(started, done);
+        }
         for e in outcome.errors {
             self.fail(e);
         }
@@ -1162,6 +1174,47 @@ mod tests {
         }
         assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
         assert!(!host.fading, "and that it ended");
+    }
+
+    #[test]
+    fn a_frame_held_up_by_the_hardware_does_not_jump_the_fade() {
+        // A game leaving exclusive fullscreen blocks gamma writes for a
+        // quarter of a second. The next frame goes on from the one before.
+        let mut host = host();
+        host.now_ms = 10_000;
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "warm",
+                "return { start = function(cx) cx:claim('display.color_temp', 3200, { fade = 1000 }) end }",
+            )],
+        );
+        sup.start(&mut host);
+        let kelvin = |host: &MockHost| match host.value(ids::DISPLAY_COLOR_TEMP) {
+            Some(Value::Int(k)) => k,
+            other => panic!("no number on screen: {other:?}"),
+        };
+        for _ in 0..20 {
+            host.now_ms += 15;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        let before = kelvin(&host);
+        host.now_ms += 15;
+        host.slow_apply(ids::DISPLAY_COLOR_TEMP, 250);
+        sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        let held = kelvin(&host);
+        host.now_ms += 15;
+        sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        let after = kelvin(&host);
+        let step = before - held;
+        assert!(step > 0, "{before} {held}");
+        assert!(held - after < 3 * step, "{before} {held} {after}");
+        // Still lands, a quarter of a second later.
+        for _ in 0..100 {
+            host.now_ms += 15;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        assert_eq!(kelvin(&host), 3200);
     }
 
     #[test]

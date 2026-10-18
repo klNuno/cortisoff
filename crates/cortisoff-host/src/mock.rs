@@ -52,6 +52,9 @@ pub struct MockActuator {
     clock: Rc<Cell<u64>>,
     /// How long `capture` takes, as reading a panel over DDC/CI does.
     capture_ms: Cell<u64>,
+    /// How long the next `apply` takes, once, as a gamma write does while a
+    /// game changes the display mode.
+    apply_ms: Cell<u64>,
     /// Set for an actuator that holds outputs apart, with what each one holds.
     outputs: Option<RefCell<BTreeMap<String, Value>>>,
     /// The last baseline captured, which an apply recognises as a restore.
@@ -76,6 +79,7 @@ impl Actuator for MockActuator {
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError> {
         self.trace.push(format!("apply {} {:?}", self.id, value));
+        self.clock.set(self.clock.get() + self.apply_ms.take());
         // The baseline back lets go of every output, as a real one does.
         if let Some(outputs) = &self.outputs {
             let baseline = match &self.opaque {
@@ -284,6 +288,7 @@ impl MockHost {
                 opaque: None,
                 clock: self.spent.clone(),
                 capture_ms: Cell::new(0),
+                apply_ms: Cell::new(0),
                 outputs: None,
                 captured: RefCell::new(None),
             },
@@ -306,6 +311,7 @@ impl MockHost {
                 opaque: Some((baseline, rest)),
                 clock: self.spent.clone(),
                 capture_ms: Cell::new(0),
+                apply_ms: Cell::new(0),
                 outputs: None,
                 captured: RefCell::new(None),
             },
@@ -327,6 +333,14 @@ impl MockHost {
     pub fn slow_capture(&self, id: &str, ms: u64) {
         if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
             actuator.capture_ms.set(ms);
+        }
+    }
+
+    /// The next apply on this actuator takes `ms` off the host's clock, as a
+    /// gamma write does while the display mode changes under it.
+    pub fn slow_apply(&self, id: &str, ms: u64) {
+        if let Some(actuator) = self.actuators.get(&CapabilityId::new(id)) {
+            actuator.apply_ms.set(ms);
         }
     }
 
