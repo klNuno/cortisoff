@@ -87,10 +87,10 @@ pub fn capture(devices: &[String]) -> Vec<(String, Gains)> {
 /// What reaches a panel. Behind a trait so the writer's timing, ordering and
 /// verification are tested without a monitor.
 pub trait Wire: Send + Sync {
-    /// Set each `(channel, value)` in the order given. True only when every
-    /// one was accepted: a panel that takes red and refuses blue is not
-    /// carrying the tint.
-    fn set(&self, key: &str, channels: &[(usize, u32)]) -> bool;
+    /// Set each `(channel, value)` in the order given. Returns the channels
+    /// the panel refused, by index: one refused and the panel is not
+    /// carrying the tint, but the others moved.
+    fn set(&self, key: &str, channels: &[(usize, u32)]) -> [bool; 3];
     /// What the panel holds now, `None` when it does not answer.
     fn get(&self, key: &str) -> Option<[u32; 3]>;
 }
@@ -112,20 +112,20 @@ impl Panels {
 }
 
 impl Wire for Panels {
-    fn set(&self, key: &str, channels: &[(usize, u32)]) -> bool {
+    fn set(&self, key: &str, channels: &[(usize, u32)]) -> [bool; 3] {
         Self::with(key, |pm| {
-            let mut all = true;
+            let mut refused = [false; 3];
             // Every channel is attempted even after a refusal, so a panel is
             // never left with one channel at the new gain for want of trying.
             for &(i, value) in channels {
                 let ok = unsafe {
                     SetMonitorRedGreenOrBlueGain(pm.hPhysicalMonitor, CHANNELS[i], value)
                 };
-                all &= ok != 0;
+                refused[i] = ok == 0;
             }
-            Some(all)
+            Some(refused)
         })
-        .unwrap_or(false)
+        .unwrap_or_else(|| all_of(channels))
     }
 
     fn get(&self, key: &str) -> Option<[u32; 3]> {
@@ -160,6 +160,30 @@ fn order(from: Option<[u32; 3]>, to: [u32; 3], all: bool) -> Vec<(usize, u32)> {
         }
     }
     out
+}
+
+/// Every channel in `channels`, refused: a panel that could not be opened.
+fn all_of(channels: &[(usize, u32)]) -> [bool; 3] {
+    let mut refused = [false; 3];
+    for &(i, _) in channels {
+        refused[i] = true;
+    }
+    refused
+}
+
+/// What a panel holds after a set some of whose channels it refused, from
+/// what it held before: an accepted channel moved, a refused one stayed. A
+/// later write is ordered from this, as forgetting it would order from a
+/// guess: a tint that took green and blue but not red, then raised, would
+/// lift blue before green.
+fn after(from: [u32; 3], channels: &[(usize, u32)], refused: [bool; 3]) -> [u32; 3] {
+    let mut now = from;
+    for &(i, v) in channels {
+        if !refused[i] {
+            now[i] = v;
+        }
+    }
+    now
 }
 
 /// Panel writes off the caller's thread.
@@ -311,10 +335,11 @@ impl Writer {
         }
         let mut landed = Landed::Missed;
         for _ in 0..MISSES {
-            let from = known.or(likely).unwrap_or([0; 3]);
-            let channels = order(Some(from), values, true);
-            if !wire.set(key, &channels) {
-                known = None;
+            let believed = known.or(likely);
+            let channels = order(Some(believed.unwrap_or([0; 3])), values, true);
+            let refused = wire.set(key, &channels);
+            if refused.contains(&true) {
+                known = believed.map(|b| after(b, &channels, refused));
                 break;
             }
             match read_patiently(wire.as_ref(), key) {
@@ -480,10 +505,11 @@ fn run(shared: &Shared) {
         };
         q.busy = true;
         drop(q);
-        let ok = shared.wire.set(&key, &order(known, target, all));
+        let channels = order(known, target, all);
+        let refused = shared.wire.set(&key, &channels);
         q = lock();
         q.busy = false;
-        if ok {
+        if !refused.contains(&true) {
             q.known.insert(key.clone(), target);
             let due = Instant::now() + VERIFY_AFTER;
             q.checks.insert(
@@ -495,7 +521,10 @@ fn run(shared: &Shared) {
                 },
             );
         } else {
-            q.known.remove(&key);
+            match known {
+                Some(k) => q.known.insert(key.clone(), after(k, &channels, refused)),
+                None => q.known.remove(&key),
+            };
             q.checks.remove(&key);
             q.refused.push(key);
         }
@@ -847,6 +876,8 @@ mod tests {
         sets: Mutex<Vec<Set>>,
         reads: Mutex<usize>,
         refuse: std::sync::atomic::AtomicBool,
+        /// Channels the next set refuses, the others taken.
+        refuse_once: Mutex<Vec<usize>>,
         lose: Mutex<usize>,
         /// Reads still to go unanswered.
         blind: Mutex<usize>,
@@ -885,7 +916,7 @@ mod tests {
     }
 
     impl Wire for Fake {
-        fn set(&self, key: &str, channels: &[(usize, u32)]) -> bool {
+        fn set(&self, key: &str, channels: &[(usize, u32)]) -> [bool; 3] {
             self.0
                 .sets
                 .lock()
@@ -896,19 +927,25 @@ mod tests {
             }
             std::thread::sleep(*self.0.delay.lock().unwrap());
             if self.0.refuse.load(std::sync::atomic::Ordering::SeqCst) {
-                return false;
+                return all_of(channels);
+            }
+            let mut refused = [false; 3];
+            for i in std::mem::take(&mut *self.0.refuse_once.lock().unwrap()) {
+                refused[i] = true;
             }
             let mut lose = self.0.lose.lock().unwrap();
             if *lose > 0 {
                 *lose -= 1;
-                return true;
+                return refused;
             }
             let mut held = self.0.held.lock().unwrap();
             let panel = held.entry(key.to_owned()).or_insert([0; 3]);
             for &(i, v) in channels {
-                panel[i] = v;
+                if !refused[i] {
+                    panel[i] = v;
+                }
             }
-            true
+            refused
         }
 
         fn get(&self, key: &str) -> Option<[u32; 3]> {
@@ -1013,8 +1050,8 @@ mod tests {
         writer.settle();
         assert_eq!(writer.take_refused(), ["p#0"]);
         assert!(writer.take_refused().is_empty());
-        // Nothing is assumed about a panel that refused: the next write sends
-        // every channel.
+        // A panel that refused everything is taken to hold what it held, and
+        // the next write sends every channel that differs.
         writer.post("p#0", [2, 2, 2]);
         writer.settle();
         assert_eq!(fake.sets()[1].1.len(), 3);
@@ -1137,6 +1174,24 @@ mod tests {
         let landed = writer.write_now("p#0", [100, 64, 41], Some([100, 92, 96]));
         assert_eq!(landed, Landed::Verified);
         assert_eq!(fake.sets()[0].1, [(2, 41), (1, 64), (0, 100)]);
+    }
+
+    /// A first tint that took green and blue but not red, then a lighter one
+    /// with no read answering: ordered from what the panel took, green rises
+    /// before blue, where ordering from the base would lift blue first.
+    #[test]
+    fn a_partly_refused_tint_is_remembered_channel_by_channel() {
+        let fake = Fake::holding("p#0", [100, 92, 96]);
+        let writer = Writer::with(fake.clone());
+        let base = Some([100, 92, 96]);
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
+        *fake.0.refuse_once.lock().unwrap() = vec![0];
+        assert_eq!(writer.write_now("p#0", [100, 64, 41], base), Landed::Missed);
+        assert_eq!(fake.held("p#0"), Some([100, 64, 41]));
+        *fake.0.blind.lock().unwrap() = MISSES as usize;
+        let landed = writer.write_now("p#0", [100, 80, 70], base);
+        assert_eq!(fake.sets()[1].1, [(0, 100), (1, 80), (2, 70)]);
+        assert_eq!(landed, Landed::Unread);
     }
 
     /// A read that misses once is asked again before the write counts as
