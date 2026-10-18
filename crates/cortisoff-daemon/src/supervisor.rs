@@ -36,6 +36,12 @@ const WATCH_MS: u64 = 1000;
 /// `cortisoff-cli trace` costs a bounded amount of memory.
 const MAX_PENDING: usize = 4096;
 
+/// A batch that takes longer than this to apply was held up by the hardware,
+/// and the fades wait for it. A normal frame writes three ramps in a few
+/// milliseconds; right after a display mode change one takes up to 40, and
+/// those still count as time passing.
+const HELD_UP_MS: u64 = 50;
+
 pub struct Supervisor<J> {
     claims: Claims,
     runtime: Runtime,
@@ -178,10 +184,17 @@ impl<J: JournalStore> Supervisor<J> {
     /// world and probe.
     fn call<R>(&mut self, host: &mut dyn Host, f: impl FnOnce(&mut Runtime, &mut Env) -> R) -> R {
         let now = host.monotonic_ms();
+        let claims = &self.claims;
+        let holds = |owner: u32, cap: &CapabilityId| {
+            claims
+                .index_of(cap)
+                .is_ok_and(|i| claims.arbiter().held(i, OwnerId::Plugin(owner)).is_some())
+        };
         let mut env = Env {
             host,
-            world: self.claims.world(),
+            world: claims.world(),
             probed: &self.probed,
+            holds: &holds,
             now,
         };
         f(&mut self.runtime, &mut env)
@@ -199,7 +212,7 @@ impl<J: JournalStore> Supervisor<J> {
                     priority,
                     fade_ms,
                 } => {
-                    let Ok(index) = self.claims.index_of(&cap) else {
+                    let Ok(index) = self.claims.slot_of(&cap) else {
                         continue;
                     };
                     let fade = if self.stopped { 0 } else { fade_ms };
@@ -266,7 +279,7 @@ impl<J: JournalStore> Supervisor<J> {
     /// and the restore at the end puts the ramps themselves back.
     fn baseline(&self, host: &dyn Host, cap: &CapabilityId) -> Option<Value> {
         self.dispatcher
-            .baseline(cap)
+            .baseline(&cap.parent())
             .filter(|v| fadeable(v, v))
             .cloned()
             .or_else(|| rest_of(host, cap))
@@ -598,7 +611,13 @@ impl<J: JournalStore> Supervisor<J> {
                 self.note(Notification::Action(action.clone()));
             }
         }
+        let started = host.monotonic_ms();
         let outcome = self.dispatcher.execute(&*host, allowed);
+        // Stuck in the hardware rather than slow at it: the fades wait.
+        let done = host.monotonic_ms();
+        if done.saturating_sub(started) > HELD_UP_MS {
+            self.claims.hold(started, done);
+        }
         for e in outcome.errors {
             self.fail(e);
         }
@@ -654,7 +673,7 @@ impl<J: JournalStore> Supervisor<J> {
         let table = arbiter.table();
         (0..table.len()).any(|i| {
             let cap = CapIndex(i as u16);
-            arbiter.holder(cap).is_some() && !self.gate.blocks(table.id(cap))
+            arbiter.holder(cap).is_some() && !self.gate.blocks(&table.id(cap).parent())
         })
     }
 
@@ -670,7 +689,7 @@ impl<J: JournalStore> Supervisor<J> {
                 _ => None,
             };
             match cap {
-                Some(cap) if self.gate.blocks(cap) => {
+                Some(cap) if self.gate.blocks(&cap.parent()) => {
                     if !refused.contains(cap) {
                         refused.push(cap.clone());
                     }
@@ -783,6 +802,7 @@ impl<J: JournalStore> Supervisor<J> {
             world: WorldReport {
                 app: w.app.clone(),
                 fullscreen: w.fullscreen,
+                filled: w.filled.clone(),
                 maximized: w.maximized,
                 idle: w.idle,
                 locked: w.locked,
@@ -846,8 +866,9 @@ impl<J: JournalStore> Supervisor<J> {
     }
 }
 
+/// One output of a capability rests where the whole one does.
 fn rest_of(host: &dyn Host, cap: &CapabilityId) -> Option<Value> {
-    host.actuator(cap).and_then(|a| a.rest())
+    host.actuator(&cap.parent()).and_then(|a| a.rest())
 }
 
 #[cfg(test)]
@@ -973,6 +994,84 @@ mod tests {
         assert_eq!(host.value(ids::DISPLAY_VIBRANCE), Some(Value::Int(100)));
     }
 
+    /// Night light's shape: the whole night, and one monitor held at its own
+    /// colours while a game fills it. Through the real arbiter, dispatcher
+    /// and journal.
+    const SPARE: &str = r"return {
+        start = function(cx)
+          cx:watch('app.fullscreen')
+          cx:claim('display.color_temp', 3000)
+        end,
+        on = function(cx, s, ev)
+          if ev.kind == 'message' then
+            cx:release('display.color_temp')
+          elseif #ev.outputs > 0 then
+            for _, o in ipairs(ev.outputs) do
+              cx:claim('display.color_temp', 6500, { output = o })
+            end
+          else
+            cx:release('display.color_temp', { output = 'B' })
+          end
+        end,
+    }";
+
+    fn filled(outputs: &[&str]) -> Event {
+        Event::Fullscreen {
+            exclusive: !outputs.is_empty(),
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn one_monitor_leaves_the_night_and_comes_back_to_it() {
+        let mut host = host().with_outputs(ids::DISPLAY_COLOR_TEMP);
+        let mut sup = supervisor(&host, vec![plugin("night", SPARE)]);
+        sup.start(&mut host);
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3000)));
+
+        sup.handle(&mut host, filled(&["B"]));
+        assert_eq!(
+            host.output_value(ids::DISPLAY_COLOR_TEMP, "B"),
+            Some(Value::Int(6500))
+        );
+        assert_eq!(
+            host.output_value(ids::DISPLAY_COLOR_TEMP, "A"),
+            Some(Value::Int(3000))
+        );
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3000)));
+
+        sup.handle(&mut host, filled(&[]));
+        assert_eq!(
+            host.output_value(ids::DISPLAY_COLOR_TEMP, "B"),
+            Some(Value::Int(3000))
+        );
+    }
+
+    /// The night ends while the game still fills its monitor: the whole
+    /// baseline comes back, and that monitor is pushed again after it.
+    #[test]
+    fn the_night_ending_under_a_game_keeps_its_monitor_held() {
+        let mut host = host().with_outputs(ids::DISPLAY_COLOR_TEMP);
+        let mut sup = supervisor(&host, vec![plugin("night", SPARE)]);
+        sup.start(&mut host);
+        sup.handle(&mut host, filled(&["B"]));
+        sup.message(&mut host, "night", "morning", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(6500)));
+        assert_eq!(
+            host.output_value(ids::DISPLAY_COLOR_TEMP, "B"),
+            Some(Value::Int(6500))
+        );
+        let trace = host.trace().events();
+        let restore = trace
+            .iter()
+            .rposition(|l| l == "apply display.color_temp Int(6500)");
+        let again = trace
+            .iter()
+            .rposition(|l| l == "apply display.color_temp on B Int(6500)");
+        assert!(restore < again, "{trace:#?}");
+    }
+
     #[test]
     fn switching_a_plugin_off_fades_its_claims_away() {
         let mut host = host();
@@ -1082,6 +1181,47 @@ mod tests {
         }
         assert_eq!(host.value(ids::DISPLAY_COLOR_TEMP), Some(Value::Int(3200)));
         assert!(!host.fading, "and that it ended");
+    }
+
+    #[test]
+    fn a_frame_held_up_by_the_hardware_does_not_jump_the_fade() {
+        // A game leaving exclusive fullscreen blocks gamma writes for a
+        // quarter of a second. The next frame goes on from the one before.
+        let mut host = host();
+        host.now_ms = 10_000;
+        let mut sup = supervisor(
+            &host,
+            vec![plugin(
+                "warm",
+                "return { start = function(cx) cx:claim('display.color_temp', 3200, { fade = 1000 }) end }",
+            )],
+        );
+        sup.start(&mut host);
+        let kelvin = |host: &MockHost| match host.value(ids::DISPLAY_COLOR_TEMP) {
+            Some(Value::Int(k)) => k,
+            other => panic!("no number on screen: {other:?}"),
+        };
+        for _ in 0..20 {
+            host.now_ms += 15;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        let before = kelvin(&host);
+        host.now_ms += 15;
+        host.slow_apply(ids::DISPLAY_COLOR_TEMP, 250);
+        sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        let held = kelvin(&host);
+        host.now_ms += 15;
+        sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        let after = kelvin(&host);
+        let step = before - held;
+        assert!(step > 0, "{before} {held}");
+        assert!(held - after < 3 * step, "{before} {held} {after}");
+        // Still lands, a quarter of a second later.
+        for _ in 0..100 {
+            host.now_ms += 15;
+            sup.handle(&mut host, Event::TimerFired { id: FADE_TIMER });
+        }
+        assert_eq!(kelvin(&host), 3200);
     }
 
     #[test]

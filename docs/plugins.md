@@ -131,7 +131,7 @@ Subscribe with `cx:watch(kind)`. Each event is a table whose `kind` is the watch
 | Kind | Fields | Meaning |
 | --- | --- | --- |
 | `app.focus` | `exe`, `path`, `title` (may be `nil`), `pid` | Another application came to the front. `exe` is its file name, lowercase on Windows (`cs2.exe`, `firefox`); `path` is the full path. |
-| `app.fullscreen` | `exclusive` | An app went fullscreen or left it: exclusive, or a borderless window over its whole monitor. A maximised window is not fullscreen. The field keeps the name it had when only the exclusive case was seen. |
+| `app.fullscreen` | `exclusive`, `outputs` | An app went fullscreen or left it, or a monitor showing one changed: exclusive, or a borderless window over its whole monitor. A maximised window is not fullscreen. `exclusive` is about the focused window and keeps the name it had when only the exclusive case was seen. `outputs` lists every monitor a fullscreen app covers, focused or not, by the name `cx:claim` takes as `output`; a game left fullscreen on one monitor stays listed while you work on another. Empty where the platform does not say (Linux and macOS for now). |
 | `app.maximized` | `maximized` | The focused window fills its monitor (maximised, borderless or exclusive fullscreen), or stopped doing so. |
 | `user.idle` | `idle`, `seconds` | `idle = true` when an inactivity threshold is crossed, with that threshold in `seconds`; `idle = false, seconds = 0` when the user comes back. |
 | `session.lock` | `locked` | The session was locked or unlocked. |
@@ -175,6 +175,8 @@ Priorities are integers, clamped to -100 through 999. The anchors:
 
 `opts.fade` is a duration in milliseconds, up to a day. With a fade, a numeric value travels from where it is now to the new value; cortisoff steps it, you claim once. Claiming the same target again while it fades does not restart the fade. A fade eases in and out, and a colour temperature travels in mireds, evenly to the eye, rather than in kelvin, which would rush through the warm end. Values that are not numbers switch at once. `cx:release(cap, { fade = ms })` fades back to whatever lies underneath.
 
+`opts.output` holds a capability on one monitor only, over whatever holds the whole capability: `cx:claim("display.color_temp", 6600, { output = o, fade = 800 })` for each `o` in `cx:world().filled` keeps the monitor a game fills at its own colours while the others stay warm. Releasing it, with `cx:release(cap, { output = o })`, lets that monitor show the whole capability's value again, faded from where it is. Such a claim is a stack of its own, with the same rules as above. Only `display.color_temp` on Windows can be held apart for now; elsewhere the claim returns `nil` and a sentence, and a plugin should fall back to the whole capability.
+
 `cx:claim` returns `true` when the claim was accepted, or `nil` and a sentence when the capability is missing on this machine, only watchable, or the value has the wrong type. Accepted does not mean winning: the claim is applied after your call returns. `cortisoff-cli state` shows who holds what.
 
 Capabilities you can claim:
@@ -216,12 +218,12 @@ A value given to `cx:claim` converts as follows: a boolean stays a boolean, a wh
 | `cx:at(time, fn)` | timer id | Every day at `time`: `"20:30"`, `"7:05"`, or a minute of the day (`1230`). Measured again after sleep or a clock change. Raises an error if the system gives no clock. |
 | `cx:cancel(id)` | nothing | Cancels one of your timers. Unknown ids are ignored. |
 | `cx:now()` | minute, ms | The local minute of the day with its fraction (`nil` without a clock), and the monotonic milliseconds timers count in. |
-| `cx:claim(cap, value, [opts])` | `true` or `nil, err` | `opts.priority` (default 0, clamped to -100 through 999), `opts.fade` in ms (0 to 86 400 000). See [Capabilities and claims](#capabilities-and-claims). |
-| `cx:release(cap, [opts])` | nothing | Lets go of one capability. `opts.fade` in ms. |
+| `cx:claim(cap, value, [opts])` | `true` or `nil, err` | `opts.priority` (default 0, clamped to -100 through 999), `opts.fade` in ms (0 to 86 400 000), `opts.output` for one monitor only. See [Capabilities and claims](#capabilities-and-claims). |
+| `cx:release(cap, [opts])` | nothing | Lets go of one capability. `opts.fade` in ms, `opts.output` for the claim held on one monitor. |
 | `cx:release_all([opts])` | nothing | Lets go of everything you hold. `opts.fade` in ms. |
 | `cx:has(cap)` | boolean | Whether this machine has the capability, settable or not. |
 | `cx:rest(cap)` | value or `nil` | What the capability shows when nobody holds it, in a claim's shape, for example `6600` for `display.color_temp`. `nil` where there is no such number. |
-| `cx:world()` | table | The current state: `app` (`{ exe, path, title, pid }` as in `app.focus`, or `nil`), `fullscreen`, `maximized`, `idle`, `idle_seconds`, `locked`, `on_battery`, `audio`. |
+| `cx:world()` | table | The current state: `app` (`{ exe, path, title, pid }` as in `app.focus`, or `nil`), `fullscreen`, `filled` (the monitors a fullscreen app covers, as in `app.fullscreen`), `maximized`, `idle`, `idle_seconds`, `locked`, `on_battery`, `audio`. |
 | `cx:publish(state)` | nothing | Sends `state` (plain data) to the window, where it arrives as `st`. |
 | `cx:log(...)` | nothing | An info line in the log, arguments joined with spaces. `print` does the same, joined with tabs, up to 256 lines per call. |
 | `cx:warn(...)` | nothing | A warning line in the log. |

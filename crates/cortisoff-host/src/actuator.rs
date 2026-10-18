@@ -47,6 +47,33 @@ pub trait Actuator {
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError>;
 
+    /// True when one output can be held apart from the others, which is what
+    /// [`Self::apply_output`] and [`Self::release_output`] need.
+    fn per_output(&self) -> bool {
+        false
+    }
+
+    /// Push a value onto one output only, over whatever [`Self::apply`] put
+    /// on the rest. `output` is the actuator's own name for it, the one the
+    /// platform reports in [`crate::Event::Fullscreen`]. The baseline is the
+    /// whole actuator's, captured before the first apply of either kind.
+    fn apply_output(&self, output: &str, _value: &Value) -> Result<(), ActuatorError> {
+        Err(ActuatorError::on(
+            self.id(),
+            format!("cannot hold {output} apart from the other outputs"),
+        ))
+    }
+
+    /// Let one output go: it shows the value [`Self::apply`] last put on the
+    /// others, or its own baseline when nothing holds the whole capability.
+    /// A restore of the baseline lets go of every output too.
+    fn release_output(&self, output: &str) -> Result<(), ActuatorError> {
+        Err(ActuatorError::on(
+            self.id(),
+            format!("cannot hold {output} apart from the other outputs"),
+        ))
+    }
+
     /// The hardware underneath moved: a monitor was plugged, unplugged, or
     /// woke up with a different identity. Hand back a baseline covering what
     /// is there now, or `None` when the one already captured still does.

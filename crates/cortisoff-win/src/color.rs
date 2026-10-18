@@ -83,24 +83,30 @@ pub fn ramp_for(c: &Rgb) -> Ramp {
 /// from the identity, `(i - 128) * 256` to `(i + 128) * 256`, unless the
 /// `GdiIcmGammaRange` value has lifted the clamp. A tint never goes above the
 /// identity, so only the floor bites, and it bites on blue below about
-/// 3400 K. The tightest index is the last one, so a straight channel stays
+/// 3250 K. The tightest index is the last one, so a straight channel stays
 /// inside as long as its gain is at least [`MIN_GAIN`].
 ///
-/// The strongest tint Windows accepts is the wanted one with each channel's
-/// gain raised to that floor, and it is what goes out when the wanted ramp is
-/// refused. Clamping the entries one by one instead bent the blue curve: dark
-/// tones followed the tint, bright ones climbed at full slope from wherever
-/// they met the floor, and that bend moved on every frame of a fade, which
-/// showed as colour shifting in bands across the screen. `None` when the
-/// colour is already inside.
+/// The strongest tint Windows accepts is the wanted one mixed with white just
+/// enough to bring its lowest channel up to that floor. Mixing with white
+/// keeps the hue: on the blackbody curve it lands on a slightly cooler
+/// temperature, 3000 K on about 3250 K. Raising blue alone to the floor, which
+/// is what this did until 0.3.0, kept red and green where they were and gave
+/// back blue only: at 3000 K the screen turned salmon, and the warmer the
+/// setting the pinker it got, 2000 K being close to magenta. Clamping the
+/// entries one by one bent the blue curve, which showed as bands moving
+/// across the screen through a fade. `None` when the colour is already inside.
 pub fn within_windows_range(c: &Rgb) -> Option<Rgb> {
-    let lift = |g: f32| g.max(MIN_GAIN);
-    let inside = Rgb {
-        r: lift(c.r),
-        g: lift(c.g),
-        b: lift(c.b),
-    };
-    (inside != *c).then_some(inside)
+    let low = c.r.min(c.g).min(c.b);
+    if low >= MIN_GAIN {
+        return None;
+    }
+    let t = (1.0 - MIN_GAIN) / (1.0 - low);
+    let mix = |g: f32| (1.0 - t * (1.0 - g)).max(MIN_GAIN);
+    Some(Rgb {
+        r: mix(c.r),
+        g: mix(c.g),
+        b: mix(c.b),
+    })
 }
 
 /// `127 * 256 / 65535`, plus enough that rounding the last entry cannot land
@@ -178,20 +184,25 @@ mod tests {
         }
     }
 
-    /// The Windows floor: 3400 K passes untouched, a warmer colour keeps its
-    /// red and green and stops its blue at the floor, and the ramp it makes is
-    /// still a straight line that Windows' rule accepts at every index.
+    /// The Windows floor: 3400 K passes untouched, a warmer colour is mixed
+    /// with white until its blue reaches the floor, keeping its hue, and the
+    /// ramp it makes is still a straight line that Windows' rule accepts at
+    /// every index.
     #[test]
-    fn the_windows_floor_stops_blue_and_keeps_the_ramp_straight() {
+    fn the_windows_floor_keeps_the_hue_and_the_ramp_straight() {
         assert!(within_windows_range(&Rgb::NEUTRAL).is_none());
         assert!(within_windows_range(&from_kelvin(3400.0)).is_none());
 
-        for k in [3200.0, 2500.0, 1900.0] {
+        for k in [3200.0, 3000.0, 2500.0, 1900.0] {
             let wanted = from_kelvin(k);
             let sent = within_windows_range(&wanted).expect("below the floor");
-            assert_eq!(sent.r, wanted.r);
-            assert_eq!(sent.g, wanted.g.max(MIN_GAIN));
-            assert_eq!(sent.b, MIN_GAIN);
+            assert_eq!(sent.r, 1.0);
+            assert!((sent.b - MIN_GAIN).abs() < 1e-4, "{k} K blue {}", sent.b);
+            // Still warm, never pink: green stays above blue, and the share
+            // each channel lost to the tint keeps its proportion.
+            assert!(sent.g > sent.b, "{k} K: {sent:?}");
+            let lost = |w: f32, s: f32| (1.0 - s) / (1.0 - w);
+            assert!((lost(wanted.g, sent.g) - lost(wanted.b, sent.b)).abs() < 1e-3);
             let ramp = ramp_for(&sent);
             for (n, &entry) in ramp.iter().enumerate() {
                 let i = (n % 256) as i32;
@@ -202,6 +213,14 @@ mod tests {
             let gain = f32::from(ramp[512 + 255]) / 65535.0;
             assert!((f32::from(ramp[512 + 100]) / (100.0 * 257.0) - gain).abs() < 0.001);
         }
+    }
+
+    /// What lifting blue alone did at 2000 K: green and blue ended level,
+    /// which is pink. Mixing with white keeps a clear gap between them.
+    #[test]
+    fn a_warm_setting_under_the_floor_is_orange_not_pink() {
+        let sent = within_windows_range(&from_kelvin(2000.0)).unwrap();
+        assert!(sent.g - sent.b > 0.2, "{sent:?}");
     }
 
     #[test]

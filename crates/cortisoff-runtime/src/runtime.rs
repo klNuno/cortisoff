@@ -25,6 +25,9 @@ pub struct Env<'a> {
     pub host: &'a mut dyn Host,
     pub world: &'a World,
     pub probed: &'a CapabilitySet,
+    /// Whether a plugin, by its key, still holds a capability: claimed, or
+    /// on its way out of it over a release fade.
+    pub holds: &'a dyn Fn(u32, &CapabilityId) -> bool,
     /// [`Host::monotonic_ms`] when the batch started.
     pub now: u64,
 }
@@ -1051,7 +1054,13 @@ fn event_table(lua: &Lua, kind: &str, e: &Event) -> mlua::Result<Table> {
             t.set("title", app.title.clone())?;
             t.set("pid", app.pid)?;
         }
-        Event::Fullscreen { exclusive } => t.set("exclusive", *exclusive)?,
+        Event::Fullscreen { exclusive, outputs } => {
+            t.set("exclusive", *exclusive)?;
+            t.set(
+                "outputs",
+                lua.create_sequence_from(outputs.iter().cloned())?,
+            )?;
+        }
         Event::Maximized { maximized } => t.set("maximized", *maximized)?,
         Event::Idle { idle, seconds } => {
             t.set("idle", *idle)?;

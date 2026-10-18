@@ -26,7 +26,7 @@ use windows::Win32::UI::Magnification::{
 };
 
 use crate::color::{self, Ramp, Rgb};
-use crate::ddc::{self, Gains};
+use crate::ddc::{self, Gains, Landed};
 use crate::screen;
 
 pub struct ColorTemp {
@@ -47,6 +47,16 @@ pub struct ColorTemp {
     /// posted; a panel's first write is made in place, because its answer
     /// decides whether its monitor needs the ramp in the same apply.
     proven: RefCell<BTreeSet<String>>,
+    /// The base gains of every panel this process is tinting, kept on disk
+    /// until each is verified back.
+    memory: ddc::Memory,
+    /// What the whole capability holds, `None` for its baseline.
+    whole: RefCell<Option<Rgb>>,
+    /// Monitors held apart from the whole, by device name: the one a game
+    /// fills, kept at its own colours while the others stay warm.
+    apart: RefCell<BTreeMap<String, Rgb>>,
+    /// `GdiIcmGammaRange` lifted. Read once: it takes a reboot to change.
+    unlocked: bool,
 }
 
 struct Captured {
@@ -128,6 +138,10 @@ impl ColorTemp {
             live: RefCell::new(Live::default()),
             panels: ddc::Writer::new(),
             proven: RefCell::new(BTreeSet::new()),
+            memory: ddc::Memory::open(),
+            whole: RefCell::new(None),
+            apart: RefCell::new(BTreeMap::new()),
+            unlocked: screen::gamma_range_unlocked(),
         })
     }
 
@@ -142,7 +156,10 @@ impl ColorTemp {
         }
     }
 
-    fn apply_tint(&self, c: &Rgb) -> Result<(), ActuatorError> {
+    /// Push what every monitor should show now: its own colour when it is
+    /// held apart, the whole capability's otherwise, its baseline when
+    /// neither holds it.
+    fn push(&self) -> Result<(), ActuatorError> {
         let hdr = screen::hdr_outputs();
         let outputs: Vec<(String, bool)> = screen::device_names()
             .into_iter()
@@ -167,7 +184,17 @@ impl ColorTemp {
             .flat_map(|c| c.gains.iter().map(|(key, _)| key.clone()))
             .filter(|key| !live.refused.contains(key))
             .collect();
-        let plan = plan(&outputs, &panels, self.magnifier, fullscreen_now());
+        let apart = self.apart.borrow();
+        let whole = *self.whole.borrow();
+        // One effect over every monitor cannot leave one of them out.
+        let magnifier = self.magnifier && apart.is_empty();
+        let plan = plan(&outputs, &panels, magnifier, fullscreen_now());
+
+        // Windows holds a ramp at about 3250 K. Every monitor is held there
+        // with it, the HDR panel included, or the panel goes warmer than the
+        // two ramps beside it and the desk shows two colours.
+        let clamp = !self.unlocked && (!plan.gamma.is_empty() || !live.refused.is_empty());
+        let colour = |device: &str| shown(whole, &apart, device, clamp);
 
         // Whichever path is losing a monitor lets go first, or two of them
         // multiply and the screen goes twice as warm as asked.
@@ -181,9 +208,12 @@ impl ColorTemp {
             .filter(|device| !plan.gamma.contains(device))
             .cloned()
             .collect();
+        // A ramp the driver refuses, as during a game's mode change, stays
+        // live and is put back on a later apply.
         for device in leaving {
-            screen::write(&device, &baseline_ramp(captured.as_ref(), &device));
-            live.gamma.remove(&device);
+            if screen::write(&device, &baseline_ramp(captured.as_ref(), &device)) {
+                live.gamma.remove(&device);
+            }
         }
         let leaving: Vec<String> = live
             .touched
@@ -193,49 +223,84 @@ impl ColorTemp {
             .collect();
         for key in leaving {
             if let Some(base) = gains_of(captured.as_ref(), &key) {
-                self.panels.write_now(&key, ddc::currents(base));
+                if self.panels.write_now(&key, ddc::currents(base), None) == Landed::Verified {
+                    self.memory.forget(&key);
+                }
             }
             live.touched.remove(&key);
             live.panel.remove(&key);
         }
 
-        let ramp = color::ramp_for(c);
-        let mut clamped = None;
+        // Whether any monitor wants a tint, and whether one took it.
+        let mut wanted = false;
         let mut carried = false;
         for key in &plan.panel {
             let Some(base) = gains_of(captured.as_ref(), key) else {
                 continue;
             };
-            let wanted = ddc::targets(base, c);
-            if live.panel.get(key) == Some(&wanted) {
+            let device = ddc::device_of(key).to_owned();
+            let gains = match colour(&device) {
+                Some(c) => {
+                    wanted = true;
+                    ddc::targets(base, &c)
+                }
+                // Back to its own gains, if this process ever moved them.
+                None if live.touched.contains(key) => ddc::currents(base),
+                None => continue,
+            };
+            if live.panel.get(key) == Some(&gains) {
                 carried = true;
                 continue;
             }
-            live.touched.insert(key.clone());
+            if live.touched.insert(key.clone()) {
+                // Remembered before the first write, so a capture made while
+                // this tint is on never takes it for the panel's own.
+                self.memory.hold(key, base);
+            }
             if self.proven.borrow().contains(key) {
-                self.panels.post(key, wanted);
-                live.panel.insert(key.clone(), wanted);
+                self.panels.post(key, gains);
+                live.panel.insert(key.clone(), gains);
                 carried = true;
-            } else if self.panels.write_now(key, wanted) {
+            } else if self
+                .panels
+                .write_now(key, gains, Some(ddc::currents(base)))
+                .took()
+            {
                 self.proven.borrow_mut().insert(key.clone());
-                live.panel.insert(key.clone(), wanted);
+                live.panel.insert(key.clone(), gains);
                 carried = true;
             } else {
                 // A panel that stops answering still gets a tint, from its
                 // ramp, and is not asked again until the claim ends.
                 live.panel.remove(key);
                 live.refused.insert(key.clone());
-                let device = ddc::device_of(key).to_owned();
-                if push_ramp(&device, c, &ramp, &mut clamped) {
-                    live.gamma.insert(device);
-                    carried = true;
+                if let Some(c) = colour(&device) {
+                    if push_ramp(&device, &c) {
+                        live.gamma.insert(device);
+                        carried = true;
+                    }
                 }
             }
         }
         for device in &plan.gamma {
-            if push_ramp(device, c, &ramp, &mut clamped) {
-                live.gamma.insert(device.clone());
-                carried = true;
+            match colour(device) {
+                Some(c) => {
+                    wanted = true;
+                    if push_ramp(device, &c) {
+                        live.gamma.insert(device.clone());
+                        carried = true;
+                    }
+                }
+                // Its own ramp back, not the identity: a calibrated monitor
+                // held apart from the night shows its profile. Live until the
+                // write is taken, so a refusal is tried again.
+                None => {
+                    if live.gamma.contains(device)
+                        && screen::write(device, &baseline_ramp(captured.as_ref(), device))
+                    {
+                        live.gamma.remove(device);
+                    }
+                }
             }
         }
         // The fallback comes on only when nothing else took the tint, and
@@ -243,16 +308,26 @@ impl ColorTemp {
         // two overlap: dropping the magnifier before the writes would blink
         // the screen to neutral on every fade step of a machine that refuses
         // every ramp.
+        let all = whole.filter(|c| !neutral(c));
         if carried && live.magnifier {
             set_magnifier(&Rgb::NEUTRAL)?;
             live.magnifier = false;
         } else if !carried && plan.magnifier {
-            set_magnifier(c)?;
-            live.magnifier = true;
-            carried = true;
+            match all {
+                Some(c) => {
+                    set_magnifier(&c)?;
+                    live.magnifier = true;
+                    carried = true;
+                }
+                None if live.magnifier => {
+                    set_magnifier(&Rgb::NEUTRAL)?;
+                    live.magnifier = false;
+                }
+                None => {}
+            }
         }
 
-        if carried {
+        if carried || !wanted {
             Ok(())
         } else {
             Err(ActuatorError::on(
@@ -270,7 +345,7 @@ impl ColorTemp {
             &screen::device_names(),
             set_magnifier,
             screen::write,
-            |key, values| self.panels.write_now(key, values),
+            |key, values| self.panels.write_now(key, values, None),
         )
     }
 
@@ -286,7 +361,7 @@ impl ColorTemp {
         present: &[String],
         reset: impl FnOnce(&Rgb) -> Result<(), ActuatorError>,
         mut write_ramp: impl FnMut(&str, &Ramp) -> bool,
-        mut write_panel: impl FnMut(&str, [u32; 3]) -> bool,
+        mut write_panel: impl FnMut(&str, [u32; 3]) -> Landed,
     ) -> Result<(), ActuatorError> {
         let here = |device: &str| present.iter().any(|d| d == device);
         let mut failures = Vec::new();
@@ -309,8 +384,17 @@ impl ColorTemp {
             if known && !live.touched.contains(&key) {
                 continue;
             }
-            if !write_panel(&key, ddc::currents(&gains)) && here(ddc::device_of(&key)) {
-                failures.push(format!("panel gains on {key}"));
+            match write_panel(&key, ddc::currents(&gains)) {
+                Landed::Verified => self.memory.forget(&key),
+                // Taken and never read back, it may still show the night. It
+                // stays remembered, so no capture takes the night for its own
+                // gains, and the restore fails, so the journal keeps it for
+                // the next start: a check posted to the writer does not
+                // outlive the process.
+                _ if here(ddc::device_of(&key)) => {
+                    failures.push(format!("panel gains on {key}"));
+                }
+                _ => {}
             }
         }
         if !failures.is_empty() {
@@ -324,6 +408,9 @@ impl ColorTemp {
         // error keeps the dispatcher's durable journal entry alive.
         self.captured.borrow_mut().take();
         *live = Live::default();
+        // A baseline back is every monitor back, those held apart included.
+        self.whole.borrow_mut().take();
+        self.apart.borrow_mut().clear();
         Ok(())
     }
 }
@@ -365,6 +452,7 @@ impl Actuator for ColorTemp {
             ddc::capture(&capable)
         };
         self.panels.read_back(&gains);
+        let gains = self.memory.correct(gains);
 
         let captured = Captured { ramps, gains };
         let encoded = encode(&captured);
@@ -420,6 +508,7 @@ impl Actuator for ColorTemp {
             ddc::capture(&capable)
         };
         self.panels.read_back(&gains);
+        let gains = self.memory.correct(gains);
 
         if fresh.is_empty() && gains.is_empty() {
             return None;
@@ -431,7 +520,10 @@ impl Actuator for ColorTemp {
 
     fn apply(&self, value: &Value) -> Result<(), ActuatorError> {
         match value {
-            Value::Int(kelvin) => self.apply_tint(&color::from_kelvin(*kelvin as f32)),
+            Value::Int(kelvin) => {
+                *self.whole.borrow_mut() = Some(color::from_kelvin(*kelvin as f32));
+                self.push()
+            }
             // A captured baseline coming back, from a release or from the
             // journal after a crash.
             Value::Text(encoded) => self.restore(encoded),
@@ -440,6 +532,40 @@ impl Actuator for ColorTemp {
                 format!("expected a colour temperature in kelvin, got {other:?}"),
             )),
         }
+    }
+
+    /// Every monitor has a ramp, or a panel, of its own. Not the magnifier:
+    /// one effect over every monitor cannot leave one out.
+    fn per_output(&self) -> bool {
+        self.gamma
+    }
+
+    /// `output` is a device name, `\\.\DISPLAY3`, as the fullscreen event
+    /// reports it.
+    fn apply_output(&self, output: &str, value: &Value) -> Result<(), ActuatorError> {
+        let Value::Int(kelvin) = value else {
+            return Err(ActuatorError::on(
+                self.id(),
+                format!("expected a colour temperature in kelvin, got {value:?}"),
+            ));
+        };
+        if !self.gamma {
+            return Err(ActuatorError::on(
+                self.id(),
+                format!("cannot hold {output} apart: the magnifier tints every monitor at once"),
+            ));
+        }
+        self.apart
+            .borrow_mut()
+            .insert(output.to_owned(), color::from_kelvin(*kelvin as f32));
+        self.push()
+    }
+
+    fn release_output(&self, output: &str) -> Result<(), ActuatorError> {
+        if self.apart.borrow_mut().remove(output).is_none() {
+            return Ok(());
+        }
+        self.push()
     }
 
     fn volatile(&self) -> bool {
@@ -475,18 +601,37 @@ impl Drop for ColorTemp {
 }
 
 /// The ramp as wanted and, when Windows refuses it, the strongest one it
-/// accepts. The clamp is computed once per apply, and only once a write has
-/// been refused, so a machine with the range lifted never pays for it.
-fn push_ramp(device: &str, c: &Rgb, ramp: &Ramp, clamped: &mut Option<Option<Ramp>>) -> bool {
-    if screen::write(device, ramp) {
+/// accepts. Only reached past the clamp with the range lifted, or on a
+/// driver stricter than the registry says.
+fn push_ramp(device: &str, c: &Rgb) -> bool {
+    if screen::write(device, &color::ramp_for(c)) {
         return true;
     }
-    clamped
-        .get_or_insert_with(|| {
-            color::within_windows_range(c).map(|inside| color::ramp_for(&inside))
-        })
-        .as_ref()
-        .is_some_and(|inside| screen::write(device, inside))
+    color::within_windows_range(c)
+        .is_some_and(|inside| screen::write(device, &color::ramp_for(&inside)))
+}
+
+/// The colour `device` shows: its own when it is held apart, the whole
+/// capability's otherwise, held inside the Windows range with every other
+/// monitor when `clamp`. `None` for its own ramp and gains.
+fn shown(
+    whole: Option<Rgb>,
+    apart: &BTreeMap<String, Rgb>,
+    device: &str,
+    clamp: bool,
+) -> Option<Rgb> {
+    let c = apart.get(device).copied().or(whole)?;
+    let c = match clamp {
+        true => color::within_windows_range(&c).unwrap_or(c),
+        false => c,
+    };
+    (!neutral(&c)).then_some(c)
+}
+
+/// No tint at all: the curve leaves every channel at full. Such a monitor
+/// shows its own ramp and gains, not the identity.
+fn neutral(c: &Rgb) -> bool {
+    c.r.min(c.g).min(c.b) >= 0.9999
 }
 
 /// The baseline as the journal holds it: every ramp, then every panel gain.
@@ -585,6 +730,10 @@ mod tests {
             }),
             panels: ddc::Writer::new(),
             proven: RefCell::new(BTreeSet::new()),
+            memory: ddc::Memory::none(),
+            whole: RefCell::new(None),
+            apart: RefCell::new(BTreeMap::new()),
+            unlocked: false,
         };
         (actuator, encoded)
     }
@@ -604,7 +753,7 @@ mod tests {
             },
             |key, values| {
                 panels.push((key.to_owned(), values));
-                false
+                Landed::Missed
             },
         );
         let error = result.expect_err("a failed restoration must keep the journal dirty");
@@ -623,7 +772,7 @@ mod tests {
                 |_, _| true,
                 |key, values| {
                     panels.push((key.to_owned(), values));
-                    true
+                    Landed::Verified
                 },
             )
             .unwrap();
@@ -648,7 +797,7 @@ mod tests {
                 |_, _| false,
                 |key, _| {
                     panels.push(key.to_owned());
-                    false
+                    Landed::Missed
                 },
             )
             .expect_err("failed recovery must not clear the journal");
@@ -669,12 +818,59 @@ mod tests {
                 |_, _| true,
                 |key, _| {
                     panels.push(key.to_owned());
-                    true
+                    Landed::Verified
                 },
             )
             .unwrap();
         assert_eq!(panels, vec![ddc::key(ONE, 0)]);
         assert!(actuator.captured.borrow().is_none());
+    }
+
+    /// A panel that took its baseline back and could not be read is not
+    /// proven: the restore fails, so the journal keeps it, and its remembered
+    /// gains stay, so a capture made while it still shows the night takes
+    /// them instead.
+    #[test]
+    fn a_restore_that_cannot_be_read_keeps_the_panel_remembered() {
+        let (actuator, encoded) = restoration_fixture(true);
+        let key = ddc::key(ONE, 0);
+        let base = [ddc::Gain {
+            min: 0,
+            current: 42,
+            max: 100,
+        }; 3];
+        let remembered = |actuator: &ColorTemp| {
+            let shown = [ddc::Gain {
+                min: 0,
+                current: 7,
+                max: 100,
+            }; 3];
+            ddc::currents(&actuator.memory.correct(vec![(key.clone(), shown)])[0].1)
+        };
+        actuator.memory.hold(&key, &base);
+        actuator
+            .restore_using(
+                &encoded,
+                &both(),
+                |_| unreachable!(),
+                |_, _| true,
+                |_, _| Landed::Unread,
+            )
+            .expect_err("not read back is not restored");
+        assert_eq!(remembered(&actuator), [42; 3]);
+
+        let (actuator, encoded) = restoration_fixture(true);
+        actuator.memory.hold(&key, &base);
+        actuator
+            .restore_using(
+                &encoded,
+                &both(),
+                |_| unreachable!(),
+                |_, _| true,
+                |_, _| Landed::Verified,
+            )
+            .unwrap();
+        assert_eq!(remembered(&actuator), [7; 3], "read back: forgotten");
     }
 
     /// The monitor that carried the baseline is switched off. Nothing can be
@@ -693,7 +889,7 @@ mod tests {
                     written.push(device.to_owned());
                     device == TWO
                 },
-                |_, _| false,
+                |_, _| Landed::Missed,
             )
             .expect("a monitor that left is not a failure");
         // Both were attempted: a device can come back under the same name
@@ -804,5 +1000,35 @@ mod tests {
         let p = plan(&outs, &panels(&[r"\\.\DISPLAY10#0"]), false, false);
         assert!(p.panel.is_empty(), "{p:?}");
         assert_eq!(p.gamma.len(), 2);
+    }
+
+    /// The night on every monitor but the one a game fills, which shows its
+    /// own ramp. Every warm one gets the same colour, clamped or not.
+    #[test]
+    fn a_monitor_held_apart_shows_its_own_colours() {
+        let warm = color::from_kelvin(3000.0);
+        let night = Some(warm);
+        let apart: BTreeMap<String, Rgb> = [(
+            TWO.to_owned(),
+            color::from_kelvin(color::NEUTRAL_KELVIN as f32),
+        )]
+        .into();
+        assert_eq!(shown(night, &apart, TWO, true), None);
+        let one = shown(night, &apart, ONE, true).unwrap();
+        assert_eq!(Some(one), color::within_windows_range(&warm));
+        assert_eq!(shown(night, &apart, ONE, false), night);
+        // Nothing on the whole: only the monitor held apart is tinted.
+        let warm: BTreeMap<String, Rgb> = [(TWO.to_owned(), color::from_kelvin(4000.0))].into();
+        assert_eq!(shown(None, &warm, ONE, false), None);
+        assert_eq!(
+            shown(None, &warm, TWO, false),
+            Some(color::from_kelvin(4000.0))
+        );
+    }
+
+    #[test]
+    fn six_thousand_six_hundred_is_no_tint_and_six_thousand_five_hundred_is() {
+        assert!(neutral(&color::from_kelvin(color::NEUTRAL_KELVIN as f32)));
+        assert!(!neutral(&color::from_kelvin(6500.0)));
     }
 }

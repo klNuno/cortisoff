@@ -82,6 +82,20 @@ impl Claims {
             .ok_or_else(|| format!("this machine has no {cap}"))
     }
 
+    /// The same, for a claim: one output of a capability gets its own stack
+    /// the first time it is asked for.
+    pub fn slot_of(&mut self, cap: &CapabilityId) -> Result<CapIndex, String> {
+        if let Ok(i) = self.index_of(cap) {
+            return Ok(i);
+        }
+        match cap.output() {
+            Some((whole, _)) if self.index_of(&whole).is_ok() => {
+                Ok(self.arbiter.intern(cap.clone()))
+            }
+            _ => Err(format!("this machine has no {cap}")),
+        }
+    }
+
     /// Whether `owner` is still on its way to the value it claimed.
     pub fn fading(&self, cap: CapIndex, owner: OwnerId) -> bool {
         self.fades.iter().any(|f| f.cap == cap && f.owner == owner)
@@ -105,6 +119,20 @@ impl Claims {
         }
     }
 
+    /// The hardware held every frame back from `from` to `now`: each fade
+    /// already under way waits that long, so the next frame goes on from
+    /// what the screen shows instead of jumping. A game leaving exclusive
+    /// fullscreen blocks gamma calls for a quarter of a second, and a fade
+    /// back crossed half its way in one frame after it.
+    pub fn hold(&mut self, from: u64, now: u64) {
+        let held = now.saturating_sub(from);
+        for f in &mut self.fades {
+            if f.start <= from {
+                f.start += held;
+            }
+        }
+    }
+
     /// Fold an event from the platform in. Returns which part of the world
     /// moved, for routing to plugins, and anything the hardware needs again.
     pub fn on_event(&mut self, event: &Event) -> (Option<Signals>, Vec<Action>) {
@@ -117,11 +145,19 @@ impl Claims {
                 (None, self.arbiter.resettle())
             }
             // Only one capability lost its value. A refresh rate is not
-            // pushed again for a tint.
+            // pushed again for a tint. Its outputs held apart go with it: the
+            // actuator puts them back as part of the whole.
             Event::Reapply { cap } => match self.arbiter.table().index_of(cap) {
                 Some(index) => {
-                    self.arbiter.invalidate_one(index);
-                    (None, self.arbiter.resettle_one(index).into_iter().collect())
+                    let family: Vec<CapIndex> = std::iter::once(index)
+                        .chain(self.arbiter.table().children(index))
+                        .collect();
+                    let mut out = Vec::new();
+                    for i in family {
+                        self.arbiter.invalidate_one(i);
+                        out.extend(self.arbiter.resettle_one(i));
+                    }
+                    (None, out)
                 }
                 None => (None, Vec::new()),
             },
@@ -159,6 +195,7 @@ impl Claims {
             .arbiter
             .held(cap, owner)
             .or_else(|| self.arbiter.applied(cap))
+            .or_else(|| self.shown_whole(cap))
             .or(rest)
             .cloned();
         self.fades.retain(|f| !(f.cap == cap && f.owner == owner));
@@ -182,7 +219,7 @@ impl Claims {
             None => out.extend(self.arbiter.claim(cap, owner, priority, value)),
         }
         out.extend(self.timer());
-        out
+        self.follow(out)
     }
 
     /// Let go. With `fade_ms` above zero and the owner on top, the value
@@ -238,7 +275,7 @@ impl Claims {
             None => out.extend(self.arbiter.release(cap, owner)),
         }
         out.extend(self.timer());
-        out
+        self.follow(out)
     }
 
     /// Everything one owner holds, at once. A plugin switched off or
@@ -247,7 +284,7 @@ impl Claims {
         self.fades.retain(|f| f.owner != owner);
         let mut out = self.arbiter.release_all(owner);
         out.extend(self.timer());
-        out
+        self.follow(out)
     }
 
     /// One frame of every fade, at `now`. Called when [`FADE_TIMER`] fires.
@@ -280,6 +317,29 @@ impl Claims {
         fades.append(&mut self.fades);
         self.fades = fades;
         out.extend(self.timer());
+        self.follow(out)
+    }
+
+    /// A whole capability given back to its baseline lets go of its outputs
+    /// too, so an output still held apart is pushed again after it: the game
+    /// keeps its monitor neutral when the night ends under it.
+    fn follow(&mut self, mut out: Vec<Action>) -> Vec<Action> {
+        let mut again = Vec::new();
+        for a in &out {
+            let Action::RestoreBaseline { cap } = a else {
+                continue;
+            };
+            let Some(whole) = self.arbiter.table().index_of(cap) else {
+                continue;
+            };
+            again.extend(self.arbiter.table().children(whole));
+        }
+        for i in again {
+            if self.arbiter.holder(i).is_some() {
+                self.arbiter.invalidate_one(i);
+                out.extend(self.arbiter.resettle_one(i));
+            }
+        }
         out
     }
 
@@ -293,18 +353,32 @@ impl Claims {
 
     /// A colour temperature fades in mireds, everything else in a line.
     fn curve(&self, cap: CapIndex) -> Curve {
-        if self.arbiter.table().id(cap).as_str() == ids::DISPLAY_COLOR_TEMP {
+        if self.arbiter.table().id(cap).parent().as_str() == ids::DISPLAY_COLOR_TEMP {
             Curve::Mired
         } else {
             Curve::Linear
         }
     }
 
+    /// What lies under `owner`: the next claim down, else, for one output of
+    /// a capability, what the whole capability shows right now, frame by
+    /// frame while it fades, else `rest`.
     fn beneath(&self, cap: CapIndex, owner: OwnerId, rest: Option<&Value>) -> Option<Value> {
         self.arbiter
             .beneath(cap, owner)
-            .map(|c| c.value.clone())
-            .or_else(|| rest.cloned())
+            .map(|c| &c.value)
+            .or_else(|| self.shown_whole(cap))
+            .or(rest)
+            .cloned()
+    }
+
+    /// For one output of a capability, the value the whole capability has on
+    /// the screen: where that output comes from and goes back to.
+    fn shown_whole(&self, cap: CapIndex) -> Option<&Value> {
+        self.arbiter
+            .table()
+            .parent(cap)
+            .and_then(|whole| self.arbiter.applied(whole))
     }
 
     /// The next frame, or the end of frames. Only as often as some fade
@@ -529,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn a_held_up_fade_waits_and_a_later_one_does_not() {
+        let (mut c, i) = claims();
+        let rest = Value::Int(6600);
+        c.claim(i, P, 0, Value::Int(3200), 1000, 0, Some(&rest));
+        let a = c.slot_of(&CapabilityId::new(TEMP).on_output("A")).unwrap();
+        c.claim(a, NIGHT, 0, Value::Int(3200), 1000, 600, Some(&rest));
+        // Stuck from 500 to 750: the first fade shows at 750 what it
+        // showed at 500; the one asked for at 600 had not begun.
+        c.hold(500, 750);
+        let out = c.tick(750);
+        assert_eq!(applied_on(&out, TEMP), vec![Value::Int(4310)]);
+        // The first now ends at 1250, the second still at 1600.
+        c.tick(1250);
+        assert!(!c.fading(i, P));
+        assert!(c.fading(a, NIGHT));
+    }
+
+    #[test]
     fn a_display_change_pushes_every_winner_again() {
         let (mut c, i) = claims();
         c.claim(i, P, 0, Value::Int(4000), 0, 0, None);
@@ -545,5 +637,132 @@ mod tests {
             cap: CapabilityId::new(TEMP)
         }));
         assert!(out.contains(&Action::CancelTimer { id: FADE_TIMER }));
+    }
+
+    const NIGHT: OwnerId = OwnerId::Plugin(2);
+    const SPARE: OwnerId = OwnerId::Plugin(3);
+
+    fn one(c: &mut Claims, output: &str) -> CapIndex {
+        c.slot_of(&CapabilityId::new(TEMP).on_output(output))
+            .unwrap()
+    }
+
+    fn kelvin(v: &[Value]) -> i64 {
+        match v {
+            [Value::Int(k)] => *k,
+            _ => panic!("one frame expected, got {v:?}"),
+        }
+    }
+
+    fn applied_on(actions: &[Action], cap: &str) -> Vec<Value> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Apply { cap: c, value } if c.as_str() == cap => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_output_is_its_own_stack_under_the_same_capability() {
+        let (mut c, whole) = claims();
+        let a = one(&mut c, "A");
+        assert_ne!(a, whole);
+        assert_eq!(one(&mut c, "A"), a, "asked twice, interned once");
+        assert_eq!(c.arbiter().table().parent(a), Some(whole));
+        assert!(c.slot_of(&CapabilityId::new("display.mode@A")).is_err());
+        assert!(c.slot_of(&CapabilityId::new("display.nothing")).is_err());
+    }
+
+    #[test]
+    fn an_output_fades_out_of_the_night_and_back_into_it() {
+        let (mut c, whole) = claims();
+        let rest = Value::Int(6600);
+        c.claim(whole, NIGHT, 0, Value::Int(3000), 0, 0, Some(&rest));
+        let a = one(&mut c, "A");
+        // A game fills A: that output alone leaves the night, from 3000 K and
+        // in mireds like the whole one.
+        let out = c.claim(a, SPARE, 0, Value::Int(6600), 800, 0, Some(&rest));
+        let id = format!("{TEMP}@A");
+        assert_eq!(applied_on(&out, &id), vec![Value::Int(3000)]);
+        assert!(kelvin(&applied_on(&c.tick(400), &id)) < 4800);
+        assert_eq!(applied_on(&c.tick(800), &id), vec![Value::Int(6600)]);
+        // It goes back to the night, not to the 6600 K rest.
+        c.release(a, SPARE, 800, 1000, Some(&rest));
+        let mid = kelvin(&applied_on(&c.tick(1400), &id));
+        assert!(mid < 4800 && mid > 3000, "{mid}");
+        let out = c.tick(1800);
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(id.clone())
+        }));
+        assert!(c.arbiter().holder(a).is_none());
+        assert!(
+            applied_on(&out, TEMP).is_empty(),
+            "the other outputs never moved"
+        );
+    }
+
+    #[test]
+    fn an_output_already_matching_the_night_lets_go_and_rides_its_fade() {
+        let (mut c, whole) = claims();
+        let rest = Value::Int(6600);
+        c.claim(whole, NIGHT, 0, Value::Int(6600), 0, 0, Some(&rest));
+        let a = one(&mut c, "A");
+        c.claim(a, SPARE, 0, Value::Int(6600), 0, 0, Some(&rest));
+        c.claim(whole, NIGHT, 0, Value::Int(3000), 1000, 0, Some(&rest));
+        // The output shows what the whole one shows, so it lets go at once
+        // and rides the whole one's fade from there, with no jump.
+        let out = c.release(a, SPARE, 1000, 0, Some(&rest));
+        assert!(out.contains(&Action::RestoreBaseline {
+            cap: CapabilityId::new(format!("{TEMP}@A"))
+        }));
+        assert_eq!(applied_on(&c.tick(1000), TEMP), vec![Value::Int(3000)]);
+    }
+
+    #[test]
+    fn the_night_ending_under_a_held_output_pushes_that_output_again() {
+        let (mut c, whole) = claims();
+        let rest = Value::Int(6600);
+        c.claim(whole, NIGHT, 0, Value::Int(3000), 0, 0, Some(&rest));
+        let a = one(&mut c, "A");
+        c.claim(a, SPARE, 0, Value::Int(6600), 0, 0, Some(&rest));
+        let out = c.release(whole, NIGHT, 0, 0, Some(&rest));
+        let id = CapabilityId::new(format!("{TEMP}@A"));
+        let restore = out
+            .iter()
+            .position(|a| {
+                *a == Action::RestoreBaseline {
+                    cap: CapabilityId::new(TEMP),
+                }
+            })
+            .unwrap();
+        let again = out
+            .iter()
+            .position(|a| {
+                *a == Action::Apply {
+                    cap: id.clone(),
+                    value: Value::Int(6600),
+                }
+            })
+            .unwrap();
+        assert!(restore < again, "{out:?}");
+    }
+
+    #[test]
+    fn a_reapply_of_the_whole_pushes_its_outputs_too() {
+        let (mut c, whole) = claims();
+        let rest = Value::Int(6600);
+        c.claim(whole, NIGHT, 0, Value::Int(3000), 0, 0, Some(&rest));
+        let a = one(&mut c, "A");
+        c.claim(a, SPARE, 0, Value::Int(6600), 0, 0, Some(&rest));
+        let (_, out) = c.on_event(&Event::Reapply {
+            cap: CapabilityId::new(TEMP),
+        });
+        assert_eq!(applied_on(&out, TEMP), vec![Value::Int(3000)]);
+        assert_eq!(
+            applied_on(&out, &format!("{TEMP}@A")),
+            vec![Value::Int(6600)]
+        );
     }
 }
