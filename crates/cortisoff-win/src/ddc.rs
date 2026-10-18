@@ -218,6 +218,11 @@ struct Queue {
     /// What each panel holds, as last written or read, so a write sends only
     /// what moved.
     known: BTreeMap<String, [u32; 3]>,
+    /// What a panel that refused part of a set is believed to hold, by
+    /// [`after`]. Not known: an accepted channel may not have been applied,
+    /// so the next write reads first, and orders from this only when that
+    /// read finds nothing.
+    guessed: BTreeMap<String, [u32; 3]>,
     /// Panels to read back, once their writes have stopped.
     checks: BTreeMap<String, Check>,
     /// Panels that refused a posted write since the caller last asked.
@@ -325,21 +330,23 @@ impl Writer {
         q.pending.remove(key);
         q.checks.remove(key);
         let mut known = q.known.get(key).copied();
+        let mut guessed = q.guessed.remove(key);
         q.busy = true;
         drop(q);
         let wire = &self.shared.wire;
-        // Nothing known, as after a crash: read first, so the channels go out
-        // in an order that is never pink.
+        // Nothing known, as after a crash or a refusal: read first, so the
+        // channels go out in an order that is never pink.
         if known.is_none() {
             known = read_patiently(wire.as_ref(), key);
         }
         let mut landed = Landed::Missed;
         for _ in 0..MISSES {
-            let believed = known.or(likely);
+            let believed = known.or(guessed).or(likely);
             let channels = order(Some(believed.unwrap_or([0; 3])), values, true);
             let refused = wire.set(key, &channels);
             if refused.contains(&true) {
-                known = believed.map(|b| after(b, &channels, refused));
+                guessed = believed.map(|b| after(b, &channels, refused));
+                known = None;
                 break;
             }
             match read_patiently(wire.as_ref(), key) {
@@ -359,10 +366,17 @@ impl Writer {
         }
         let mut q = self.lock();
         q.busy = false;
-        match known {
-            Some(v) => q.known.insert(key.to_owned(), v),
-            None => q.known.remove(key),
-        };
+        match (known, guessed) {
+            (Some(v), _) => {
+                q.known.insert(key.to_owned(), v);
+            }
+            (None, guess) => {
+                q.known.remove(key);
+                if let Some(g) = guess {
+                    q.guessed.insert(key.to_owned(), g);
+                }
+            }
+        }
         if landed == Landed::Unread {
             q.checks.insert(
                 key.to_owned(),
@@ -390,6 +404,7 @@ impl Writer {
     pub fn read_back(&self, gains: &[(String, Gains)]) {
         let mut q = self.lock();
         for (key, g) in gains {
+            q.guessed.remove(key);
             q.known.insert(key.clone(), currents(g));
         }
     }
@@ -498,10 +513,13 @@ fn run(shared: &Shared) {
             continue;
         };
         // After a read, every channel goes out, ordered from what it found,
-        // or from what was last believed when the panel did not answer.
-        let (known, all) = match read {
-            Some(found) => (found.or(q.known.get(&key).copied()), true),
-            None => (q.known.get(&key).copied(), false),
+        // or from what was last believed when the panel did not answer. A
+        // guess is not trusted to skip a channel.
+        let guess = q.guessed.get(&key).copied();
+        let (known, all) = match (read, q.known.get(&key).copied()) {
+            (Some(found), known) => (found.or(known).or(guess), true),
+            (None, Some(known)) => (Some(known), false),
+            (None, None) => (guess, true),
         };
         q.busy = true;
         drop(q);
@@ -510,6 +528,7 @@ fn run(shared: &Shared) {
         q = lock();
         q.busy = false;
         if !refused.contains(&true) {
+            q.guessed.remove(&key);
             q.known.insert(key.clone(), target);
             let due = Instant::now() + VERIFY_AFTER;
             q.checks.insert(
@@ -521,9 +540,10 @@ fn run(shared: &Shared) {
                 },
             );
         } else {
+            q.known.remove(&key);
             match known {
-                Some(k) => q.known.insert(key.clone(), after(k, &channels, refused)),
-                None => q.known.remove(&key),
+                Some(k) => q.guessed.insert(key.clone(), after(k, &channels, refused)),
+                None => q.guessed.remove(&key),
             };
             q.checks.remove(&key);
             q.refused.push(key);
@@ -1191,7 +1211,25 @@ mod tests {
         *fake.0.blind.lock().unwrap() = MISSES as usize;
         let landed = writer.write_now("p#0", [100, 80, 70], base);
         assert_eq!(fake.sets()[1].1, [(0, 100), (1, 80), (2, 70)]);
-        assert_eq!(landed, Landed::Unread);
+        assert_eq!(landed, Landed::Verified);
+    }
+
+    /// The same refusal where green and blue were taken but not applied: the
+    /// guess is wrong, so the next write reads the panel first and lowers
+    /// blue before green from what it really holds.
+    #[test]
+    fn a_partly_refused_tint_is_read_again_before_the_next_write() {
+        let fake = Fake::holding("p#0", [100, 92, 96]);
+        let writer = Writer::with(fake.clone());
+        let base = Some([100, 92, 96]);
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
+        *fake.0.refuse_once.lock().unwrap() = vec![0];
+        *fake.0.lose.lock().unwrap() = 1;
+        assert_eq!(writer.write_now("p#0", [100, 64, 41], base), Landed::Missed);
+        assert_eq!(fake.held("p#0"), Some([100, 92, 96]));
+        let landed = writer.write_now("p#0", [100, 80, 70], base);
+        assert_eq!(fake.sets()[1].1, [(2, 70), (1, 80), (0, 100)]);
+        assert_eq!(landed, Landed::Verified);
     }
 
     /// A read that misses once is asked again before the write counts as
