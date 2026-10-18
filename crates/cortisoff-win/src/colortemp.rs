@@ -26,7 +26,7 @@ use windows::Win32::UI::Magnification::{
 };
 
 use crate::color::{self, Ramp, Rgb};
-use crate::ddc::{self, Gains};
+use crate::ddc::{self, Gains, Landed};
 use crate::screen;
 
 pub struct ColorTemp {
@@ -208,9 +208,12 @@ impl ColorTemp {
             .filter(|device| !plan.gamma.contains(device))
             .cloned()
             .collect();
+        // A ramp the driver refuses, as during a game's mode change, stays
+        // live and is put back on a later apply.
         for device in leaving {
-            screen::write(&device, &baseline_ramp(captured.as_ref(), &device));
-            live.gamma.remove(&device);
+            if screen::write(&device, &baseline_ramp(captured.as_ref(), &device)) {
+                live.gamma.remove(&device);
+            }
         }
         let leaving: Vec<String> = live
             .touched
@@ -220,7 +223,7 @@ impl ColorTemp {
             .collect();
         for key in leaving {
             if let Some(base) = gains_of(captured.as_ref(), &key) {
-                if self.panels.write_now(&key, ddc::currents(base)) {
+                if self.panels.write_now(&key, ddc::currents(base)) == Landed::Verified {
                     self.memory.forget(&key);
                 }
             }
@@ -258,7 +261,7 @@ impl ColorTemp {
                 self.panels.post(key, gains);
                 live.panel.insert(key.clone(), gains);
                 carried = true;
-            } else if self.panels.write_now(key, gains) {
+            } else if self.panels.write_now(key, gains).took() {
                 self.proven.borrow_mut().insert(key.clone());
                 live.panel.insert(key.clone(), gains);
                 carried = true;
@@ -285,10 +288,13 @@ impl ColorTemp {
                     }
                 }
                 // Its own ramp back, not the identity: a calibrated monitor
-                // held apart from the night shows its profile.
+                // held apart from the night shows its profile. Live until the
+                // write is taken, so a refusal is tried again.
                 None => {
-                    if live.gamma.remove(device) {
-                        screen::write(device, &baseline_ramp(captured.as_ref(), device));
+                    if live.gamma.contains(device)
+                        && screen::write(device, &baseline_ramp(captured.as_ref(), device))
+                    {
+                        live.gamma.remove(device);
                     }
                 }
             }
@@ -351,7 +357,7 @@ impl ColorTemp {
         present: &[String],
         reset: impl FnOnce(&Rgb) -> Result<(), ActuatorError>,
         mut write_ramp: impl FnMut(&str, &Ramp) -> bool,
-        mut write_panel: impl FnMut(&str, [u32; 3]) -> bool,
+        mut write_panel: impl FnMut(&str, [u32; 3]) -> Landed,
     ) -> Result<(), ActuatorError> {
         let here = |device: &str| present.iter().any(|d| d == device);
         let mut failures = Vec::new();
@@ -374,10 +380,16 @@ impl ColorTemp {
             if known && !live.touched.contains(&key) {
                 continue;
             }
-            if write_panel(&key, ddc::currents(&gains)) {
-                self.memory.forget(&key);
-            } else if here(ddc::device_of(&key)) {
-                failures.push(format!("panel gains on {key}"));
+            match write_panel(&key, ddc::currents(&gains)) {
+                Landed::Verified => self.memory.forget(&key),
+                // Taken and not read back: the writer reads it again, and the
+                // panel stays remembered so a capture before a read proves it
+                // back never takes the night for its own gains.
+                Landed::Unread => {}
+                Landed::Missed if here(ddc::device_of(&key)) => {
+                    failures.push(format!("panel gains on {key}"));
+                }
+                Landed::Missed => {}
             }
         }
         if !failures.is_empty() {
@@ -736,7 +748,7 @@ mod tests {
             },
             |key, values| {
                 panels.push((key.to_owned(), values));
-                false
+                Landed::Missed
             },
         );
         let error = result.expect_err("a failed restoration must keep the journal dirty");
@@ -755,7 +767,7 @@ mod tests {
                 |_, _| true,
                 |key, values| {
                     panels.push((key.to_owned(), values));
-                    true
+                    Landed::Verified
                 },
             )
             .unwrap();
@@ -780,7 +792,7 @@ mod tests {
                 |_, _| false,
                 |key, _| {
                     panels.push(key.to_owned());
-                    false
+                    Landed::Missed
                 },
             )
             .expect_err("failed recovery must not clear the journal");
@@ -801,12 +813,58 @@ mod tests {
                 |_, _| true,
                 |key, _| {
                     panels.push(key.to_owned());
-                    true
+                    Landed::Verified
                 },
             )
             .unwrap();
         assert_eq!(panels, vec![ddc::key(ONE, 0)]);
         assert!(actuator.captured.borrow().is_none());
+    }
+
+    /// A panel that took its baseline back and could not be read is not
+    /// failed, and not proven either: its remembered gains stay, so a capture
+    /// made while it still shows the night takes them instead.
+    #[test]
+    fn a_restore_that_cannot_be_read_keeps_the_panel_remembered() {
+        let (actuator, encoded) = restoration_fixture(true);
+        let key = ddc::key(ONE, 0);
+        let base = [ddc::Gain {
+            min: 0,
+            current: 42,
+            max: 100,
+        }; 3];
+        let remembered = |actuator: &ColorTemp| {
+            let shown = [ddc::Gain {
+                min: 0,
+                current: 7,
+                max: 100,
+            }; 3];
+            ddc::currents(&actuator.memory.correct(vec![(key.clone(), shown)])[0].1)
+        };
+        actuator.memory.hold(&key, &base);
+        actuator
+            .restore_using(
+                &encoded,
+                &both(),
+                |_| unreachable!(),
+                |_, _| true,
+                |_, _| Landed::Unread,
+            )
+            .expect("taken is not failed");
+        assert_eq!(remembered(&actuator), [42; 3]);
+
+        let (actuator, encoded) = restoration_fixture(true);
+        actuator.memory.hold(&key, &base);
+        actuator
+            .restore_using(
+                &encoded,
+                &both(),
+                |_| unreachable!(),
+                |_, _| true,
+                |_, _| Landed::Verified,
+            )
+            .unwrap();
+        assert_eq!(remembered(&actuator), [7; 3], "read back: forgotten");
     }
 
     /// The monitor that carried the baseline is switched off. Nothing can be
@@ -825,7 +883,7 @@ mod tests {
                     written.push(device.to_owned());
                     device == TWO
                 },
-                |_, _| false,
+                |_, _| Landed::Missed,
             )
             .expect("a monitor that left is not a failure");
         // Both were attempted: a device can come back under the same name

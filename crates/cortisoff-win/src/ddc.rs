@@ -222,6 +222,26 @@ const VERIFY_AFTER: Duration = Duration::from_millis(1500);
 /// Reads that find the wrong gains before a panel counts as refusing.
 const MISSES: u8 = 3;
 
+/// How a write made in place ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// Read back as asked.
+    Verified,
+    /// Taken, and the panel did not answer the read. It is read again once
+    /// quiet, like a posted write, but nothing can say yet that it holds the
+    /// gains: a baseline is not done with until a read does.
+    Unread,
+    /// Refused, or read back wrong every time.
+    Missed,
+}
+
+impl Landed {
+    /// The panel took the write, read back or not.
+    pub fn took(self) -> bool {
+        self != Landed::Missed
+    }
+}
+
 impl Writer {
     pub fn new() -> Self {
         Self::with(Panels)
@@ -242,6 +262,11 @@ impl Writer {
     pub fn post(&self, key: &str, values: [u32; 3]) {
         let mut q = self.lock();
         q.pending.insert(key.to_owned(), values);
+        self.wake(q);
+    }
+
+    /// Start the thread if it is not running, and tell it the queue moved.
+    fn wake(&self, mut q: MutexGuard<'_, Queue>) {
         if !q.running {
             q.running = true;
             let shared = Arc::clone(&self.shared);
@@ -266,9 +291,8 @@ impl Writer {
     /// never cross on the wire, and read it back. For the first write to a
     /// panel, whose answer decides its path, and for putting a baseline back,
     /// which must land: every channel is sent whatever the panel is believed
-    /// to hold, and sent again while a read finds something else. True once
-    /// the panel holds `values`, or took them and cannot be read.
-    pub fn write_now(&self, key: &str, values: [u32; 3]) -> bool {
+    /// to hold, and sent again while a read finds something else.
+    pub fn write_now(&self, key: &str, values: [u32; 3]) -> Landed {
         let mut q = self.settled();
         // This is the target from now on: nothing older goes out after it.
         q.pending.remove(key);
@@ -277,7 +301,13 @@ impl Writer {
         q.busy = true;
         drop(q);
         let wire = &self.shared.wire;
-        let mut ok = false;
+        // Nothing known, as after a crash: without a read the channels go out
+        // in the order for falling ones, and a panel coming back from the
+        // night has its blue raised before its green, which is pink.
+        if known.is_none() {
+            known = wire.get(key);
+        }
+        let mut landed = Landed::Missed;
         for _ in 0..MISSES {
             if !wire.set(key, &order(known, values, true)) {
                 known = None;
@@ -287,13 +317,13 @@ impl Writer {
                 Some(held) => {
                     known = Some(held);
                     if held == values {
-                        ok = true;
+                        landed = Landed::Verified;
                         break;
                     }
                 }
                 None => {
                     known = Some(values);
-                    ok = true;
+                    landed = Landed::Unread;
                     break;
                 }
             }
@@ -304,8 +334,20 @@ impl Writer {
             Some(v) => q.known.insert(key.to_owned(), v),
             None => q.known.remove(key),
         };
-        self.shared.changed.notify_all();
-        ok
+        if landed == Landed::Unread {
+            q.checks.insert(
+                key.to_owned(),
+                Check {
+                    due: Instant::now() + VERIFY_AFTER,
+                    target: values,
+                    misses: 0,
+                },
+            );
+            self.wake(q);
+        } else {
+            self.shared.changed.notify_all();
+        }
+        landed
     }
 
     /// Wait for every posted write to go out, up to [`SETTLE`]. Before a
@@ -426,10 +468,10 @@ fn run(shared: &Shared) {
             };
             continue;
         };
-        // After a read, every channel goes from what it found; a read that
-        // found nothing leaves nothing to skip.
+        // After a read, every channel goes out, ordered from what it found,
+        // or from what was last believed when the panel did not answer.
         let (known, all) = match read {
-            Some(found) => (found, true),
+            Some(found) => (found.or(q.known.get(&key).copied()), true),
             None => (q.known.get(&key).copied(), false),
         };
         q.busy = true;
@@ -785,6 +827,8 @@ mod tests {
         reads: Mutex<usize>,
         refuse: std::sync::atomic::AtomicBool,
         lose: Mutex<usize>,
+        /// Reads still to go unanswered.
+        blind: Mutex<usize>,
         gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         delay: Mutex<Duration>,
     }
@@ -848,6 +892,11 @@ mod tests {
 
         fn get(&self, key: &str) -> Option<[u32; 3]> {
             *self.0.reads.lock().unwrap() += 1;
+            let mut blind = self.0.blind.lock().unwrap();
+            if *blind > 0 {
+                *blind -= 1;
+                return None;
+            }
             self.held(key)
         }
     }
@@ -957,7 +1006,7 @@ mod tests {
         let writer = Writer::with(fake.clone());
         writer.post("p#0", [1, 1, 1]);
         writer.post("q#0", [2, 2, 2]);
-        assert!(writer.write_now("p#0", [9, 9, 9]));
+        assert_eq!(writer.write_now("p#0", [9, 9, 9]), Landed::Verified);
         let order: Vec<(String, [u32; 3])> = fake
             .sets()
             .iter()
@@ -994,7 +1043,7 @@ mod tests {
                 max: 100,
             }; 3],
         )]);
-        assert!(writer.write_now("p#0", [100, 92, 96]));
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
         assert_eq!(fake.held("p#0"), Some([100, 92, 96]));
         assert_eq!(fake.sets().len(), 2);
         // Sent whole both times, whatever it was believed to hold.
@@ -1006,8 +1055,35 @@ mod tests {
         let fake = Fake::holding("p#0", [100, 64, 41]);
         *fake.0.lose.lock().unwrap() = usize::MAX;
         let writer = Writer::with(fake.clone());
-        assert!(!writer.write_now("p#0", [100, 92, 96]));
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Missed);
         assert_eq!(fake.sets().len(), MISSES as usize);
+    }
+
+    /// The restore that lost green and could not be read: not verified, so
+    /// the caller keeps its backup, and read again once quiet, which finds
+    /// the night still on the panel and puts the baseline back.
+    #[test]
+    fn a_direct_write_that_cannot_be_read_is_not_verified_and_is_read_again() {
+        let fake = Fake::holding("p#0", [100, 64, 41]);
+        let writer = Writer::with(fake.clone());
+        writer.read_back(&[("p#0".to_owned(), calibrated())]);
+        *fake.0.lose.lock().unwrap() = 1;
+        *fake.0.blind.lock().unwrap() = 1;
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Unread);
+        assert_eq!(fake.held("p#0"), Some([100, 64, 41]), "lost");
+        eventually(|| fake.held("p#0") == Some([100, 92, 96]));
+        assert!(writer.take_refused().is_empty());
+    }
+
+    /// After a crash nothing is known of a panel the night left warm. It is
+    /// read before the baseline goes out, so green rises before blue and no
+    /// step on the way is pink.
+    #[test]
+    fn a_direct_write_with_nothing_known_reads_the_panel_first() {
+        let fake = Fake::holding("p#0", [100, 64, 41]);
+        let writer = Writer::with(fake.clone());
+        assert_eq!(writer.write_now("p#0", [100, 92, 96]), Landed::Verified);
+        assert_eq!(fake.sets()[0].1, [(0, 100), (1, 92), (2, 96)]);
     }
 
     /// A posted write lost at the end of a fade is found once the panel has

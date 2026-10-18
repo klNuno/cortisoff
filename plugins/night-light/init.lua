@@ -150,9 +150,23 @@ function settle(cx, s)
     reason = "no clock"
   end
 
+  -- Outputs a game still fills stay spared while the whole lets go: released
+  -- together, the game's output would rejoin the whole as it fades, and the
+  -- morning would put the night back on the game for up to five minutes.
+  local function still_filled()
+    local out = {}
+    if s.pause_when_filled and apart then
+      for output in pairs(spared) do
+        if filled[output] then out[output] = true end
+      end
+    end
+    return out
+  end
+
   local keep = {}
   if reason then
     cx:release(CAP, { fade = QUICK_MS })
+    keep = still_filled()
   elseif night then
     local ok, err = cx:claim(CAP, round(s.night), { fade = quick_next and QUICK_MS or fade })
     if not ok then
@@ -167,6 +181,12 @@ function settle(cx, s)
     end
   else
     cx:release(CAP, { fade = quick_next and QUICK_MS or fade })
+    keep = still_filled()
+    -- A game opened while the morning still fades: the others are warm yet.
+    if not quick_next and s.pause_when_filled and apart and some_filled
+      and kelvin_at(s, minute) < s.day and spare(cx, filled) then
+      keep = filled
+    end
   end
   unspare(cx, keep)
   quick_next = reason ~= nil

@@ -596,6 +596,114 @@ fn night_light_spares_only_the_screen_a_game_fills() {
     assert_eq!(rt.report("night-light").unwrap().state["spared"], 0);
 }
 
+fn at(rig: &mut Rig, minute: u16) -> Event {
+    let clock = Event::TimeOfDay {
+        minute,
+        second: 0,
+        millisecond: 0,
+    };
+    rig.host.clock = Some(clock.clone());
+    clock
+}
+
+/// The morning lets the night go over its fade while a game still fills a
+/// screen: that screen stays spared, or it rejoins the whole and shows the
+/// night again for the length of the fade. A game opened while the morning
+/// still fades is spared too, and one opened after it is left alone.
+#[test]
+fn night_light_keeps_the_game_spared_through_the_morning() {
+    let mut rig = Rig::apart();
+    let store = night_light_with(serde_json::json!({ "fade_seconds": 300 }));
+    let mut rt = Runtime::new(night_light(), &store, None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let one = r"display.color_temp@\\.\DISPLAY3";
+    let two = r"display.color_temp@\\.\DISPLAY1";
+    let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&full);
+    rig.with(|env| rt.on_event(env, &full));
+
+    let morning = at(&mut rig, 7 * 60);
+    let out = rig.with(|env| rt.on_event(env, &morning));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 300_000, .. } if cap.as_str() == "display.color_temp")),
+        "{out:?}"
+    );
+    assert!(
+        !out.iter()
+            .any(|c| matches!(c, Command::Release { cap, .. } if cap.as_str() == one)),
+        "the game's screen stays spared: {out:?}"
+    );
+    assert_eq!(rt.report("night-light").unwrap().state["spared"], 1);
+
+    // A second game on another screen, two minutes into the morning fade.
+    let both = fullscreen(true, &[r"\\.\DISPLAY3", r"\\.\DISPLAY1"]);
+    rig.world.absorb(&both);
+    at(&mut rig, 7 * 60 + 2);
+    let out = rig.with(|env| rt.on_event(env, &both));
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Claim { cap, value: HostValue::Int(6500), fade_ms: 800, .. } if cap.as_str() == two)),
+        "{out:?}"
+    );
+
+    // The games leave once the morning is over: both screens go back.
+    let gone = fullscreen(false, &[]);
+    rig.world.absorb(&gone);
+    at(&mut rig, 8 * 60);
+    let out = rig.with(|env| rt.on_event(env, &gone));
+    for cap in [one, two] {
+        assert!(
+            out.iter().any(|c| matches!(c,
+                Command::Release { cap: c, fade_ms: 800, .. } if c.as_str() == cap)),
+            "{out:?}"
+        );
+    }
+
+    // In the middle of the day a game is left alone: nothing to spare it from.
+    rig.world.absorb(&full);
+    let out = rig.with(|env| rt.on_event(env, &full));
+    assert!(
+        !out.iter()
+            .any(|c| matches!(c, Command::Claim { cap, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+}
+
+/// A pause while a game fills a screen lets the others go and keeps the
+/// game's screen where it is, instead of letting it go to a whole that is
+/// still warm.
+#[test]
+fn night_light_pauses_around_the_game_without_warming_it() {
+    let mut rig = Rig::apart();
+    let mut rt = Runtime::new(night_light(), &on(&["night-light"]), None).with_os("windows");
+    rig.with(|env| rt.start_all(env));
+    let one = r"display.color_temp@\\.\DISPLAY3";
+    let full = fullscreen(true, &[r"\\.\DISPLAY3"]);
+    rig.world.absorb(&full);
+    rig.with(|env| rt.on_event(env, &full));
+    let out = rig
+        .with(|env| {
+            rt.message(
+                env,
+                "night-light",
+                "pause",
+                &serde_json::json!({ "minutes": 10 }),
+            )
+        })
+        .unwrap();
+    assert!(
+        out.iter().any(|c| matches!(c,
+            Command::Release { cap, fade_ms: 800, .. } if cap.as_str() == "display.color_temp")),
+        "{out:?}"
+    );
+    assert!(
+        !out.iter()
+            .any(|c| matches!(c, Command::Release { cap, .. } if cap.as_str() == one)),
+        "{out:?}"
+    );
+}
+
 /// Where one monitor cannot be held apart, a fullscreen game pauses every
 /// screen, as it always did.
 #[test]
