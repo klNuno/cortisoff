@@ -1,19 +1,19 @@
 version: 2
-# The workflow actions and the Cargo dependencies share one weekly pull
-# request, so a week of updates costs one CI run instead of several.
+# The workflow actions and the Cargo dependencies share one monthly pull
+# request, so a month of updates costs one CI run instead of several.
 multi-ecosystem-groups:
-  weekly:
+  monthly:
     schedule:
-      interval: weekly
+      interval: monthly
     commit-message:
       prefix: chore
       include: scope
 updates:
   - package-ecosystem: github-actions
     directory: /
-    multi-ecosystem-group: weekly
+    multi-ecosystem-group: monthly
     patterns: ["*"]
   - package-ecosystem: cargo
     directory: /
-    multi-ecosystem-group: weekly
+    multi-ecosystem-group: monthly
     patterns: ["*"]
