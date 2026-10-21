@@ -10,12 +10,12 @@ repository.workspace = true
 cortisoff-host = { path = "../cortisoff-host" }
 cortisoff-ipc = { path = "../cortisoff-ipc" }
 cortisoff-runtime = { path = "../cortisoff-runtime" }
-egui = { version = "0.36", default-features = false }
+egui = { version = "0.37", default-features = false }
 mlua = { version = "0.12", features = ["luajit", "vendored", "serialize"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 # egui ships no font without `default_fonts`; tests run where Segoe UI is not.
-egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 # The page captures, behind #[ignore]: they need a GPU.
-egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
